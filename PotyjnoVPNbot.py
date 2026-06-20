@@ -240,7 +240,7 @@ def main_menu():
     btn3 = types.KeyboardButton("👥 Рефералы")
     btn4 = types.KeyboardButton("🏆 Топ рефералов")
     btn5 = types.KeyboardButton("🔍 Проверка ключей")
-    btn6 = types.KeyboardButton("❓ Поддержка")
+    btn6 = types.KeyboardButton("Поддержка")
     keyboard.add(btn1, btn2)
     keyboard.add(btn3, btn4)
     keyboard.add(btn5, btn6)
@@ -639,7 +639,7 @@ def handle_keys_input(message):
     ).start()
 
 # ========== КНОПКА "ПОДДЕРЖКА" ==========
-@bot.message_handler(func=lambda message: message.text == "❓ Поддержка")
+@bot.message_handler(func=lambda message: message.text == "Поддержка")
 def support_command(message):
     if message.chat.type != "private":
         return
@@ -2048,3 +2048,4 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.start()
     app.run(host='0.0.0.0', port=10000)
+    
