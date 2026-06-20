@@ -7,13 +7,19 @@ import os
 from flask import Flask
 from threading import Thread
 
-# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (настрой на Render) ==========
+# ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 BOT_TOKEN = os.getenv('BOT_TOKEN', '8621740437:AAHXYevornlIKyNN204hrZ307slYZiYIqTE')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 8176196456))
 
 # ========== НАСТРОЙКИ КАНАЛА ==========
 CHANNEL_ID = -1003668283208
 CHANNEL_LINK = "https://t.me/ciorsa"
+
+# ========== ПОДДЕРЖКА ==========
+SUPPORT_USERNAME = "@mel1ste"
+
+# ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
+REFERRAL_ENABLED = False  # по умолчанию выключена
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -35,6 +41,14 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             added_by INTEGER,
             added_at INTEGER
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            reward_date INTEGER,
+            PRIMARY KEY (referrer_id, referred_id)
         )
     ''')
     conn.commit()
@@ -60,16 +74,17 @@ def is_subscribed(user_id):
         return False
 
 def get_subscription_link(user_id):
-    return f"https://vpn-bot-1f0n.onrender.com/sub/{user_id}"
+    return f"https://potyjnovpnbot.onrender.com/sub/{user_id}"
 
-# ========== ГЛАВНОЕ МЕНЮ ==========
+# ========== КЛАВИАТУРЫ ==========
 def main_menu():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn1 = types.KeyboardButton("👤 Личный кабинет")
     btn2 = types.KeyboardButton("📡 Моя подписка")
-    btn3 = types.KeyboardButton("❓ Поддержка")
+    btn3 = types.KeyboardButton("👥 Рефералы")
+    btn4 = types.KeyboardButton("❓ Поддержка")
     keyboard.add(btn1, btn2)
-    keyboard.add(btn3)
+    keyboard.add(btn3, btn4)
     return keyboard
 
 def subscribe_button():
@@ -95,6 +110,58 @@ def start_command(message):
         )
         return
     
+    # ===== ОБРАБОТКА РЕФЕРАЛЬНОЙ ССЫЛКИ =====
+    referrer_id = None
+    if len(message.text.split()) > 1:
+        ref_param = message.text.split()[1]
+        if ref_param.startswith('ref_'):
+            try:
+                referrer_id = int(ref_param.split('_')[1])
+            except:
+                pass
+    
+    # Если есть реферер, система включена, и это не тот же пользователь
+    if referrer_id and REFERRAL_ENABLED and referrer_id != user_id:
+        # Проверяем, что реферер подписан на канал
+        if is_subscribed(referrer_id):
+            conn = sqlite3.connect('users.db')
+            cursor = conn.cursor()
+            
+            # Проверяем, что реферер есть в БД и у него активна подписка
+            cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
+            ref_result = cursor.fetchone()
+            
+            if ref_result and ref_result[0] > int(time.time()):
+                # Проверяем, не приглашал ли этот пользователь уже этого реферера
+                cursor.execute(
+                    "SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?",
+                    (referrer_id, user_id)
+                )
+                already_ref = cursor.fetchone()
+                
+                if not already_ref:
+                    # Начисляем +3 дня рефереру
+                    new_end = ref_result[0] + 3 * 24 * 60 * 60
+                    cursor.execute(
+                        "UPDATE users SET subscription_end = ? WHERE user_id = ?",
+                        (new_end, referrer_id)
+                    )
+                    cursor.execute(
+                        "INSERT INTO referrals (referrer_id, referred_id, reward_date) VALUES (?, ?, ?)",
+                        (referrer_id, user_id, int(time.time()))
+                    )
+                    conn.commit()
+                    
+                    try:
+                        bot.send_message(
+                            referrer_id,
+                            f"🎉 По вашей ссылке зарегистрировался новый пользователь!\nВам начислено +3 дня подписки."
+                        )
+                    except:
+                        pass
+            conn.close()
+    
+    # ===== ОСНОВНАЯ ЛОГИКА /START =====
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
@@ -198,8 +265,46 @@ def my_subscription(message):
             message,
             "❌ Ваша подписка неактивна или истекла.\n\n"
             "Для продления обратитесь к администратору:\n"
-            "@ВашТелеграм"
+            "@mel1ste"
         )
+
+# ========== КНОПКА "РЕФЕРАЛЫ" ==========
+@bot.message_handler(func=lambda message: message.text == "👥 Рефералы")
+def referrals_command(message):
+    if message.chat.type != "private":
+        return
+    
+    user_id = message.from_user.id
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    # Проверяем, есть ли пользователь
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if not cursor.fetchone():
+        conn.close()
+        bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
+        return
+    
+    # Считаем рефералов
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
+    count = cursor.fetchone()[0]
+    conn.close()
+    
+    # Генерируем реферальную ссылку
+    bot_username = bot.get_me().username
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    
+    # Проверяем, включена ли система
+    status = "✅ Включена" if REFERRAL_ENABLED else "❌ Отключена"
+    
+    text = (
+        f"👥 Ваши рефералы: {count}\n"
+        f"📊 Статус системы: {status}\n\n"
+        f"🔗 Ваша реферальная ссылка:\n{ref_link}\n\n"
+        f"ℹ️ За каждого друга, перешедшего по ссылке, вы получите +3 дня к подписке (если система включена)."
+    )
+    bot.reply_to(message, text)
 
 # ========== КНОПКА "ПОДДЕРЖКА" ==========
 @bot.message_handler(func=lambda message: message.text == "❓ Поддержка")
@@ -210,7 +315,7 @@ def support_command(message):
     bot.reply_to(
         message,
         "📞 По всем вопросам пишите:\n"
-        "@ВашТелеграм"  # Замени на свой ник
+        "@mel1ste"
     )
 
 # ========== ОБРАБОТЧИК КНОПКИ "ПОДПИСАЛСЯ" ==========
@@ -226,7 +331,6 @@ def check_subscription(call):
         bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
         bot.delete_message(call.message.chat.id, call.message.message_id)
         
-        # Проверяем, есть ли пользователь в БД
         conn = sqlite3.connect('users.db')
         cursor = conn.cursor()
         cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
@@ -251,6 +355,36 @@ def check_subscription(call):
             show_alert=True
         )
 
+# ========== РЕФЕРАЛЬНЫЕ КОМАНДЫ ДЛЯ АДМИНА ==========
+@bot.message_handler(commands=['ref_on'])
+def referral_on(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    global REFERRAL_ENABLED
+    REFERRAL_ENABLED = True
+    bot.reply_to(message, "✅ Реферальная система ВКЛЮЧЕНА. Теперь за каждого нового пользователя начисляется +3 дня.")
+
+@bot.message_handler(commands=['ref_off'])
+def referral_off(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    global REFERRAL_ENABLED
+    REFERRAL_ENABLED = False
+    bot.reply_to(message, "❌ Реферальная система ВЫКЛЮЧЕНА. Начисления больше не производятся.")
+
+@bot.message_handler(commands=['ref_status'])
+def referral_status(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    status = "ВКЛЮЧЕНА ✅" if REFERRAL_ENABLED else "ВЫКЛЮЧЕНА ❌"
+    bot.reply_to(message, f"📊 Реферальная система: {status}")
+
 # ========== АДМИН-КОМАНДЫ ==========
 @bot.message_handler(commands=['stats'])
 def stats_command(message):
@@ -273,13 +407,17 @@ def stats_command(message):
     cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_end < ?", (int(time.time()),))
     expired_users = cursor.fetchone()[0]
     
+    cursor.execute("SELECT COUNT(*) FROM referrals")
+    total_refs = cursor.fetchone()[0]
+    
     conn.close()
     
     text = (
         f"📊 Статистика:\n\n"
         f"👥 Всего пользователей: {total_users}\n"
         f"✅ Активных: {active_users}\n"
-        f"❌ Истекших: {expired_users}"
+        f"❌ Истекших: {expired_users}\n"
+        f"🔗 Всего рефералов: {total_refs}"
     )
     bot.reply_to(message, text)
 
@@ -417,7 +555,7 @@ def remove_user(message):
         bot.send_message(
             user_id,
             "❌ Ваша подписка была отключена администратором.\n"
-            "Для восстановления обратитесь в поддержку."
+            "Для восстановления обратитесь в поддержку: @mel1ste"
         )
     except:
         pass
@@ -554,9 +692,7 @@ def get_subscription(user_id):
     if not result or result[0] < int(time.time()):
         return "Подписка истекла или не найдена", 403
     
-    # Здесь возвращается твой VPN-конфиг
-    return f"""
-#profile-title: 🌐 Потужно VPN Free
+    return f"""#profile-title: 🌐 Потужно VPN Free
 #profile-update-interval: 1
 #support-url: https://t.me/mel1ste
 #announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
@@ -573,4 +709,4 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.start()
     app.run(host='0.0.0.0', port=10000)
-  
+    
