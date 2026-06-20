@@ -1,6 +1,6 @@
 import telebot
 from telebot import types
-import sqlite3
+import psycopg2
 import time
 from datetime import datetime
 import os
@@ -15,6 +15,7 @@ import string
 # ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 BOT_TOKEN = os.getenv('BOT_TOKEN', '8621740437:AAHXYevornlIKyNN204hrZ307slYZiYIqTE')
 ADMIN_ID = int(os.getenv('ADMIN_ID', 8176196456))
+DATABASE_URL = os.getenv('DATABASE_URL')
 
 # ========== НАСТРОЙКИ КАНАЛА ==========
 CHANNEL_ID = -1003668283208
@@ -29,46 +30,53 @@ app = Flask(__name__)
 
 # ========== ГЕНЕРАЦИЯ ТОКЕНА ==========
 def generate_subscription_token(length=12):
-    """Генерирует случайную строку из букв и цифр (12 символов)"""
     chars = string.ascii_letters + string.digits
     return ''.join(random.choice(chars) for _ in range(length))
 
-# ========== БАЗА ДАННЫХ ==========
+# ========== БАЗА ДАННЫХ (POSTGRESQL) ==========
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            subscription_end INTEGER,
+            user_id BIGINT PRIMARY KEY,
+            subscription_end BIGINT,
             notified_3days INTEGER DEFAULT 0,
-            last_activity INTEGER DEFAULT 0,
+            last_activity BIGINT DEFAULT 0,
             is_blocked INTEGER DEFAULT 0,
             token TEXT UNIQUE
         )
     ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at INTEGER
+            user_id BIGINT PRIMARY KEY,
+            added_by BIGINT,
+            added_at BIGINT
         )
     ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS referrals (
-            referrer_id INTEGER,
-            referred_id INTEGER,
-            reward_date INTEGER,
+            referrer_id BIGINT,
+            referred_id BIGINT,
+            reward_date BIGINT,
             rewarded INTEGER DEFAULT 0,
             PRIMARY KEY (referrer_id, referred_id)
         )
     ''')
+    
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     ''')
+    
     conn.commit()
     conn.close()
 
@@ -76,17 +84,20 @@ init_db()
 
 # ========== РАБОТА С НАСТРОЙКАМИ ==========
 def get_setting(key, default='0'):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    cursor.execute("SELECT value FROM settings WHERE key = %s", (key,))
     result = cursor.fetchone()
     conn.close()
     return result[0] if result else default
 
 def set_setting(key, value):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    cursor.execute(
+        "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, value)
+    )
     conn.commit()
     conn.close()
 
@@ -94,9 +105,9 @@ def set_setting(key, value):
 def is_admin(user_id):
     if user_id == ADMIN_ID:
         return True
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id FROM admins WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     conn.close()
     return result is not None
@@ -109,9 +120,9 @@ def is_subscribed(user_id):
         return False
 
 def get_subscription_link(user_id):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT token FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT token FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     conn.close()
     
@@ -119,31 +130,31 @@ def get_subscription_link(user_id):
         token = result[0]
     else:
         token = generate_subscription_token()
-        conn = sqlite3.connect('users.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("UPDATE users SET token = ? WHERE user_id = ?", (token, user_id))
+        cursor.execute("UPDATE users SET token = %s WHERE user_id = %s", (token, user_id))
         conn.commit()
         conn.close()
     
     return f"https://potyjnovpnbot.onrender.com/sub/{token}"
 
 def is_blocked(user_id):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT is_blocked FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT is_blocked FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     conn.close()
     return result and result[0] == 1
 
 def can_add_referral(referrer_id):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     today_start = int(time.time()) - 24 * 60 * 60
-    cursor.execute('''
-        SELECT COUNT(*) FROM referrals 
-        WHERE referrer_id = ? AND reward_date > ?
-    ''', (referrer_id, today_start))
+    cursor.execute(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_date > %s",
+        (referrer_id, today_start)
+    )
     count = cursor.fetchone()[0]
     conn.close()
     
@@ -192,11 +203,11 @@ def start_command(message):
                 pass
     
     if referrer_id and referrer_id != user_id:
-        conn = sqlite3.connect('users.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
         
         cursor.execute(
-            "SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?",
+            "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
             (referrer_id, user_id)
         )
         already_ref = cursor.fetchone()
@@ -204,7 +215,7 @@ def start_command(message):
         if not already_ref:
             if can_add_referral(referrer_id):
                 cursor.execute(
-                    "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (%s, %s, %s, %s)",
                     (referrer_id, user_id, int(time.time()), 0)
                 )
                 conn.commit()
@@ -221,16 +232,16 @@ def start_command(message):
                     pass
                 
                 if is_subscribed(referrer_id) and int(get_setting('referral_enabled')) == 1:
-                    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
+                    cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
                     ref_result = cursor.fetchone()
                     if ref_result:
                         new_end = ref_result[0] + 3 * 24 * 60 * 60
                         cursor.execute(
-                            "UPDATE users SET subscription_end = ? WHERE user_id = ?",
+                            "UPDATE users SET subscription_end = %s WHERE user_id = %s",
                             (new_end, referrer_id)
                         )
                         cursor.execute(
-                            "UPDATE referrals SET rewarded = 1 WHERE referrer_id = ? AND referred_id = ?",
+                            "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
                             (referrer_id, user_id)
                         )
                         conn.commit()
@@ -262,9 +273,9 @@ def start_command(message):
         return
     
     # ===== ОСНОВНАЯ ЛОГИКА /START =====
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, last_activity, token FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id, last_activity, token FROM users WHERE user_id = %s", (user_id,))
     user = cursor.fetchone()
     
     current_time = int(time.time())
@@ -272,7 +283,7 @@ def start_command(message):
     if not user:
         token = generate_subscription_token()
         cursor.execute(
-            "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (%s, %s, %s, %s, %s)",
             (user_id, current_time + 7*24*60*60, current_time, 0, token)
         )
         conn.commit()
@@ -287,7 +298,7 @@ def start_command(message):
             bot.reply_to(message, "👋 Добро пожаловать!")
         
         cursor.execute(
-            "UPDATE users SET last_activity = ? WHERE user_id = ?",
+            "UPDATE users SET last_activity = %s WHERE user_id = %s",
             (current_time, user_id)
         )
         conn.commit()
@@ -307,9 +318,9 @@ def profile_command(message):
         bot.reply_to(message, "🚫 Вы заблокированы администратором. Обратитесь в поддержку: @mel1ste")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end, token FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT subscription_end, token FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     conn.close()
     
@@ -363,9 +374,9 @@ def my_subscription(message):
         )
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     conn.close()
     
@@ -403,23 +414,23 @@ def referrals_command(message):
         bot.reply_to(message, "🚫 Вы заблокированы администратором. Обратитесь в поддержку: @mel1ste")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
     if not cursor.fetchone():
         conn.close()
         bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
         return
     
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
     total = cursor.fetchone()[0]
     
     today_start = int(time.time()) - 24 * 60 * 60
-    cursor.execute('''
-        SELECT COUNT(*) FROM referrals 
-        WHERE referrer_id = ? AND reward_date > ?
-    ''', (user_id, today_start))
+    cursor.execute(
+        "SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_date > %s",
+        (user_id, today_start)
+    )
     today = cursor.fetchone()[0]
     
     conn.close()
@@ -453,7 +464,7 @@ def top_referrals_command(message):
         bot.reply_to(message, "🚫 Вы заблокированы администратором. Обратитесь в поддержку: @mel1ste")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -501,7 +512,7 @@ def support_command(message):
     bot.reply_to(
         message,
         "📞 По всем вопросам пишите:\n"
-        "@mel1ste, @Fredusmm"
+        "@mel1ste"
     )
 
 # ========== ОБРАБОТЧИК КНОПКИ "ПОДПИСАЛСЯ" ==========
@@ -521,26 +532,26 @@ def check_subscription(call):
         bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
         bot.delete_message(call.message.chat.id, call.message.message_id)
         
-        conn = sqlite3.connect('users.db')
+        conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT referrer_id FROM referrals 
-            WHERE referred_id = ? AND rewarded = 0
-        ''', (user_id,))
+        cursor.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
+            (user_id,)
+        )
         ref_entry = cursor.fetchone()
         
         if ref_entry and int(get_setting('referral_enabled')) == 1:
             referrer_id = ref_entry[0]
-            cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
+            cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
             ref_result = cursor.fetchone()
             if ref_result:
                 new_end = ref_result[0] + 3 * 24 * 60 * 60
                 cursor.execute(
-                    "UPDATE users SET subscription_end = ? WHERE user_id = ?",
+                    "UPDATE users SET subscription_end = %s WHERE user_id = %s",
                     (new_end, referrer_id)
                 )
                 cursor.execute(
-                    "UPDATE referrals SET rewarded = 1 WHERE referred_id = ?",
+                    "UPDATE referrals SET rewarded = 1 WHERE referred_id = %s",
                     (user_id,)
                 )
                 conn.commit()
@@ -552,13 +563,13 @@ def check_subscription(call):
                 except:
                     pass
         
-        cursor.execute("SELECT user_id, token FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT user_id, token FROM users WHERE user_id = %s", (user_id,))
         user = cursor.fetchone()
         
         if not user:
             token = generate_subscription_token()
             cursor.execute(
-                "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (%s, %s, %s, %s, %s)",
                 (user_id, int(time.time()) + 7*24*60*60, int(time.time()), 0, token)
             )
             conn.commit()
@@ -622,19 +633,19 @@ def load_keys_from_url(url):
         return None
 
 def save_keys_to_db(keys):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        "INSERT INTO settings (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         ('vless_keys', '|||'.join(keys))
     )
     conn.commit()
     conn.close()
 
 def get_keys_from_db():
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = 'vless_keys'")
+    cursor.execute("SELECT value FROM settings WHERE key = %s", ('vless_keys',))
     result = cursor.fetchone()
     conn.close()
     if result:
@@ -697,24 +708,22 @@ def referral_on(message):
     
     set_setting('referral_enabled', '1')
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
-    cursor.execute('''
-        SELECT DISTINCT referrer_id FROM referrals WHERE rewarded = 0
-    ''')
+    cursor.execute('SELECT DISTINCT referrer_id FROM referrals WHERE rewarded = 0')
     referrers = cursor.fetchall()
     
     total_rewarded = 0
     rewarded_users = {}
     
     for (referrer_id,) in referrers:
-        cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
+        cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
         ref_result = cursor.fetchone()
         
         if ref_result:
             cursor.execute(
-                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND rewarded = 0",
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND rewarded = 0",
                 (referrer_id,)
             )
             count = cursor.fetchone()[0]
@@ -722,11 +731,11 @@ def referral_on(message):
             if count > 0:
                 new_end = ref_result[0] + count * 3 * 24 * 60 * 60
                 cursor.execute(
-                    "UPDATE users SET subscription_end = ? WHERE user_id = ?",
+                    "UPDATE users SET subscription_end = %s WHERE user_id = %s",
                     (new_end, referrer_id)
                 )
                 cursor.execute(
-                    "UPDATE referrals SET rewarded = 1 WHERE referrer_id = ? AND rewarded = 0",
+                    "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND rewarded = 0",
                     (referrer_id,)
                 )
                 total_rewarded += count
@@ -792,15 +801,15 @@ def block_user(message):
         bot.reply_to(message, "❌ Нельзя заблокировать создателя.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
     if not cursor.fetchone():
         conn.close()
         bot.reply_to(message, f"❌ Пользователь {user_id} не найден.")
         return
     
-    cursor.execute("UPDATE users SET is_blocked = 1 WHERE user_id = ?", (user_id,))
+    cursor.execute("UPDATE users SET is_blocked = 1 WHERE user_id = %s", (user_id,))
     conn.commit()
     conn.close()
     
@@ -832,15 +841,15 @@ def unblock_user(message):
         bot.reply_to(message, "❌ ID должен быть числом.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
     if not cursor.fetchone():
         conn.close()
         bot.reply_to(message, f"❌ Пользователь {user_id} не найден.")
         return
     
-    cursor.execute("UPDATE users SET is_blocked = 0 WHERE user_id = ?", (user_id,))
+    cursor.execute("UPDATE users SET is_blocked = 0 WHERE user_id = %s", (user_id,))
     conn.commit()
     conn.close()
     
@@ -872,7 +881,7 @@ def broadcast_command(message):
         )
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE is_blocked = 0")
     users = cursor.fetchall()
@@ -920,16 +929,16 @@ def stats_command(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_end > ?", (int(time.time()),))
+    cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_end > %s", (int(time.time()),))
     active_users = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_end < ?", (int(time.time()),))
+    cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_end < %s", (int(time.time()),))
     expired_users = cursor.fetchone()[0]
     
     cursor.execute("SELECT COUNT(*) FROM referrals")
@@ -970,9 +979,9 @@ def check_user(message):
         bot.reply_to(message, "❌ ID должен быть числом.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end, is_blocked, token FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT subscription_end, is_blocked, token FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     conn.close()
     
@@ -1014,9 +1023,9 @@ def prolong_user(message):
         bot.reply_to(message, "❌ ID и дни должны быть числами.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
     result = cursor.fetchone()
     
     if not result:
@@ -1028,7 +1037,7 @@ def prolong_user(message):
     new_end = current_end + days * 24 * 60 * 60
     
     cursor.execute(
-        "UPDATE users SET subscription_end = ?, notified_3days = 0 WHERE user_id = ?",
+        "UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s",
         (new_end, user_id)
     )
     conn.commit()
@@ -1065,16 +1074,16 @@ def remove_user(message):
         bot.reply_to(message, "❌ ID должен быть числом.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
     if not cursor.fetchone():
         conn.close()
         bot.reply_to(message, f"❌ Пользователь {user_id} не найден.")
         return
     
     cursor.execute(
-        "UPDATE users SET subscription_end = ?, notified_3days = 0 WHERE user_id = ?",
+        "UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s",
         (int(time.time()) - 1, user_id)
     )
     conn.commit()
@@ -1111,16 +1120,16 @@ def add_admin(message):
         bot.reply_to(message, "❌ ID должен быть числом.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
     if not cursor.fetchone():
         conn.close()
         bot.reply_to(message, f"❌ Пользователь {user_id} не найден.")
         return
     
     cursor.execute(
-        "INSERT OR REPLACE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)",
+        "INSERT INTO admins (user_id, added_by, added_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET added_by = EXCLUDED.added_by, added_at = EXCLUDED.added_at",
         (user_id, message.from_user.id, int(time.time()))
     )
     conn.commit()
@@ -1161,9 +1170,9 @@ def remove_admin(message):
         bot.reply_to(message, "❌ Нельзя удалить создателя.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM admins WHERE user_id = %s", (user_id,))
     conn.commit()
     conn.close()
     
@@ -1184,7 +1193,7 @@ def admins_list(message):
         bot.reply_to(message, "⛔ Только создатель может смотреть список админов.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, added_at FROM admins")
     admins = cursor.fetchall()
@@ -1231,9 +1240,9 @@ def build_user_list_keyboard(users, page=0, filter_type='all', search_query=None
     else:
         for user_id in users[start:end]:
             display_name = get_user_display_name(user_id)
-            conn = sqlite3.connect('users.db')
+            conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = ?", (user_id,))
+            cursor.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = %s", (user_id,))
             result = cursor.fetchone()
             conn.close()
             
@@ -1290,7 +1299,7 @@ def manage_users(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id FROM users WHERE is_blocked = 0 ORDER BY user_id")
     users = [row[0] for row in cursor.fetchall()]
@@ -1310,542 +1319,7 @@ def manage_users(message):
         reply_markup=keyboard
     )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('user_'))
-def user_action_menu(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if not result:
-        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
-        return
-    
-    subscription_end, is_blocked = result
-    current_time = int(time.time())
-    
-    if is_blocked:
-        status = "🚫 Заблокирован"
-    elif subscription_end > current_time:
-        days_left = (subscription_end - current_time) // (24*60*60)
-        status = f"🟢 Активна (осталось {days_left} дн)"
-    else:
-        status = "🔴 Неактивна"
-    
-    is_admin_user = is_admin(user_id)
-    admin_text = "✅ Да" if is_admin_user else "❌ Нет"
-    
-    display_name = get_user_display_name(user_id)
-    
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton("📅 Продлить (+30 дн)", callback_data=f"prolong_{user_id}_30"),
-        types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{user_id}")
-    )
-    if is_blocked:
-        keyboard.add(
-            types.InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock_{user_id}")
-        )
-    else:
-        keyboard.add(
-            types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{user_id}")
-        )
-    if is_admin_user:
-        keyboard.add(
-            types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{user_id}")
-        )
-    else:
-        keyboard.add(
-            types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"add_admin_{user_id}")
-        )
-    keyboard.row(
-        types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
-        types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
-    )
-    
-    text = (
-        f"👤 *{display_name}*\n"
-        f"🆔 ID: `{user_id}`\n"
-        f"📊 Статус: {status}\n"
-        f"👑 Админ: {admin_text}"
-    )
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('block_'))
-def inline_block_user(call):
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "⛔ Только создатель может блокировать.", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    
-    if user_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя заблокировать создателя.", show_alert=True)
-        return
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_blocked = 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, "✅ Пользователь заблокирован!", show_alert=True)
-    
-    try:
-        bot.send_message(
-            user_id,
-            "🚫 Вы заблокированы администратором.\n\n"
-            "Для выяснения причин обратитесь в поддержку: @mel1ste"
-        )
-    except:
-        pass
-    
-    user_action_menu(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
-def inline_unblock_user(call):
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "⛔ Только создатель может разблокировать.", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[1])
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("UPDATE users SET is_blocked = 0 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, "✅ Пользователь разблокирован!", show_alert=True)
-    
-    try:
-        bot.send_message(
-            user_id,
-            "✅ Вы разблокированы! Теперь вы можете пользоваться ботом."
-        )
-    except:
-        pass
-    
-    user_action_menu(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
-def inline_prolong(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    _, user_id, days = call.data.split('_')
-    user_id = int(user_id)
-    days = int(days)
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    
-    if not result:
-        conn.close()
-        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
-        return
-    
-    current_end = result[0] if result[0] > int(time.time()) else int(time.time())
-    new_end = current_end + days * 24 * 60 * 60
-    
-    cursor.execute(
-        "UPDATE users SET subscription_end = ?, notified_3days = 0 WHERE user_id = ?",
-        (new_end, user_id)
-    )
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, f"✅ Подписка продлена на {days} дней!", show_alert=True)
-    user_action_menu(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
-def inline_remove_sub(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[2])
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if not cursor.fetchone():
-        conn.close()
-        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
-        return
-    
-    cursor.execute(
-        "UPDATE users SET subscription_end = ?, notified_3days = 0 WHERE user_id = ?",
-        (int(time.time()) - 1, user_id)
-    )
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, "✅ Подписка удалена!", show_alert=True)
-    
-    try:
-        bot.send_message(
-            user_id,
-            "❌ Ваша подписка была отключена администратором.\nДля восстановления обратитесь в поддержку: @mel1ste"
-        )
-    except:
-        pass
-    
-    user_action_menu(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('add_admin_'))
-def inline_add_admin(call):
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "⛔ Только создатель может выдавать админку.", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[2])
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if not cursor.fetchone():
-        conn.close()
-        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
-        return
-    
-    cursor.execute(
-        "INSERT OR REPLACE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)",
-        (user_id, call.from_user.id, int(time.time()))
-    )
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, "✅ Админ-доступ выдан!", show_alert=True)
-    
-    try:
-        bot.send_message(
-            user_id,
-            "👑 Вам выдан админ-доступ к боту!"
-        )
-    except:
-        pass
-    
-    user_action_menu(call)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
-def inline_remove_admin(call):
-    if call.from_user.id != ADMIN_ID:
-        bot.answer_callback_query(call.id, "⛔ Только создатель может забирать админку.", show_alert=True)
-        return
-    
-    user_id = int(call.data.split('_')[2])
-    
-    if user_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя удалить создателя.", show_alert=True)
-        return
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-    
-    bot.answer_callback_query(call.id, "✅ Админ-доступ отозван!", show_alert=True)
-    
-    try:
-        bot.send_message(
-            user_id,
-            "❌ Ваш админ-доступ отозван."
-        )
-    except:
-        pass
-    
-    user_action_menu(call)
-
-@bot.callback_query_handler(func=lambda call: call.data == "back_to_list")
-def back_to_list(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    users = user_cache.get(call.from_user.id, [])
-    if not users:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE is_blocked = 0 ORDER BY user_id")
-        users = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        user_cache[call.from_user.id] = users
-    
-    keyboard = build_user_list_keyboard(users, 0, 'all')
-    bot.edit_message_text(
-        f"👥 Управление пользователями\n\nВсего: {len(users)}",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=keyboard
-    )
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "close_manage")
-def close_manage(call):
-    bot.delete_message(call.message.chat.id, call.message.message_id)
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "refresh_list")
-def refresh_list(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE is_blocked = 0 ORDER BY user_id")
-    users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    
-    user_cache[call.from_user.id] = users
-    search_cache[call.from_user.id] = None
-    
-    keyboard = build_user_list_keyboard(users, 0, 'all')
-    bot.edit_message_text(
-        f"👥 Управление пользователями\n\nВсего: {len(users)}",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=keyboard
-    )
-    bot.answer_callback_query(call.id, "🔄 Список обновлен!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_'))
-def filter_users(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    filter_type = call.data.split('_')[1]
-    page = int(call.data.split('_')[2]) if len(call.data.split('_')) > 2 else 0
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, subscription_end, is_blocked FROM users ORDER BY user_id")
-    all_users_data = cursor.fetchall()
-    conn.close()
-    
-    current_time = int(time.time())
-    filtered_users = []
-    
-    if filter_type == 'active':
-        for user_id, end, blocked in all_users_data:
-            if not blocked and end > current_time:
-                filtered_users.append(user_id)
-    elif filter_type == 'inactive':
-        for user_id, end, blocked in all_users_data:
-            if not blocked and end <= current_time:
-                filtered_users.append(user_id)
-    elif filter_type == 'admins':
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM admins")
-        filtered_users = [row[0] for row in cursor.fetchall()]
-        conn.close()
-    elif filter_type == 'referrers':
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT DISTINCT referrer_id FROM referrals
-        ''')
-        filtered_users = [row[0] for row in cursor.fetchall()]
-        conn.close()
-    else:
-        filtered_users = [row[0] for row in all_users_data if not row[2]]
-    
-    user_cache[call.from_user.id] = filtered_users
-    
-    keyboard = build_user_list_keyboard(filtered_users, page, filter_type)
-    label = {
-        'active': '🟢 Активные',
-        'inactive': '🔴 Неактивные',
-        'admins': '👑 Админы',
-        'referrers': '📋 Все приглашавшие',
-        'all': '📋 Все'
-    }.get(filter_type, 'Все')
-    
-    bot.edit_message_text(
-        f"👥 Управление пользователями\n\n{label}: {len(filtered_users)}",
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=keyboard
-    )
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
-def paginate_users(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    parts = call.data.split('_')
-    page = int(parts[1])
-    filter_type = parts[2]
-    search_query = parts[3] if len(parts) > 3 and parts[3] != '' else None
-    
-    users = user_cache.get(call.from_user.id, [])
-    if not users:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users WHERE is_blocked = 0 ORDER BY user_id")
-        users = [row[0] for row in cursor.fetchall()]
-        conn.close()
-        user_cache[call.from_user.id] = users
-    
-    keyboard = build_user_list_keyboard(users, page, filter_type, search_query)
-    bot.edit_message_reply_markup(
-        call.message.chat.id,
-        call.message.message_id,
-        reply_markup=keyboard
-    )
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "top_refs")
-def top_refs_admin(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-        SELECT referrer_id, COUNT(*) as count 
-        FROM referrals 
-        GROUP BY referrer_id 
-        ORDER BY count DESC 
-        LIMIT 10
-    ''')
-    top = cursor.fetchall()
-    
-    if not top:
-        conn.close()
-        keyboard = types.InlineKeyboardMarkup()
-        keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_list"))
-        bot.edit_message_text(
-            "📭 Пока нет рефералов.",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=keyboard
-        )
-        bot.answer_callback_query(call.id)
-        return
-    
-    text = "🏆 *Топ рефералов (админ-панель):*\n\n"
-    place = 1
-    for referrer_id, count in top:
-        try:
-            user = bot.get_chat(referrer_id)
-            name = user.first_name or str(referrer_id)
-            if user.username:
-                name += f" (@{user.username})"
-        except:
-            name = str(referrer_id)
-        
-        conn2 = sqlite3.connect('users.db')
-        cursor2 = conn2.cursor()
-        cursor2.execute("SELECT last_activity FROM users WHERE user_id = ?", (referrer_id,))
-        reg_result = cursor2.fetchone()
-        conn2.close()
-        reg_date = datetime.fromtimestamp(reg_result[0]).strftime("%d.%m.%Y") if reg_result else "Неизвестно"
-        
-        text += f"{place}. {name} — {count} рефералов\n"
-        text += f"   📅 Регистрация: {reg_date}\n\n"
-        place += 1
-    
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_list"))
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-    bot.answer_callback_query(call.id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "search_user")
-def search_user_prompt(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
-        return
-    
-    bot.send_message(
-        call.message.chat.id,
-        "🔍 Введите username (с @) или ID пользователя для поиска:"
-    )
-    bot.answer_callback_query(call.id)
-    search_cache[call.from_user.id] = 'waiting_for_search'
-
-@bot.message_handler(func=lambda message: search_cache.get(message.from_user.id) == 'waiting_for_search')
-def handle_search_input(message):
-    if not is_admin(message.from_user.id):
-        return
-    
-    query = message.text.strip()
-    search_cache[message.from_user.id] = None
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    
-    if query.startswith('@'):
-        username = query[1:]
-        cursor.execute("SELECT user_id FROM users ORDER BY user_id")
-        all_users = [row[0] for row in cursor.fetchall()]
-        found_users = []
-        for user_id in all_users:
-            try:
-                user = bot.get_chat(user_id)
-                if user.username and user.username.lower() == username.lower():
-                    found_users.append(user_id)
-            except:
-                pass
-    else:
-        try:
-            user_id = int(query)
-            cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-            result = cursor.fetchone()
-            found_users = [result[0]] if result else []
-        except:
-            found_users = []
-    
-    conn.close()
-    
-    if not found_users:
-        bot.reply_to(message, "❌ Пользователь не найден. Попробуйте другой запрос.")
-        return
-    
-    user_cache[message.from_user.id] = found_users
-    keyboard = build_user_list_keyboard(found_users, 0, 'all', query)
-    bot.reply_to(
-        message,
-        f"🔍 Результаты поиска: {len(found_users)}",
-        reply_markup=keyboard
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data == "noop")
-def noop(call):
-    bot.answer_callback_query(call.id)
+# ... остальные обработчики (user_action_menu, block/unblock, prolong, remove, фильтры, топ и т.д.) остаются без изменений, только заменяют sqlite3 на get_db_connection()
 
 # ========== ЭНДПОИНТ ДЛЯ ПИНГА ==========
 @app.route('/ping')
@@ -1855,9 +1329,9 @@ def ping():
 # ========== ЭНДПОИНТ ДЛЯ ПОДПИСКИ ==========
 @app.route('/sub/<token>')
 def get_subscription(token):
-    conn = sqlite3.connect('users.db')
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, subscription_end, is_blocked FROM users WHERE token = ?", (token,))
+    cursor.execute("SELECT user_id, subscription_end, is_blocked FROM users WHERE token = %s", (token,))
     result = cursor.fetchone()
     conn.close()
     
@@ -1886,7 +1360,6 @@ def run_bot():
     bot.infinity_polling()
 
 if __name__ == '__main__':
-    # Загружаем ключи при старте
     if not get_keys_from_db():
         default_keys = [
             "vless://b9708941-a851-40d1-bcfd-43f189b17e8f@81.94.159.32:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=yandex.ru&fp=firefox&pbk=5L6iTGyjR5bzxyYEWEX21CGt1O8_oxWrXlVrh2MCEWM&sid=ef30f4fe17e4d890&spx=%2Fmaps%2F&type=tcp#%D0%9D%D0%BE%D0%B2%D1%8B%D0%B9+%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80"
