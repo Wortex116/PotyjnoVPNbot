@@ -240,7 +240,7 @@ def main_menu():
     btn3 = types.KeyboardButton("👥 Рефералы")
     btn4 = types.KeyboardButton("🏆 Топ рефералов")
     btn5 = types.KeyboardButton("🔍 Проверка ключей")
-    btn6 = types.KeyboardButton("Поддержка")
+    btn6 = types.KeyboardButton("❓ Поддержка")
     keyboard.add(btn1, btn2)
     keyboard.add(btn3, btn4)
     keyboard.add(btn5, btn6)
@@ -375,6 +375,32 @@ def start_command(message):
     
     conn.close()
     bot.reply_to(message, "Выберите действие:", reply_markup=main_menu())
+
+# ========== ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ==========
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    if message.chat.type != "private":
+        return
+    
+    text = message.text
+    user_id = message.from_user.id
+    
+    if is_blocked(user_id):
+        bot.reply_to(message, "🚫 Вы заблокированы администратором. Обратитесь в поддержку: @mel1ste")
+        return
+    
+    if text == "👤 Личный кабинет":
+        profile_command(message)
+    elif text == "📡 Моя подписка":
+        my_subscription(message)
+    elif text == "👥 Рефералы":
+        referrals_command(message)
+    elif text == "🏆 Топ рефералов":
+        top_referrals_command(message)
+    elif text == "🔍 Проверка ключей":
+        check_keys_command(message)
+    elif text == "❓ Поддержка":
+        support_command(message)
 
 # ========== КНОПКА "ЛИЧНЫЙ КАБИНЕТ" ==========
 @bot.message_handler(func=lambda message: message.text == "👤 Личный кабинет")
@@ -639,7 +665,7 @@ def handle_keys_input(message):
     ).start()
 
 # ========== КНОПКА "ПОДДЕРЖКА" ==========
-@bot.message_handler(func=lambda message: message.text == "Поддержка")
+@bot.message_handler(func=lambda message: message.text == "❓ Поддержка")
 def support_command(message):
     if message.chat.type != "private":
         return
@@ -2035,6 +2061,7 @@ def get_subscription(token):
 
 # ========== ЗАПУСК БОТА ==========
 def run_bot():
+    bot.remove_webhook()
     bot.infinity_polling(skip_pending=True)
 
 if __name__ == '__main__':
@@ -2047,4 +2074,3 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.start()
     app.run(host='0.0.0.0', port=10000)
-    
