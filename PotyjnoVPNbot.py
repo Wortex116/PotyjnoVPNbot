@@ -6,6 +6,9 @@ from datetime import datetime
 import os
 from flask import Flask
 from threading import Thread
+import requests
+import re
+from bs4 import BeautifulSoup
 
 # ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 BOT_TOKEN = os.getenv('BOT_TOKEN', '8621740437:AAHXYevornlIKyNN204hrZ307slYZiYIqTE')
@@ -54,7 +57,7 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
-            value INTEGER
+            value TEXT
         )
     ''')
     conn.commit()
@@ -63,7 +66,7 @@ def init_db():
 init_db()
 
 # ========== РАБОТА С НАСТРОЙКАМИ ==========
-def get_setting(key, default=0):
+def get_setting(key, default='0'):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
@@ -120,7 +123,7 @@ def can_add_referral(referrer_id):
     count = cursor.fetchone()[0]
     conn.close()
     
-    return count < 10  # Максимум 10 в день
+    return count < 10
 
 # ========== КЛАВИАТУРЫ ==========
 def main_menu():
@@ -168,7 +171,6 @@ def start_command(message):
         conn = sqlite3.connect('users.db')
         cursor = conn.cursor()
         
-        # Проверяем, не было ли уже такой связи
         cursor.execute(
             "SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?",
             (referrer_id, user_id)
@@ -176,16 +178,13 @@ def start_command(message):
         already_ref = cursor.fetchone()
         
         if not already_ref:
-            # Проверяем лимит рефералов в день
             if can_add_referral(referrer_id):
-                # Сохраняем реферала (rewarded = 0, т.е. ещё не начислено)
                 cursor.execute(
                     "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (?, ?, ?, ?)",
                     (referrer_id, user_id, int(time.time()), 0)
                 )
                 conn.commit()
                 
-                # Отправляем уведомление рефереру (без упоминания "после включения")
                 try:
                     new_user = bot.get_chat(user_id)
                     new_user_name = f"@{new_user.username}" if new_user.username else new_user.first_name
@@ -197,8 +196,7 @@ def start_command(message):
                 except:
                     pass
                 
-                # Если реферер подписан и система включена — начисляем сразу
-                if is_subscribed(referrer_id) and get_setting('referral_enabled') == 1:
+                if is_subscribed(referrer_id) and int(get_setting('referral_enabled')) == 1:
                     cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
                     ref_result = cursor.fetchone()
                     if ref_result:
@@ -221,7 +219,6 @@ def start_command(message):
                         except:
                             pass
             else:
-                # Лимит превышен — отправляем уведомление рефереру
                 try:
                     bot.send_message(
                         referrer_id,
@@ -390,11 +387,9 @@ def referrals_command(message):
         bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
         return
     
-    # Общее количество рефералов
     cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
     total = cursor.fetchone()[0]
     
-    # Количество рефералов за сегодня
     today_start = int(time.time()) - 24 * 60 * 60
     cursor.execute('''
         SELECT COUNT(*) FROM referrals 
@@ -501,7 +496,6 @@ def check_subscription(call):
         bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
         bot.delete_message(call.message.chat.id, call.message.message_id)
         
-        # Проверяем, есть ли у этого пользователя реферал, который ещё не начислен
         conn = sqlite3.connect('users.db')
         cursor = conn.cursor()
         cursor.execute('''
@@ -510,7 +504,7 @@ def check_subscription(call):
         ''', (user_id,))
         ref_entry = cursor.fetchone()
         
-        if ref_entry and get_setting('referral_enabled') == 1:
+        if ref_entry and int(get_setting('referral_enabled')) == 1:
             referrer_id = ref_entry[0]
             cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
             ref_result = cursor.fetchone()
@@ -533,7 +527,6 @@ def check_subscription(call):
                 except:
                     pass
         
-        # Регистрация пользователя
         cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
         
@@ -556,6 +549,126 @@ def check_subscription(call):
             show_alert=True
         )
 
+# ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
+KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
+#profile-update-interval: 1
+#support-url: https://t.me/mel1ste
+#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
+#channel: 📢 https://t.me/ciorsa
+#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={expire}
+{keys}"""
+
+def load_keys_from_url(url):
+    """Загружает ключи из URL (парсит HTML-страницу или сырой файл)"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(url, timeout=30, headers=headers)
+        response.raise_for_status()
+        
+        text = response.text
+        
+        # 1. Ищем vless:// строки по всему тексту
+        keys = re.findall(r'vless://[^\s<>"\']+', text)
+        
+        # 2. Если не нашли, пробуем парсить как HTML через BeautifulSoup
+        if not keys:
+            soup = BeautifulSoup(text, 'html.parser')
+            for element in soup.find_all(string=True):
+                found = re.findall(r'vless://[^\s<>"\']+', element)
+                if found:
+                    keys.extend(found)
+        
+        # 3. Если всё ещё пусто — пробуем найти в JSON-блоке
+        if not keys:
+            json_match = re.search(r'\[{.*}\]', text, re.DOTALL)
+            if json_match:
+                json_text = json_match.group(0)
+                keys = re.findall(r'vless://[^\s<>"\']+', json_text)
+        
+        # Убираем дубликаты, сохраняя порядок
+        seen = set()
+        unique_keys = []
+        for key in keys:
+            if key not in seen:
+                seen.add(key)
+                unique_keys.append(key)
+        
+        return unique_keys
+    except Exception as e:
+        print(f"Ошибка загрузки ключей: {e}")
+        return None
+
+def save_keys_to_db(keys):
+    """Сохраняет ключи в таблицу settings"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        ('vless_keys', '|||'.join(keys))
+    )
+    conn.commit()
+    conn.close()
+
+def get_keys_from_db():
+    """Загружает ключи из таблицы settings"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = 'vless_keys'")
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return result[0].split('|||')
+    return []
+
+@bot.message_handler(commands=['update_keys'])
+def update_keys_command(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        bot.reply_to(
+            message,
+            "❌ Использование: /update_keys [URL]"
+        )
+        return
+    
+    url = args[1]
+    
+    msg = bot.reply_to(message, "⏳ Загрузка ключей...")
+    
+    keys = load_keys_from_url(url)
+    
+    if keys is None:
+        bot.edit_message_text(
+            "❌ Не удалось загрузить ключи. Проверьте URL.",
+            msg.chat.id,
+            msg.message_id
+        )
+        return
+    
+    if not keys:
+        bot.edit_message_text(
+            "❌ В файле не найдено ключей (строк с vless://).\n"
+            "Проверьте, что ссылка ведёт на файл с ключами.",
+            msg.chat.id,
+            msg.message_id
+        )
+        return
+    
+    save_keys_to_db(keys)
+    
+    bot.edit_message_text(
+        f"✅ Ключи обновлены!\n\n"
+        f"📊 Загружено ключей: {len(keys)}\n"
+        f"🔗 Источник: {url}",
+        msg.chat.id,
+        msg.message_id
+    )
+
 # ========== РЕФЕРАЛЬНЫЕ КОМАНДЫ ==========
 @bot.message_handler(commands=['ref_on'])
 def referral_on(message):
@@ -563,7 +676,7 @@ def referral_on(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    set_setting('referral_enabled', 1)
+    set_setting('referral_enabled', '1')
     
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
@@ -626,7 +739,7 @@ def referral_off(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    set_setting('referral_enabled', 0)
+    set_setting('referral_enabled', '0')
     bot.reply_to(message, "❌ Реферальная система ВЫКЛЮЧЕНА. Новые рефералы сохраняются, но дни не начисляются.")
 
 @bot.message_handler(commands=['ref_status'])
@@ -635,7 +748,7 @@ def referral_status(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    status = "ВКЛЮЧЕНА ✅" if get_setting('referral_enabled') == 1 else "ВЫКЛЮЧЕНА ❌"
+    status = "ВКЛЮЧЕНА ✅" if int(get_setting('referral_enabled')) == 1 else "ВЫКЛЮЧЕНА ❌"
     bot.reply_to(message, f"📊 Реферальная система: {status}")
 
 # ========== БЛОКИРОВКА ПОЛЬЗОВАТЕЛЕЙ ==========
@@ -1715,146 +1828,6 @@ def handle_search_input(message):
 def noop(call):
     bot.answer_callback_query(call.id)
 
-# ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
-import requests
-import re
-
-# Шаблон ответа для подписки
-KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
-#profile-update-interval: 1
-#support-url: https://t.me/mel1ste
-#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
-#channel: 📢 https://t.me/ciorsa
-#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={expire}
-{keys}"""
-
-# ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
-import requests
-import re
-from bs4 import BeautifulSoup
-
-# Шаблон ответа для подписки
-KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
-#profile-update-interval: 1
-#support-url: https://t.me/mel1ste
-#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
-#channel: 📢 https://t.me/ciorsa
-#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={expire}
-{keys}"""
-
-def load_keys_from_url(url):
-    """Загружает ключи из URL (парсит HTML-страницу или сырой файл)"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        response = requests.get(url, timeout=30, headers=headers)
-        response.raise_for_status()
-        
-        text = response.text
-        
-        # 1. Ищем vless:// строки по всему тексту
-        keys = re.findall(r'vless://[^\s<>"\']+', text)
-        
-        # 2. Если не нашли, пробуем парсить как HTML через BeautifulSoup
-        if not keys:
-            soup = BeautifulSoup(text, 'html.parser')
-            # Ищем все элементы, содержащие vless://
-            for element in soup.find_all(string=True):
-                found = re.findall(r'vless://[^\s<>"\']+', element)
-                if found:
-                    keys.extend(found)
-        
-        # 3. Если всё ещё пусто — пробуем найти в JSON-блоке (для Happ)
-        if not keys:
-            # Ищем блок с ключами в JSON-подобном формате
-            json_match = re.search(r'\[{.*}\]', text, re.DOTALL)
-            if json_match:
-                json_text = json_match.group(0)
-                # Ищем vless:// внутри JSON
-                keys = re.findall(r'vless://[^\s<>"\']+', json_text)
-        
-        # Убираем дубликаты, сохраняя порядок
-        seen = set()
-        unique_keys = []
-        for key in keys:
-            if key not in seen:
-                seen.add(key)
-                unique_keys.append(key)
-        
-        return unique_keys
-    except Exception as e:
-        print(f"Ошибка загрузки ключей: {e}")
-        return None
-
-def save_keys_to_db(keys):
-    """Сохраняет ключи в таблицу settings"""
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        ('vless_keys', '|||'.join(keys))
-    )
-    conn.commit()
-    conn.close()
-
-def get_keys_from_db():
-    """Загружает ключи из таблицы settings"""
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT value FROM settings WHERE key = 'vless_keys'")
-    result = cursor.fetchone()
-    conn.close()
-    if result:
-        return result[0].split('|||')
-    return []
-
-@bot.message_handler(commands=['update_keys'])
-def update_keys_command(message):
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "⛔ У вас нет прав.")
-        return
-    
-    args = message.text.split()
-    if len(args) != 2:
-        bot.reply_to(
-            message,
-            "❌ Использование: /update_keys [URL]"
-        )
-        return
-    
-    url = args[1]
-    
-    msg = bot.reply_to(message, "⏳ Загрузка ключей...")
-    
-    keys = load_keys_from_url(url)
-    
-    if keys is None:
-        bot.edit_message_text(
-            "❌ Не удалось загрузить ключи. Проверьте URL.",
-            msg.chat.id,
-            msg.message_id
-        )
-        return
-    
-    if not keys:
-        bot.edit_message_text(
-            "❌ В файле не найдено ключей (строк с vless://).\n"
-            "Проверьте, что ссылка ведёт на файл с ключами.",
-            msg.chat.id,
-            msg.message_id
-        )
-        return
-    
-    save_keys_to_db(keys)
-    
-    bot.edit_message_text(
-        f"✅ Ключи обновлены!\n\n"
-        f"📊 Загружено ключей: {len(keys)}\n"
-        f"🔗 Источник: {url}",
-        msg.chat.id,
-        msg.message_id
-    )
 # ========== ЭНДПОИНТ ДЛЯ ПИНГА ==========
 @app.route('/ping')
 def ping():
@@ -1872,20 +1845,31 @@ def get_subscription(user_id):
     if not result or result[0] < int(time.time()) or result[1] == 1:
         return "Подписка истекла, не найдена или пользователь заблокирован", 403
     
-    return f"""#profile-title: 🌐 Потужно VPN Free
-#profile-update-interval: 1
-#support-url: https://t.me/mel1ste
-#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
-#channel: 📢 https://t.me/ciorsa
-#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={result[0]}
-vless://b9708941-a851-40d1-bcfd-43f189b17e8f@81.94.159.32:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=yandex.ru&fp=firefox&pbk=5L6iTGyjR5bzxyYEWEX21CGt1O8_oxWrXlVrh2MCEWM&sid=ef30f4fe17e4d890&spx=%2Fmaps%2F&type=tcp#%D0%9D%D0%BE%D0%B2%D1%8B%D0%B9+%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80
-"""
+    keys = get_keys_from_db()
+    
+    if not keys:
+        keys = [
+            "vless://b9708941-a851-40d1-bcfd-43f189b17e8f@81.94.159.32:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=yandex.ru&fp=firefox&pbk=5L6iTGyjR5bzxyYEWEX21CGt1O8_oxWrXlVrh2MCEWM&sid=ef30f4fe17e4d890&spx=%2Fmaps%2F&type=tcp#%D0%9D%D0%BE%D0%B2%D1%8B%D0%B9+%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80"
+        ]
+    
+    return KEY_TEMPLATE.format(
+        expire=result[0],
+        keys='\n'.join(keys)
+    )
 
 # ========== ЗАПУСК БОТА ==========
 def run_bot():
     bot.infinity_polling()
 
 if __name__ == '__main__':
+    # Загружаем ключи при старте
+    if not get_keys_from_db():
+        default_keys = [
+            "vless://b9708941-a851-40d1-bcfd-43f189b17e8f@81.94.159.32:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=yandex.ru&fp=firefox&pbk=5L6iTGyjR5bzxyYEWEX21CGt1O8_oxWrXlVrh2MCEWM&sid=ef30f4fe17e4d890&spx=%2Fmaps%2F&type=tcp#%D0%9D%D0%BE%D0%B2%D1%8B%D0%B9+%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80"
+        ]
+        save_keys_to_db(default_keys)
+    
     thread = Thread(target=run_bot)
     thread.start()
     app.run(host='0.0.0.0', port=10000)
+    
