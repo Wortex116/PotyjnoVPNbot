@@ -9,6 +9,8 @@ from threading import Thread
 import requests
 import re
 from bs4 import BeautifulSoup
+import random
+import string
 
 # ========== ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ==========
 BOT_TOKEN = os.getenv('BOT_TOKEN', '8621740437:AAHXYevornlIKyNN204hrZ307slYZiYIqTE')
@@ -25,6 +27,12 @@ SUPPORT_USERNAME = "@mel1ste"
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
+# ========== ГЕНЕРАЦИЯ ТОКЕНА ==========
+def generate_subscription_token(length=12):
+    """Генерирует случайную строку из букв и цифр (12 символов)"""
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choice(chars) for _ in range(length))
+
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
     conn = sqlite3.connect('users.db')
@@ -35,7 +43,8 @@ def init_db():
             subscription_end INTEGER,
             notified_3days INTEGER DEFAULT 0,
             last_activity INTEGER DEFAULT 0,
-            is_blocked INTEGER DEFAULT 0
+            is_blocked INTEGER DEFAULT 0,
+            token TEXT UNIQUE
         )
     ''')
     cursor.execute('''
@@ -100,7 +109,23 @@ def is_subscribed(user_id):
         return False
 
 def get_subscription_link(user_id):
-    return f"https://potyjnovpnbot.onrender.com/sub/{user_id}"
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT token FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        token = result[0]
+    else:
+        token = generate_subscription_token()
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET token = ? WHERE user_id = ?", (token, user_id))
+        conn.commit()
+        conn.close()
+    
+    return f"https://potyjnovpnbot.onrender.com/sub/{token}"
 
 def is_blocked(user_id):
     conn = sqlite3.connect('users.db')
@@ -111,7 +136,6 @@ def is_blocked(user_id):
     return result and result[0] == 1
 
 def can_add_referral(referrer_id):
-    """Проверяет, не превышен ли лимит 10 рефералов в день"""
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     
@@ -240,15 +264,16 @@ def start_command(message):
     # ===== ОСНОВНАЯ ЛОГИКА /START =====
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, last_activity FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id, last_activity, token FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
     
     current_time = int(time.time())
     
     if not user:
+        token = generate_subscription_token()
         cursor.execute(
-            "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked) VALUES (?, ?, ?, ?)",
-            (user_id, current_time + 7*24*60*60, current_time, 0)
+            "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (?, ?, ?, ?, ?)",
+            (user_id, current_time + 7*24*60*60, current_time, 0, token)
         )
         conn.commit()
         bot.reply_to(message, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
@@ -284,7 +309,7 @@ def profile_command(message):
     
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT subscription_end, token FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     conn.close()
     
@@ -292,7 +317,7 @@ def profile_command(message):
         bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
         return
     
-    subscription_end = result[0]
+    subscription_end, token = result
     current_time = int(time.time())
     
     if subscription_end > current_time:
@@ -527,13 +552,14 @@ def check_subscription(call):
                 except:
                     pass
         
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT user_id, token FROM users WHERE user_id = ?", (user_id,))
         user = cursor.fetchone()
         
         if not user:
+            token = generate_subscription_token()
             cursor.execute(
-                "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked) VALUES (?, ?, ?, ?)",
-                (user_id, int(time.time()) + 7*24*60*60, int(time.time()), 0)
+                "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (?, ?, ?, ?, ?)",
+                (user_id, int(time.time()) + 7*24*60*60, int(time.time()), 0, token)
             )
             conn.commit()
             bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
@@ -559,7 +585,6 @@ KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
 {keys}"""
 
 def load_keys_from_url(url):
-    """Загружает ключи из URL (парсит HTML-страницу или сырой файл)"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -569,25 +594,21 @@ def load_keys_from_url(url):
         
         text = response.text
         
-        # 1. Ищем vless:// строки по всему тексту
         keys = re.findall(r'vless://[^\s<>"\']+', text)
         
-        # 2. Если не нашли, пробуем парсить как HTML через BeautifulSoup
         if not keys:
-            soup = BeautifulSoup(text, 'html.parser')
+            soup = BeautifulSoup(text, 'html5lib')
             for element in soup.find_all(string=True):
                 found = re.findall(r'vless://[^\s<>"\']+', element)
                 if found:
                     keys.extend(found)
         
-        # 3. Если всё ещё пусто — пробуем найти в JSON-блоке
         if not keys:
             json_match = re.search(r'\[{.*}\]', text, re.DOTALL)
             if json_match:
                 json_text = json_match.group(0)
                 keys = re.findall(r'vless://[^\s<>"\']+', json_text)
         
-        # Убираем дубликаты, сохраняя порядок
         seen = set()
         unique_keys = []
         for key in keys:
@@ -601,7 +622,6 @@ def load_keys_from_url(url):
         return None
 
 def save_keys_to_db(keys):
-    """Сохраняет ключи в таблицу settings"""
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute(
@@ -612,7 +632,6 @@ def save_keys_to_db(keys):
     conn.close()
 
 def get_keys_from_db():
-    """Загружает ключи из таблицы settings"""
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key = 'vless_keys'")
@@ -953,7 +972,7 @@ def check_user(message):
     
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT subscription_end, is_blocked, token FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
     conn.close()
     
@@ -961,7 +980,7 @@ def check_user(message):
         bot.reply_to(message, f"❌ Пользователь {user_id} не найден.")
         return
     
-    subscription_end, is_blocked = result
+    subscription_end, is_blocked, token = result
     current_time = int(time.time())
     
     if is_blocked:
@@ -972,7 +991,7 @@ def check_user(message):
     else:
         status = "❌ Истекла"
     
-    bot.reply_to(message, f"👤 Пользователь {user_id}\n📊 Статус: {status}")
+    bot.reply_to(message, f"👤 Пользователь {user_id}\n📊 Статус: {status}\n🔗 Токен: {token}")
 
 @bot.message_handler(commands=['prolong'])
 def prolong_user(message):
@@ -1834,16 +1853,21 @@ def ping():
     return "ok", 200
 
 # ========== ЭНДПОИНТ ДЛЯ ПОДПИСКИ ==========
-@app.route('/sub/<int:user_id>')
-def get_subscription(user_id):
+@app.route('/sub/<token>')
+def get_subscription(token):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id, subscription_end, is_blocked FROM users WHERE token = ?", (token,))
     result = cursor.fetchone()
     conn.close()
     
-    if not result or result[0] < int(time.time()) or result[1] == 1:
-        return "Подписка истекла, не найдена или пользователь заблокирован", 403
+    if not result:
+        return "Подписка не найдена", 404
+    
+    user_id, subscription_end, is_blocked = result
+    
+    if subscription_end < int(time.time()) or is_blocked == 1:
+        return "Подписка истекла или пользователь заблокирован", 403
     
     keys = get_keys_from_db()
     
@@ -1853,7 +1877,7 @@ def get_subscription(user_id):
         ]
     
     return KEY_TEMPLATE.format(
-        expire=result[0],
+        expire=subscription_end,
         keys='\n'.join(keys)
     )
 
