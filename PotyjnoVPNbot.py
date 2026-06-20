@@ -19,7 +19,7 @@ CHANNEL_LINK = "https://t.me/ciorsa"
 SUPPORT_USERNAME = "@mel1ste"
 
 # ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
-REFERRAL_ENABLED = False  # по умолчанию выключена
+REFERRAL_ENABLED = False
 
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -112,7 +112,7 @@ def start_command(message):
         )
         return
     
-    # ===== ОБРАБОТКА РЕФЕРАЛЬНОЙ ССЫЛКИ =====
+    # Реферальная ссылка
     referrer_id = None
     if len(message.text.split()) > 1:
         ref_param = message.text.split()[1]
@@ -164,14 +164,13 @@ def start_command(message):
                             pass
             conn.close()
     
-    # ===== ОСНОВНАЯ ЛОГИКА =====
+    # Основная логика
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, last_activity FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
     
     current_time = int(time.time())
-    is_new_user = False
     
     if not user:
         cursor.execute(
@@ -179,7 +178,6 @@ def start_command(message):
             (user_id, current_time + 7*24*60*60, current_time)
         )
         conn.commit()
-        is_new_user = True
         bot.reply_to(message, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
     else:
         last_activity = user[1] if user[1] else 0
@@ -190,7 +188,6 @@ def start_command(message):
         else:
             bot.reply_to(message, "👋 Добро пожаловать!")
         
-        # Обновляем активность
         cursor.execute(
             "UPDATE users SET last_activity = ? WHERE user_id = ?",
             (current_time, user_id)
@@ -373,7 +370,7 @@ def check_subscription(call):
             show_alert=True
         )
 
-# ========== РЕФЕРАЛЬНЫЕ КОМАНДЫ ДЛЯ АДМИНА ==========
+# ========== РЕФЕРАЛЬНЫЕ КОМАНДЫ ==========
 @bot.message_handler(commands=['ref_on'])
 def referral_on(message):
     if message.from_user.id != ADMIN_ID:
@@ -765,38 +762,6 @@ def remove_admin(message):
     except:
         pass
 
-@bot.message_handler(commands=['admins_list'])
-def admins_list(message):
-    if message.chat.type != "private":
-        return
-    
-    if message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "⛔ Только создатель может смотреть список админов.")
-        return
-    
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT user_id, added_at FROM admins")
-    admins = cursor.fetchall()
-    conn.close()
-    
-    if not admins:
-        bot.reply_to(message, "📋 Список администраторов пуст.")
-        return
-    
-    text = "👑 Список администраторов:\n\n"
-    text += f"👤 Создатель: {ADMIN_ID}\n"
-    
-    for admin_id, added_at in admins:
-        try:
-            user = bot.get_chat(admin_id)
-            name = user.first_name or str(admin_id)
-        except:
-            name = str(admin_id)
-        text += f"└ {name} (ID: {admin_id})\n"
-    
-    bot.reply_to(message, text)
-
 # ========== КОМАНДА ADMINS_LIST ==========
 @bot.message_handler(commands=['admins_list'])
 def admins_list(message):
@@ -829,7 +794,6 @@ def admins_list(message):
         text += f"└ {name} (ID: {admin_id})\n"
     
     bot.reply_to(message, text)
-
 
 # ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (/manage) ==========
 user_cache = {}
@@ -1373,4 +1337,3 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.start()
     app.run(host='0.0.0.0', port=10000)
-    
