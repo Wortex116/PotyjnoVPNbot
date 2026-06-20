@@ -376,35 +376,7 @@ def start_command(message):
     conn.close()
     bot.reply_to(message, "Выберите действие:", reply_markup=main_menu())
 
-# ========== ОБРАБОТЧИК ТЕКСТОВЫХ СООБЩЕНИЙ ==========
-@bot.message_handler(func=lambda message: True)
-def handle_all_messages(message):
-    if message.chat.type != "private":
-        return
-    
-    # Если это команда (начинается с /) — пропускаем
-    if message.text.startswith('/'):
-        return
-    
-    text = message.text
-    user_id = message.from_user.id
-    
-    if is_blocked(user_id):
-        bot.reply_to(message, "🚫 Вы заблокированы администратором. Обратитесь в поддержку: @mel1ste")
-        return
-    
-    if text == "👤 Личный кабинет":
-        profile_command(message)
-    elif text == "📡 Моя подписка":
-        my_subscription(message)
-    elif text == "👥 Рефералы":
-        referrals_command(message)
-    elif text == "🏆 Топ рефералов":
-        top_referrals_command(message)
-    elif text == "🔍 Проверка ключей":
-        check_keys_command(message)
-    elif text == "❓ Поддержка":
-        support_command(message)
+
 
 # ========== КНОПКА "ЛИЧНЫЙ КАБИНЕТ" ==========
 @bot.message_handler(func=lambda message: message.text == "👤 Личный кабинет")
