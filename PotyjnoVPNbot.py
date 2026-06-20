@@ -2035,6 +2035,7 @@ def get_subscription(token):
 
 # ========== ЗАПУСК БОТА ==========
 def run_bot():
+    bot.remove_webhook()
     bot.infinity_polling(skip_pending=True)
 
 if __name__ == '__main__':
