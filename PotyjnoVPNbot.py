@@ -1728,17 +1728,63 @@ KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
 #subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={expire}
 {keys}"""
 
+# ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
+import requests
+import re
+from bs4 import BeautifulSoup
+
+# Шаблон ответа для подписки
+KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
+#profile-update-interval: 1
+#support-url: https://t.me/mel1ste
+#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
+#channel: 📢 https://t.me/ciorsa
+#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={expire}
+{keys}"""
+
 def load_keys_from_url(url):
-    """Загружает ключи из URL и возвращает список строк vless://"""
+    """Загружает ключи из URL (парсит HTML-страницу или сырой файл)"""
     try:
-        response = requests.get(url, timeout=30)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        response = requests.get(url, timeout=30, headers=headers)
         response.raise_for_status()
+        
         text = response.text
         
-        # Ищем все строки, начинающиеся с vless://
-        keys = re.findall(r'^vless://.*$', text, re.MULTILINE)
-        return keys
+        # 1. Ищем vless:// строки по всему тексту
+        keys = re.findall(r'vless://[^\s<>"\']+', text)
+        
+        # 2. Если не нашли, пробуем парсить как HTML через BeautifulSoup
+        if not keys:
+            soup = BeautifulSoup(text, 'html.parser')
+            # Ищем все элементы, содержащие vless://
+            for element in soup.find_all(string=True):
+                found = re.findall(r'vless://[^\s<>"\']+', element)
+                if found:
+                    keys.extend(found)
+        
+        # 3. Если всё ещё пусто — пробуем найти в JSON-блоке (для Happ)
+        if not keys:
+            # Ищем блок с ключами в JSON-подобном формате
+            json_match = re.search(r'\[{.*}\]', text, re.DOTALL)
+            if json_match:
+                json_text = json_match.group(0)
+                # Ищем vless:// внутри JSON
+                keys = re.findall(r'vless://[^\s<>"\']+', json_text)
+        
+        # Убираем дубликаты, сохраняя порядок
+        seen = set()
+        unique_keys = []
+        for key in keys:
+            if key not in seen:
+                seen.add(key)
+                unique_keys.append(key)
+        
+        return unique_keys
     except Exception as e:
+        print(f"Ошибка загрузки ключей: {e}")
         return None
 
 def save_keys_to_db(keys):
@@ -1773,17 +1819,14 @@ def update_keys_command(message):
     if len(args) != 2:
         bot.reply_to(
             message,
-            "❌ Использование: /update_keys [URL]\n"
-            "Пример: /update_keys https://xuexvpn-1.onrender.com/sub/8500473305"
+            "❌ Использование: /update_keys [URL]"
         )
         return
     
     url = args[1]
     
-    # Отправляем сообщение о начале загрузки
     msg = bot.reply_to(message, "⏳ Загрузка ключей...")
     
-    # Загружаем ключи
     keys = load_keys_from_url(url)
     
     if keys is None:
@@ -1796,13 +1839,13 @@ def update_keys_command(message):
     
     if not keys:
         bot.edit_message_text(
-            "❌ В файле не найдено ключей (строк с vless://).",
+            "❌ В файле не найдено ключей (строк с vless://).\n"
+            "Проверьте, что ссылка ведёт на файл с ключами.",
             msg.chat.id,
             msg.message_id
         )
         return
     
-    # Сохраняем ключи в БД
     save_keys_to_db(keys)
     
     bot.edit_message_text(
