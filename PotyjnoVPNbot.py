@@ -18,9 +18,6 @@ CHANNEL_LINK = "https://t.me/ciorsa"
 # ========== ПОДДЕРЖКА ==========
 SUPPORT_USERNAME = "@mel1ste"
 
-# ========== РЕФЕРАЛЬНАЯ СИСТЕМА ==========
-REFERRAL_ENABLED = False
-
 # ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -54,11 +51,34 @@ def init_db():
             PRIMARY KEY (referrer_id, referred_id)
         )
     ''')
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value INTEGER
+        )
+    ''')
     conn.commit()
     conn.close()
 
 init_db()
 
+# ========== РАБОТА С НАСТРОЙКАМИ ==========
+def get_setting(key, default=0):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else default
+
+def set_setting(key, value):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    conn.commit()
+    conn.close()
+
+# ========== ФУНКЦИИ ПРОВЕРКИ ==========
 def is_admin(user_id):
     if user_id == ADMIN_ID:
         return True
@@ -174,7 +194,7 @@ def start_command(message):
                     except:
                         pass
                     
-                    if REFERRAL_ENABLED:
+                    if get_setting('referral_enabled') == 1:
                         new_end = ref_result[0] + 3 * 24 * 60 * 60
                         cursor.execute(
                             "UPDATE users SET subscription_end = ? WHERE user_id = ?",
@@ -475,8 +495,7 @@ def referral_on(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    global REFERRAL_ENABLED
-    REFERRAL_ENABLED = True
+    set_setting('referral_enabled', 1)
     
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
@@ -539,8 +558,7 @@ def referral_off(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    global REFERRAL_ENABLED
-    REFERRAL_ENABLED = False
+    set_setting('referral_enabled', 0)
     bot.reply_to(message, "❌ Реферальная система ВЫКЛЮЧЕНА. Новые рефералы сохраняются, но дни не начисляются.")
 
 @bot.message_handler(commands=['ref_status'])
@@ -549,7 +567,7 @@ def referral_status(message):
         bot.reply_to(message, "⛔ У вас нет прав.")
         return
     
-    status = "ВКЛЮЧЕНА ✅" if REFERRAL_ENABLED else "ВЫКЛЮЧЕНА ❌"
+    status = "ВКЛЮЧЕНА ✅" if get_setting('referral_enabled') == 1 else "ВЫКЛЮЧЕНА ❌"
     bot.reply_to(message, f"📊 Реферальная система: {status}")
 
 # ========== БЛОКИРОВКА ПОЛЬЗОВАТЕЛЕЙ ==========
@@ -1197,7 +1215,6 @@ def inline_block_user(call):
     except:
         pass
     
-    # Обновляем карточку пользователя
     user_action_menu(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
@@ -1224,7 +1241,6 @@ def inline_unblock_user(call):
     except:
         pass
     
-    # Обновляем карточку пользователя
     user_action_menu(call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
@@ -1545,7 +1561,6 @@ def top_refs_admin(call):
         except:
             name = str(referrer_id)
         
-        # Получаем дату регистрации реферера
         conn2 = sqlite3.connect('users.db')
         cursor2 = conn2.cursor()
         cursor2.execute("SELECT last_activity FROM users WHERE user_id = ?", (referrer_id,))
