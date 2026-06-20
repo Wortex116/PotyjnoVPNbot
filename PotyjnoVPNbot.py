@@ -1715,6 +1715,103 @@ def handle_search_input(message):
 def noop(call):
     bot.answer_callback_query(call.id)
 
+# ========== ОБНОВЛЕНИЕ КЛЮЧЕЙ ==========
+import requests
+import re
+
+# Шаблон ответа для подписки
+KEY_TEMPLATE = """#profile-title: 🌐 Потужно VPN Free
+#profile-update-interval: 1
+#support-url: https://t.me/mel1ste
+#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
+#channel: 📢 https://t.me/ciorsa
+#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={expire}
+{keys}"""
+
+def load_keys_from_url(url):
+    """Загружает ключи из URL и возвращает список строк vless://"""
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        text = response.text
+        
+        # Ищем все строки, начинающиеся с vless://
+        keys = re.findall(r'^vless://.*$', text, re.MULTILINE)
+        return keys
+    except Exception as e:
+        return None
+
+def save_keys_to_db(keys):
+    """Сохраняет ключи в таблицу settings"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+        ('vless_keys', '|||'.join(keys))
+    )
+    conn.commit()
+    conn.close()
+
+def get_keys_from_db():
+    """Загружает ключи из таблицы settings"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = 'vless_keys'")
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        return result[0].split('|||')
+    return []
+
+@bot.message_handler(commands=['update_keys'])
+def update_keys_command(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    args = message.text.split()
+    if len(args) != 2:
+        bot.reply_to(
+            message,
+            "❌ Использование: /update_keys [URL]\n"
+            "Пример: /update_keys https://xuexvpn-1.onrender.com/sub/8500473305"
+        )
+        return
+    
+    url = args[1]
+    
+    # Отправляем сообщение о начале загрузки
+    msg = bot.reply_to(message, "⏳ Загрузка ключей...")
+    
+    # Загружаем ключи
+    keys = load_keys_from_url(url)
+    
+    if keys is None:
+        bot.edit_message_text(
+            "❌ Не удалось загрузить ключи. Проверьте URL.",
+            msg.chat.id,
+            msg.message_id
+        )
+        return
+    
+    if not keys:
+        bot.edit_message_text(
+            "❌ В файле не найдено ключей (строк с vless://).",
+            msg.chat.id,
+            msg.message_id
+        )
+        return
+    
+    # Сохраняем ключи в БД
+    save_keys_to_db(keys)
+    
+    bot.edit_message_text(
+        f"✅ Ключи обновлены!\n\n"
+        f"📊 Загружено ключей: {len(keys)}\n"
+        f"🔗 Источник: {url}",
+        msg.chat.id,
+        msg.message_id
+    )
 # ========== ЭНДПОИНТ ДЛЯ ПИНГА ==========
 @app.route('/ping')
 def ping():
