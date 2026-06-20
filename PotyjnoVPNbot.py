@@ -556,11 +556,13 @@ def get_subscription(user_id):
     
     # Здесь возвращается твой VPN-конфиг
     return f"""
-#profile-title: VPN Бот
-#subscription-userinfo: upload=0; download=0; total=0; expire={result[0]}
-#support-url: https://t.me/ciorsa
-
-vless://... ТВОЙ КЛЮЧ ...
+#profile-title: 🌐 Потужно VPN Free
+#profile-update-interval: 1
+#support-url: https://t.me/mel1ste
+#announce: 📡 Сервера LTE использовать только при белых списках. Без торрентов. 🕐 Поддержка с 10 до 22, ответят в ближайшее время.
+#channel: 📢 https://t.me/ciorsa
+#subscription-userinfo: upload=0; download=0; total=10995116277760000; expire={result[0]}
+vless://b9708941-a851-40d1-bcfd-43f189b17e8f@81.94.159.32:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=yandex.ru&fp=firefox&pbk=5L6iTGyjR5bzxyYEWEX21CGt1O8_oxWrXlVrh2MCEWM&sid=ef30f4fe17e4d890&spx=%2Fmaps%2F&type=tcp#%D0%9D%D0%BE%D0%B2%D1%8B%D0%B9+%D1%81%D0%B5%D1%80%D0%B2%D0%B5%D1%80
 """
 
 # ========== ЗАПУСК БОТА ==========
