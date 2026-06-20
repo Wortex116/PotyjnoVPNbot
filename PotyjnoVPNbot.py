@@ -5,6 +5,7 @@ import socket
 import string
 import random
 import threading
+import traceback
 import base64
 import urllib.parse
 import io
@@ -136,6 +137,27 @@ def generate_subscription_token():
         conn.close()
         if not exists:
             return token
+
+def get_next_file_number():
+    """
+    Атомарно увеличивает и возвращает счётчик файлов расшифровки
+    (хранится в таблице settings, ключ 'decrypt_file_counter').
+    Используется один SQL-запрос с RETURNING, поэтому он безопасен
+    при параллельных запросах от разных пользователей.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO settings (key, value) VALUES ('decrypt_file_counter', '1')
+        ON CONFLICT (key) DO UPDATE
+        SET value = (COALESCE(settings.value, '0')::integer + 1)::text
+        RETURNING value
+    """)
+    new_value = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return int(new_value)
 
 # ==================== KEY PARSING UTILS ====================
 
@@ -748,76 +770,126 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
     if user_id in decrypt_results:
         del decrypt_results[user_id]
 
-    wait_msg = bot.reply_to(message, "⏳ Обрабатываю подписку...")
+    try:
+        wait_msg = bot.reply_to(message, "⏳ Обрабатываю подписку...")
+    except Exception:
+        wait_msg = None
 
     def process():
         try:
-            if file_bytes is not None:
-                raw = file_bytes.decode('utf-8', errors='ignore')
-                keys, steps = _parse_subscription_any(raw, source_label=file_name or 'файл')
-            else:
-                keys, steps = _parse_subscription_any(text)
-        except Exception as e:
-            keys, steps = [], [f"❌ Ошибка: {e}"]
+            # ---- Шаг 1: парсинг ключей ----
+            try:
+                if file_bytes is not None:
+                    raw = file_bytes.decode('utf-8', errors='ignore')
+                    keys, steps = _parse_subscription_any(raw, source_label=file_name or 'файл')
+                else:
+                    keys, steps = _parse_subscription_any(text)
+            except Exception as e:
+                keys, steps = [], [f"Ошибка парсинга: {e}"]
 
-        try:
-            bot.delete_message(message.chat.id, wait_msg.message_id)
-        except:
-            pass
+            if wait_msg:
+                try:
+                    bot.delete_message(message.chat.id, wait_msg.message_id)
+                except Exception:
+                    pass
 
-        if not keys:
-            info = '\n'.join(steps) if steps else '—'
-            bot.reply_to(
-                message,
-                f"❌ *Не удалось найти VPN ключи*\n\n"
-                f"🔍 Шаги:\n{info}\n\n"
-                f"Убедитесь что ссылка рабочая и содержит VPN ключи.",
-                parse_mode="Markdown"
+            # ---- Если ключи не найдены ----
+            if not keys:
+                info = '\n'.join(steps) if steps else '—'
+                err_text = (
+                    "❌ Не удалось найти VPN ключи\n\n"
+                    f"Шаги:\n{info}\n\n"
+                    "Убедитесь что ссылка рабочая и содержит VPN ключи."
+                )
+                # ВАЖНО: без parse_mode="Markdown" — в URL/тексте могут быть
+                # символы _ * ` [ ], которые ломали парсинг и "роняли" поток
+                # без какого-либо сообщения пользователю.
+                try:
+                    bot.reply_to(message, err_text)
+                except Exception:
+                    try:
+                        bot.send_message(message.chat.id, err_text)
+                    except Exception as e3:
+                        print(f"[decrypt] не удалось отправить сообщение об ошибке: {e3}")
+                return
+
+            # ---- Порядковый номер файла + дата ----
+            try:
+                file_number = get_next_file_number()
+            except Exception as e:
+                print(f"[decrypt] не удалось получить номер файла: {e}")
+                file_number = 0
+            date_str = datetime.now().strftime("%d.%m.%Y")
+            filename = f"{file_number:06d}_{date_str}.txt"
+
+            # ---- Сборка содержимого файла ----
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            src = text[:80] if text else (file_name or 'файл')
+            file_content = (
+                f"# VPN подписка расшифрована\n"
+                f"# Номер файла: {file_number:06d}\n"
+                f"# Дата: {now}\n"
+                f"# Ключей: {len(keys)}\n"
+                f"# Источник: {src}\n"
+                f"# {'='*48}\n\n"
             )
-            return
+            file_content += '\n'.join(keys) + '\n'
 
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        src = text[:80] if text else (file_name or 'файл')
-        file_content = (
-            f"# VPN подписка расшифрована\n"
-            f"# Дата: {now}\n"
-            f"# Ключей: {len(keys)}\n"
-            f"# Источник: {src}\n"
-            f"# {'='*48}\n\n"
-        )
-        file_content += '\n'.join(keys) + '\n'
+            proto_stats = {}
+            for k in keys:
+                m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                if m:
+                    p = m.group(1).lower()
+                    proto_stats[p] = proto_stats.get(p, 0) + 1
+            stats_text = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+            steps_text = '\n'.join(steps) if steps else '—'
 
-        proto_stats = {}
-        for k in keys:
-            m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
-            if m:
-                p = m.group(1).lower()
-                proto_stats[p] = proto_stats.get(p, 0) + 1
-        stats_text = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
-        steps_text = '\n'.join(steps) if steps else '—'
-
-        caption = (
-            f"✅ *Расшифровка завершена!*\n\n"
-            f"📊 Найдено ключей: *{len(keys)}*\n\n"
-            f"📋 По протоколам:\n{stats_text}\n\n"
-            f"🔍 Шаги:\n{steps_text}"
-        )
-
-        buf = io.BytesIO(file_content.encode('utf-8'))
-        buf.name = f"vpn_keys_{len(keys)}.txt"
-        try:
-            bot.send_document(
-                message.chat.id, buf,
-                caption=caption, parse_mode="Markdown",
-                visible_file_name=f"vpn_keys_{len(keys)}.txt"
+            caption = (
+                f"✅ Расшифровка завершена!\n\n"
+                f"📊 Найдено ключей: {len(keys)}\n"
+                f"📁 Файл №{file_number:06d}\n\n"
+                f"📋 По протоколам:\n{stats_text}\n\n"
+                f"🔍 Шаги:\n{steps_text}"
             )
-        except:
-            buf.seek(0)
-            bot.send_document(
-                message.chat.id, buf,
-                caption=f"✅ Найдено ключей: {len(keys)}",
-                visible_file_name=f"vpn_keys_{len(keys)}.txt"
-            )
+            # Telegram режет caption на отправке документа лимитом 1024 символа
+            if len(caption) > 1024:
+                caption = caption[:1000].rstrip() + "\n…"
+
+            buf = io.BytesIO(file_content.encode('utf-8'))
+            buf.name = filename
+            try:
+                bot.send_document(
+                    message.chat.id, buf,
+                    caption=caption,
+                    visible_file_name=filename
+                )
+            except Exception as e1:
+                print(f"[decrypt] первая попытка send_document не удалась: {e1}")
+                try:
+                    buf.seek(0)
+                    bot.send_document(
+                        message.chat.id, buf,
+                        caption=f"✅ Найдено ключей: {len(keys)}\n📁 Файл №{file_number:06d}",
+                        visible_file_name=filename
+                    )
+                except Exception as e2:
+                    print(f"[decrypt] вторая попытка send_document не удалась: {e2}")
+                    try:
+                        bot.send_message(message.chat.id, f"❌ Не удалось отправить файл: {e2}")
+                    except Exception:
+                        pass
+        except Exception as outer_e:
+            # Сетевая ошибка вызывающая истечение времени или иной непредвиденный сбой —
+            # ранее тут поток просто тихо умирал и пользователь не получал НИЧЕГО.
+            print(f"[decrypt] непредвиденная ошибка: {outer_e}")
+            print(traceback.format_exc())
+            try:
+                bot.send_message(
+                    message.chat.id,
+                    "❌ Произошла ошибка при обработке подписки. Попробуйте снова или напишите в поддержку: " + SUPPORT
+                )
+            except Exception:
+                pass
 
     t = threading.Thread(target=process)
     t.daemon = True
@@ -1286,107 +1358,6 @@ def cmd_update_keys(message):
         parse_mode="Markdown"
     )
 
-# ==================== KEY PARSING FUNCS ====================
-
-def load_keys_from_url(raw_url):
-    url = _resolve_url(raw_url)
-    if not re.match(r'https?://', url, re.IGNORECASE):
-        decoded = _try_b64(url)
-        if decoded:
-            keys = _extract_vpn_keys(decoded)
-            if keys:
-                return _dedup(keys)
-        return _dedup(_extract_vpn_keys(url))
-    headers = {'User-Agent': 'v2rayNG/1.8.7', 'Accept': '*/*'}
-    content = None
-    for verify in [True, False]:
-        try:
-            resp = requests.get(url, headers=headers, timeout=30, verify=verify)
-            content = resp.text
-            break
-        except:
-            continue
-    if not content:
-        return []
-    return _parse_keys_from_content(content)
-
-def load_keys_from_text(text):
-    return _parse_keys_from_content(text)
-
-def _resolve_url(raw_url):
-    raw_url = raw_url.strip()
-    app_scheme = re.match(
-        r'^(?:incy|happ|v2ray|v2rayng|v2box|clash|sing-box|quantumult|surge|loon|shadowrocket|stash|nekoray|hiddify|streisand|karing|mihomo|flclash)://(?:add|sub|crypt|import|install|update)/(.+)',
-        raw_url, re.IGNORECASE
-    )
-    if app_scheme:
-        payload = urllib.parse.unquote(app_scheme.group(1).strip())
-        if re.match(r'https?://', payload, re.IGNORECASE):
-            return payload
-        return payload
-    proxy_wrap = re.match(r'https?://[^/]+/(https?://.+)', raw_url, re.IGNORECASE)
-    if proxy_wrap:
-        return proxy_wrap.group(1)
-    return raw_url
-
-def _parse_keys_from_content(content):
-    all_keys = []
-    all_keys.extend(_extract_vpn_keys(content))
-    decoded = _try_b64(content.strip())
-    if decoded:
-        all_keys.extend(_extract_vpn_keys(decoded))
-    for line in content.splitlines():
-        line = line.strip()
-        if len(line) < 20:
-            continue
-        d = _try_b64(line)
-        if d:
-            all_keys.extend(_extract_vpn_keys(d))
-    if '<' in content:
-        try:
-            soup = BeautifulSoup(content, 'html5lib')
-            for elem in soup.find_all(string=True):
-                all_keys.extend(_extract_vpn_keys(str(elem)))
-        except:
-            pass
-    try:
-        json_matches = re.findall(
-            r'"([^"]*(?:vless|vmess|trojan|ss|ssr|hysteria)[^"]*)"', content, re.IGNORECASE
-        )
-        for m in json_matches:
-            all_keys.extend(_extract_vpn_keys(m))
-    except:
-        pass
-    return _dedup(all_keys)
-
-def _finish_update_keys(message, keys, source_label):
-    if not keys:
-        bot.reply_to(
-            message,
-            "❌ Не найдено ни одного VPN ключа.\n\n"
-            "Поддерживается:\n"
-            "• vless:// vmess:// trojan:// ss:// и др.\n"
-            "• Base64 подписка\n"
-            "• URL подписки (включая happ.dska.su и подобные)\n"
-            "• HTML страница с ключами"
-        )
-        return
-    save_keys_to_db(keys)
-    proto_stats = {}
-    for k in keys:
-        m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
-        if m:
-            p = m.group(1).lower()
-            proto_stats[p] = proto_stats.get(p, 0) + 1
-    stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
-    bot.reply_to(
-        message,
-        f"✅ Ключи обновлены!\n\n"
-        f"📊 Загружено ключей: {len(keys)}\n"
-        f"📋 По протоколам:\n{stats}\n"
-        f"🔗 Источник: {source_label}"
-    )
-
 # ==================== REF COMMANDS ====================
 
 @bot.message_handler(commands=['ref_on'])
@@ -1803,6 +1774,10 @@ def handle_document(message):
             downloaded = bot.download_file(file_info.file_path)
             _do_decrypt(message, user_id, file_bytes=downloaded, file_name=message.document.file_name)
         except Exception as e:
+            # Раньше при ошибке скачивания файла флаг 'waiting' оставался
+            # висеть навсегда — пользователь не мог повторно запустить расшифровку.
+            if user_id in decrypt_results:
+                del decrypt_results[user_id]
             bot.reply_to(message, f"❌ Не удалось прочитать файл: {e}")
         return
 
