@@ -166,9 +166,7 @@ def can_add_referral(referrer_id):
 check_results = {}
 
 def ping_key(key):
-    """Проверяет доступность ключа через TCP-сокет"""
     try:
-        # Извлекаем IP и порт из ключа
         match = re.search(r'@([\d\.]+):(\d+)', key)
         if not match:
             match = re.search(r'vless://[^@]+@([\d\.]+):(\d+)', key)
@@ -187,13 +185,11 @@ def ping_key(key):
         return False
 
 def check_keys_async(chat_id, keys, user_id, message_id):
-    """Фоновая проверка ключей"""
     results = []
     working = 0
     not_working = 0
     
     for i, key in enumerate(keys):
-        # Обновляем статус каждые 3 ключа
         if i % 3 == 0:
             try:
                 bot.edit_message_text(
@@ -214,7 +210,6 @@ def check_keys_async(chat_id, keys, user_id, message_id):
         else:
             not_working += 1
     
-    # Формируем отчёт
     report = f"📊 *Результаты проверки*\n\n"
     report += f"✅ Работает: {working}\n"
     report += f"❌ Не работает: {not_working}\n"
@@ -234,7 +229,6 @@ def check_keys_async(chat_id, keys, user_id, message_id):
     except:
         bot.send_message(chat_id, report)
     
-    # Очищаем состояние
     if user_id in check_results:
         del check_results[user_id]
 
@@ -271,7 +265,6 @@ def start_command(message):
         bot.reply_to(message, "🚫 Вы заблокированы администратором. Обратитесь в поддержку: @mel1ste")
         return
     
-    # ===== ОБРАБОТКА РЕФЕРАЛЬНОЙ ССЫЛКИ =====
     referrer_id = None
     if len(message.text.split()) > 1:
         ref_param = message.text.split()[1]
@@ -342,7 +335,6 @@ def start_command(message):
                     pass
         conn.close()
     
-    # ===== ПРОВЕРКА ПОДПИСКИ =====
     if not is_subscribed(user_id):
         bot.reply_to(
             message,
@@ -351,7 +343,6 @@ def start_command(message):
         )
         return
     
-    # ===== ОСНОВНАЯ ЛОГИКА /START =====
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, last_activity, token FROM users WHERE user_id = %s", (user_id,))
@@ -2044,7 +2035,7 @@ def get_subscription(token):
 
 # ========== ЗАПУСК БОТА ==========
 def run_bot():
-    bot.infinity_polling()
+    bot.infinity_polling(skip_pending=True)
 
 if __name__ == '__main__':
     if not get_keys_from_db():
