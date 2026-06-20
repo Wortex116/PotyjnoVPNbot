@@ -1666,5 +1666,6 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.daemon = True
     thread.start()
-    app.run(host='0.0.0.0', port=10000)
+    from waitress import waitress_serve
+waitress_serve(app, host='0.0.0.0', port=10000)
     
