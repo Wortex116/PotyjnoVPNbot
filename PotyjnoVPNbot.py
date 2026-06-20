@@ -33,7 +33,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             subscription_end INTEGER,
-            notified_3days INTEGER DEFAULT 0
+            notified_3days INTEGER DEFAULT 0,
+            last_activity INTEGER DEFAULT 0
         )
     ''')
     cursor.execute('''
@@ -48,6 +49,7 @@ def init_db():
             referrer_id INTEGER,
             referred_id INTEGER,
             reward_date INTEGER,
+            rewarded INTEGER DEFAULT 0,
             PRIMARY KEY (referrer_id, referred_id)
         )
     ''')
@@ -120,19 +122,14 @@ def start_command(message):
             except:
                 pass
     
-    # Если есть реферер, система включена, и это не тот же пользователь
-    if referrer_id and REFERRAL_ENABLED and referrer_id != user_id:
-        # Проверяем, что реферер подписан на канал
+    if referrer_id and referrer_id != user_id:
         if is_subscribed(referrer_id):
             conn = sqlite3.connect('users.db')
             cursor = conn.cursor()
-            
-            # Проверяем, что реферер есть в БД и у него активна подписка
             cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
             ref_result = cursor.fetchone()
             
-            if ref_result and ref_result[0] > int(time.time()):
-                # Проверяем, не приглашал ли этот пользователь уже этого реферера
+            if ref_result:
                 cursor.execute(
                     "SELECT * FROM referrals WHERE referrer_id = ? AND referred_id = ?",
                     (referrer_id, user_id)
@@ -140,42 +137,65 @@ def start_command(message):
                 already_ref = cursor.fetchone()
                 
                 if not already_ref:
-                    # Начисляем +3 дня рефереру
-                    new_end = ref_result[0] + 3 * 24 * 60 * 60
                     cursor.execute(
-                        "UPDATE users SET subscription_end = ? WHERE user_id = ?",
-                        (new_end, referrer_id)
-                    )
-                    cursor.execute(
-                        "INSERT INTO referrals (referrer_id, referred_id, reward_date) VALUES (?, ?, ?)",
-                        (referrer_id, user_id, int(time.time()))
+                        "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (?, ?, ?, ?)",
+                        (referrer_id, user_id, int(time.time()), 0)
                     )
                     conn.commit()
                     
-                    try:
-                        bot.send_message(
-                            referrer_id,
-                            f"🎉 По вашей ссылке зарегистрировался новый пользователь!\nВам начислено +3 дня подписки."
+                    if REFERRAL_ENABLED:
+                        new_end = ref_result[0] + 3 * 24 * 60 * 60
+                        cursor.execute(
+                            "UPDATE users SET subscription_end = ? WHERE user_id = ?",
+                            (new_end, referrer_id)
                         )
-                    except:
-                        pass
+                        cursor.execute(
+                            "UPDATE referrals SET rewarded = 1 WHERE referrer_id = ? AND referred_id = ?",
+                            (referrer_id, user_id)
+                        )
+                        conn.commit()
+                        
+                        try:
+                            bot.send_message(
+                                referrer_id,
+                                f"🎉 По вашей ссылке зарегистрировался новый пользователь!\nВам начислено +3 дня подписки."
+                            )
+                        except:
+                            pass
             conn.close()
     
-    # ===== ОСНОВНАЯ ЛОГИКА /START =====
+    # ===== ОСНОВНАЯ ЛОГИКА =====
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT user_id, last_activity FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
+    
+    current_time = int(time.time())
+    is_new_user = False
     
     if not user:
         cursor.execute(
-            "INSERT INTO users (user_id, subscription_end) VALUES (?, ?)",
-            (user_id, int(time.time()) + 7*24*60*60)
+            "INSERT INTO users (user_id, subscription_end, last_activity) VALUES (?, ?, ?)",
+            (user_id, current_time + 7*24*60*60, current_time)
         )
         conn.commit()
+        is_new_user = True
         bot.reply_to(message, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
     else:
-        bot.reply_to(message, "👋 С возвращением!")
+        last_activity = user[1] if user[1] else 0
+        days_since_last = (current_time - last_activity) // (24*60*60)
+        
+        if days_since_last >= 3:
+            bot.reply_to(message, "👋 С возвращением!")
+        else:
+            bot.reply_to(message, "👋 Добро пожаловать!")
+        
+        # Обновляем активность
+        cursor.execute(
+            "UPDATE users SET last_activity = ? WHERE user_id = ?",
+            (current_time, user_id)
+        )
+        conn.commit()
     
     conn.close()
     bot.reply_to(message, "Выберите действие:", reply_markup=main_menu())
@@ -279,32 +299,30 @@ def referrals_command(message):
     conn = sqlite3.connect('users.db')
     cursor = conn.cursor()
     
-    # Проверяем, есть ли пользователь
     cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
     if not cursor.fetchone():
         conn.close()
         bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
         return
     
-    # Считаем рефералов
     cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
     count = cursor.fetchone()[0]
     conn.close()
     
-    # Генерируем реферальную ссылку
     bot_username = bot.get_me().username
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     
-    # Проверяем, включена ли система
-    status = "✅ Включена" if REFERRAL_ENABLED else "❌ Отключена"
-    
     text = (
-        f"👥 Ваши рефералы: {count}\n"
-        f"📊 Статус системы: {status}\n\n"
-        f"🔗 Ваша реферальная ссылка:\n{ref_link}\n\n"
-        f"ℹ️ За каждого друга, перешедшего по ссылке, вы получите +3 дня к подписке (если система включена)."
+        f"👥 *Ваши рефералы:* {count}\n\n"
+        f"🔗 *Ваша реферальная ссылка:*\n"
+        f"`{ref_link}`\n\n"
+        f"📌 *Как это работает:*\n"
+        f"• Приглашенные друзья засчитываются вам на баланс\n"
+        f"• За каждого друга вы получаете бонус\n"
+        f"• Делитесь ссылкой и приглашайте больше людей!\n\n"
+        f"💬 *Вопросы?* Пишите в поддержку: @mel1ste"
     )
-    bot.reply_to(message, text)
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 # ========== КНОПКА "ПОДДЕРЖКА" ==========
 @bot.message_handler(func=lambda message: message.text == "❓ Поддержка")
@@ -338,13 +356,13 @@ def check_subscription(call):
         
         if not user:
             cursor.execute(
-                "INSERT INTO users (user_id, subscription_end) VALUES (?, ?)",
-                (user_id, int(time.time()) + 7*24*60*60)
+                "INSERT INTO users (user_id, subscription_end, last_activity) VALUES (?, ?, ?)",
+                (user_id, int(time.time()) + 7*24*60*60, int(time.time()))
             )
             conn.commit()
             bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
         else:
-            bot.send_message(user_id, "👋 С возвращением!")
+            bot.send_message(user_id, "👋 Добро пожаловать!")
         
         conn.close()
         bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
@@ -364,7 +382,55 @@ def referral_on(message):
     
     global REFERRAL_ENABLED
     REFERRAL_ENABLED = True
-    bot.reply_to(message, "✅ Реферальная система ВКЛЮЧЕНА. Теперь за каждого нового пользователя начисляется +3 дня.")
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT DISTINCT referrer_id FROM referrals WHERE rewarded = 0
+    ''')
+    referrers = cursor.fetchall()
+    
+    total_rewarded = 0
+    
+    for (referrer_id,) in referrers:
+        cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (referrer_id,))
+        ref_result = cursor.fetchone()
+        
+        if ref_result:
+            cursor.execute(
+                "SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND rewarded = 0",
+                (referrer_id,)
+            )
+            count = cursor.fetchone()[0]
+            
+            if count > 0:
+                new_end = ref_result[0] + count * 3 * 24 * 60 * 60
+                cursor.execute(
+                    "UPDATE users SET subscription_end = ? WHERE user_id = ?",
+                    (new_end, referrer_id)
+                )
+                cursor.execute(
+                    "UPDATE referrals SET rewarded = 1 WHERE referrer_id = ? AND rewarded = 0",
+                    (referrer_id,)
+                )
+                total_rewarded += count
+                
+                try:
+                    bot.send_message(
+                        referrer_id,
+                        f"🎉 Реферальная система включена!\nВам начислено +{count * 3} дней за {count} приглашённых друзей."
+                    )
+                except:
+                    pass
+    
+    conn.commit()
+    conn.close()
+    
+    bot.reply_to(
+        message,
+        f"✅ Реферальная система ВКЛЮЧЕНА.\nНачислено дней {total_rewarded * 3} рефералам."
+    )
 
 @bot.message_handler(commands=['ref_off'])
 def referral_off(message):
@@ -374,7 +440,7 @@ def referral_off(message):
     
     global REFERRAL_ENABLED
     REFERRAL_ENABLED = False
-    bot.reply_to(message, "❌ Реферальная система ВЫКЛЮЧЕНА. Начисления больше не производятся.")
+    bot.reply_to(message, "❌ Реферальная система ВЫКЛЮЧЕНА. Новые рефералы сохраняются, но дни не начисляются.")
 
 @bot.message_handler(commands=['ref_status'])
 def referral_status(message):
@@ -384,6 +450,62 @@ def referral_status(message):
     
     status = "ВКЛЮЧЕНА ✅" if REFERRAL_ENABLED else "ВЫКЛЮЧЕНА ❌"
     bot.reply_to(message, f"📊 Реферальная система: {status}")
+
+# ========== РАССЫЛКА ==========
+@bot.message_handler(commands=['broadcast'])
+def broadcast_command(message):
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    text = message.text.replace('/broadcast', '').strip()
+    
+    if not text and not message.reply_to_message:
+        bot.reply_to(
+            message,
+            "❌ Использование:\n"
+            "1. /broadcast [текст] — отправить текст всем\n"
+            "2. Ответить на фото с подписью /broadcast — отправить фото + текст"
+        )
+        return
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+    conn.close()
+    
+    if not users:
+        bot.reply_to(message, "❌ Нет пользователей для рассылки.")
+        return
+    
+    success = 0
+    fail = 0
+    
+    if message.reply_to_message and message.reply_to_message.photo:
+        photo = message.reply_to_message.photo[-1].file_id
+        caption = text if text else None
+        
+        for user in users:
+            try:
+                bot.send_photo(user[0], photo, caption=caption)
+                success += 1
+            except:
+                fail += 1
+    else:
+        for user in users:
+            try:
+                bot.send_message(user[0], text)
+                success += 1
+            except:
+                fail += 1
+    
+    bot.reply_to(
+        message,
+        f"✅ Рассылка завершена.\n\n"
+        f"📤 Отправлено: {success}\n"
+        f"❌ Не доставлено: {fail}"
+    )
 
 # ========== АДМИН-КОМАНДЫ ==========
 @bot.message_handler(commands=['stats'])
