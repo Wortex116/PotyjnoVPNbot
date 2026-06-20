@@ -5,6 +5,9 @@ import socket
 import string
 import random
 import threading
+import base64
+import urllib.parse
+import io
 from datetime import datetime
 from threading import Thread
 
@@ -28,6 +31,7 @@ app = Flask(__name__)
 
 check_results = {}
 search_cache = {}
+decrypt_results = {}
 
 KEY_TEMPLATE = """\
 #profile-title: 🌐 Потужно VPN Free
@@ -220,6 +224,9 @@ def main_menu():
     )
     kb.add(
         types.KeyboardButton("🔍 Проверка ключей"),
+        types.KeyboardButton("🔓 Расшифровать подписку")
+    )
+    kb.add(
         types.KeyboardButton("❓ Поддержка")
     )
     return kb
@@ -1557,6 +1564,15 @@ def handle_text(message):
     if message.text and message.text.startswith('/'):
         return
 
+    # Check decrypt mode
+    if user_id in decrypt_results and decrypt_results[user_id].get('waiting'):
+        if is_blocked(user_id):
+            bot.reply_to(message, "🚫 Вы заблокированы.")
+            del decrypt_results[user_id]
+            return
+        handle_decrypt_input(message, user_id)
+        return
+
     # Check key checker mode
     if user_id in check_results and check_results[user_id].get('waiting'):
         if is_blocked(user_id):
@@ -1623,6 +1639,287 @@ def _process_keys(message, keys, user_id):
     t.daemon = True
     t.start()
 
+# ==================== РАСШИФРОВКА ПОДПИСКИ ====================
+
+# Все поддерживаемые протоколы VPN ключей
+VPN_PROTOCOLS = (
+    'vless://', 'vmess://', 'trojan://', 'ss://', 'ssr://',
+    'hysteria://', 'hysteria2://', 'hy2://', 'tuic://',
+    'naive+https://', 'naive+http://', 'wg://', 'wireguard://',
+    'juicity://', 'brook://', 'shadowtls://', 'reality://',
+    'socks://', 'socks5://', 'http://', 'https://'
+)
+
+def extract_keys_from_text(text):
+    """Извлечь все VPN ключи из текста."""
+    keys = []
+    # Ищем все строки начинающиеся с известных протоколов
+    pattern = r'(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic|naive\+https?|naive\+http|wg|wireguard|juicity|brook|shadowtls|reality|socks5?|http|https)://[^\s\r\n]+'
+    found = re.findall(pattern, text, re.IGNORECASE)
+    for k in found:
+        k = k.strip().rstrip('.,;"\')>')
+        if k:
+            keys.append(k)
+    return keys
+
+def try_base64_decode(data):
+    """Попробовать декодировать Base64 (с паддингом и без)."""
+    # Убрать пробелы и переносы
+    data = data.strip().replace('\n', '').replace('\r', '').replace(' ', '')
+    # Добавить паддинг если нужно
+    for pad in ['', '=', '==', '===']:
+        try:
+            decoded = base64.b64decode(data + pad).decode('utf-8', errors='ignore')
+            if decoded and len(decoded) > 10:
+                return decoded
+        except:
+            pass
+    # Попробовать URL-safe base64
+    try:
+        data_safe = data.replace('-', '+').replace('_', '/')
+        for pad in ['', '=', '==']:
+            try:
+                decoded = base64.b64decode(data_safe + pad).decode('utf-8', errors='ignore')
+                if decoded and len(decoded) > 10:
+                    return decoded
+            except:
+                pass
+    except:
+        pass
+    return None
+
+def extract_url_from_vpn_scheme(text):
+    """Извлечь URL из специальных схем типа incy://add/URL или happ://add/URL."""
+    # Форматы: incy://add/BASE64, incy://add/https://..., happ://add/..., happ://crypt/...
+    pattern = r'(?:incy|happ|v2ray|clash|sing-box|quantumult|surge|loon|shadowrocket|stash|nekoray|hiddify|v2rayng|v2box|streisand|karing|mihomo|flclash)://(?:add|sub|crypt|import|install|update)/(.+)'
+    match = re.search(pattern, text, re.IGNORECASE)
+    if match:
+        payload = match.group(1).strip()
+        # URL decode если нужно
+        try:
+            payload = urllib.parse.unquote(payload)
+        except:
+            pass
+        return payload
+    return None
+
+def fetch_subscription_url(url):
+    """Скачать подписку по URL."""
+    headers = {
+        'User-Agent': 'v2rayNG/1.8.7',
+        'Accept': '*/*',
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        # Попробовать без verify SSL
+        try:
+            resp = requests.get(url, headers=headers, timeout=15, verify=False)
+            return resp.text
+        except:
+            return None
+
+def parse_subscription(raw_input):
+    """
+    Главная функция: принимает любой ввод, возвращает (список ключей, инфо).
+    Поддерживает:
+    - incy://add/BASE64
+    - incy://add/https://...
+    - happ://add, happ://crypt/...
+    - https://... (обычный URL подписки)
+    - Чистый Base64 текст
+    - Прямые ключи vless://, vmess:// и т.д.
+    """
+    text = raw_input.strip()
+    info_steps = []
+    all_keys = []
+
+    # 1. Проверить специальные схемы приложений
+    payload = extract_url_from_vpn_scheme(text)
+    if payload:
+        info_steps.append(f"📱 Обнаружена схема приложения")
+        text = payload
+
+    # 2. Если это URL — скачать содержимое
+    if re.match(r'https?://', text, re.IGNORECASE):
+        info_steps.append(f"🌐 Загружаю URL: {text[:60]}...")
+        content = fetch_subscription_url(text)
+        if not content:
+            return [], info_steps + ["❌ Не удалось загрузить URL"]
+        info_steps.append(f"✅ Получено {len(content)} байт")
+        text = content
+
+    # 3. Сначала проверить — есть ли уже ключи напрямую
+    direct_keys = extract_keys_from_text(text)
+    if direct_keys:
+        info_steps.append(f"🔑 Найдено ключей напрямую: {len(direct_keys)}")
+        all_keys.extend(direct_keys)
+
+    # 4. Попробовать Base64 декод (весь текст или построчно)
+    # Иногда подписка = один большой Base64 блок
+    decoded = try_base64_decode(text.strip())
+    if decoded:
+        decoded_keys = extract_keys_from_text(decoded)
+        if decoded_keys:
+            info_steps.append(f"🔓 Base64 декодировано, найдено ключей: {len(decoded_keys)}")
+            all_keys.extend(decoded_keys)
+        else:
+            # Попробовать декодировать каждую строку отдельно
+            for line in text.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                d = try_base64_decode(line)
+                if d:
+                    lk = extract_keys_from_text(d)
+                    if lk:
+                        all_keys.extend(lk)
+
+    # 5. Если всё ещё нет — попробовать построчный Base64
+    if not all_keys:
+        for line in text.strip().splitlines():
+            line = line.strip()
+            if not line or len(line) < 10:
+                continue
+            d = try_base64_decode(line)
+            if d:
+                lk = extract_keys_from_text(d)
+                all_keys.extend(lk)
+
+    # Убрать дубликаты сохраняя порядок
+    seen = set()
+    unique_keys = []
+    for k in all_keys:
+        if k not in seen:
+            seen.add(k)
+            unique_keys.append(k)
+
+    return unique_keys, info_steps
+
+
+@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
+def decrypt_subscription_start(message):
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+
+    decrypt_results[user_id] = {'waiting': True}
+
+    bot.reply_to(
+        message,
+        "🔓 *Расшифровка VPN подписки*\n\n"
+        "Отправьте ссылку или текст подписки. Поддерживаю:\n\n"
+        "• `https://example.com/sub` — URL подписки\n"
+        "• `incy://add/https://...` — схема Hiddify\n"
+        "• `incy://add/BASE64==` — схема с Base64\n"
+        "• `happ://add/...` — схема HappyVPN\n"
+        "• `vmess://...` `vless://...` — прямые ключи\n"
+        "• `trojan://...` `ss://...` `ssr://...`\n"
+        "• `hysteria2://...` `tuic://...`\n"
+        "• `wg://...` — WireGuard\n"
+        "• Чистый Base64 текст подписки\n\n"
+        "📄 Получите `.txt` файл со всеми ключами.",
+        parse_mode="Markdown"
+    )
+
+
+def handle_decrypt_input(message, user_id):
+    """Обработать ввод для расшифровки подписки."""
+    text = message.text.strip() if message.text else ''
+
+    if not text:
+        bot.reply_to(message, "❌ Пустой ввод. Отправьте ссылку или текст подписки.")
+        return
+
+    del decrypt_results[user_id]
+
+    wait_msg = bot.reply_to(message, "⏳ Обрабатываю подписку...")
+
+    def process():
+        keys, steps = parse_subscription(text)
+
+        try:
+            bot.delete_message(message.chat.id, wait_msg.message_id)
+        except:
+            pass
+
+        if not keys:
+            info = '\n'.join(steps) if steps else 'Нет данных'
+            bot.reply_to(
+                message,
+                f"❌ *Не удалось найти VPN ключи*\n\n"
+                f"🔍 Шаги обработки:\n{info}\n\n"
+                f"Убедитесь что ссылка рабочая и содержит VPN ключи.",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Формируем txt файл
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        file_content = f"# VPN Подписка расшифрована ботом\n"
+        file_content += f"# Дата: {now}\n"
+        file_content += f"# Ключей: {len(keys)}\n"
+        file_content += f"# Источник: {text[:80]}{'...' if len(text) > 80 else ''}\n"
+        file_content += "#" + "="*50 + "\n\n"
+        for k in keys:
+            file_content += k + "\n"
+
+        file_bytes = io.BytesIO(file_content.encode('utf-8'))
+        file_bytes.name = f"vpn_keys_{len(keys)}.txt"
+
+        # Статистика по протоколам
+        proto_stats = {}
+        for k in keys:
+            for proto in ['vless', 'vmess', 'trojan', 'ss', 'ssr', 'hysteria2', 'hysteria', 'hy2', 'tuic', 'wg', 'wireguard', 'naive', 'juicity', 'brook']:
+                if k.lower().startswith(proto + '://'):
+                    proto_stats[proto] = proto_stats.get(proto, 0) + 1
+                    break
+
+        stats_text = ""
+        for proto, cnt in sorted(proto_stats.items(), key=lambda x: -x[1]):
+            stats_text += f"  • {proto}:// — {cnt} шт.\n"
+
+        steps_text = '\n'.join(steps) if steps else '—'
+
+        caption = (
+            f"✅ *Расшифровка завершена!*\n\n"
+            f"📊 Найдено ключей: *{len(keys)}*\n\n"
+            f"📋 По протоколам:\n{stats_text}\n"
+            f"🔍 Шаги обработки:\n{steps_text}"
+        )
+
+        try:
+            bot.send_document(
+                message.chat.id,
+                file_bytes,
+                caption=caption,
+                parse_mode="Markdown",
+                visible_file_name=f"vpn_keys_{len(keys)}.txt"
+            )
+        except Exception as e:
+            # Fallback без parse_mode
+            try:
+                file_bytes.seek(0)
+                bot.send_document(
+                    message.chat.id,
+                    file_bytes,
+                    caption=f"✅ Найдено ключей: {len(keys)}",
+                    visible_file_name=f"vpn_keys_{len(keys)}.txt"
+                )
+            except:
+                bot.reply_to(message, f"✅ Найдено {len(keys)} ключей, но не удалось отправить файл.")
+
+    t = threading.Thread(target=process)
+    t.daemon = True
+    t.start()
+
+
 # ==================== FLASK ROUTES ====================
 
 @app.route('/ping')
@@ -1666,6 +1963,4 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.daemon = True
     thread.start()
-    from waitress import serve
-serve(app, host='0.0.0.0', port=10000)
-    
+    app.run(host='0.0.0.0', port=10000)
