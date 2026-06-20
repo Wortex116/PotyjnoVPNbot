@@ -501,7 +501,7 @@ def support_command(message):
     bot.reply_to(
         message,
         "📞 По всем вопросам пишите:\n"
-        "@mel1ste"
+        "@mel1ste, @Fredusmm"
     )
 
 # ========== ОБРАБОТЧИК КНОПКИ "ПОДПИСАЛСЯ" ==========
