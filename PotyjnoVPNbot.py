@@ -382,6 +382,10 @@ def handle_all_messages(message):
     if message.chat.type != "private":
         return
     
+    # Если это команда (начинается с /) — пропускаем
+    if message.text.startswith('/'):
+        return
+    
     text = message.text
     user_id = message.from_user.id
     
@@ -2061,7 +2065,6 @@ def get_subscription(token):
 
 # ========== ЗАПУСК БОТА ==========
 def run_bot():
-    bot.remove_webhook()
     bot.infinity_polling(skip_pending=True)
 
 if __name__ == '__main__':
@@ -2074,3 +2077,4 @@ if __name__ == '__main__':
     thread = Thread(target=run_bot)
     thread.start()
     app.run(host='0.0.0.0', port=10000)
+    
