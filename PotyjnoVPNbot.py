@@ -797,6 +797,548 @@ def admins_list(message):
     
     bot.reply_to(message, text)
 
+# ========== КОМАНДА ADMINS_LIST ==========
+@bot.message_handler(commands=['admins_list'])
+def admins_list(message):
+    if message.chat.type != "private":
+        return
+    
+    if message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "⛔ Только создатель может смотреть список админов.")
+        return
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, added_at FROM admins")
+    admins = cursor.fetchall()
+    conn.close()
+    
+    if not admins:
+        bot.reply_to(message, "📋 Список администраторов пуст.")
+        return
+    
+    text = "👑 Список администраторов:\n\n"
+    text += f"👤 Создатель: {ADMIN_ID}\n\n"
+    
+    for admin_id, added_at in admins:
+        try:
+            user = bot.get_chat(admin_id)
+            name = user.first_name or str(admin_id)
+        except:
+            name = str(admin_id)
+        text += f"└ {name} (ID: {admin_id})\n"
+    
+    bot.reply_to(message, text)
+
+
+# ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (/manage) ==========
+user_cache = {}
+search_cache = {}
+
+def get_user_display_name(user_id):
+    try:
+        user = bot.get_chat(user_id)
+        return user.first_name or str(user_id)
+    except:
+        return str(user_id)
+
+def build_user_list_keyboard(users, page=0, filter_type='all', search_query=None):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    
+    per_page = 5
+    total_pages = (len(users) + per_page - 1) // per_page if users else 1
+    start = page * per_page
+    end = min(start + per_page, len(users))
+    
+    if not users:
+        keyboard.add(types.InlineKeyboardButton("📭 Нет пользователей", callback_data="noop"))
+    else:
+        for user_id in users[start:end]:
+            display_name = get_user_display_name(user_id)
+            conn = sqlite3.connect('users.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result and result[0] > int(time.time()):
+                status_icon = "🟢"
+            else:
+                status_icon = "🔴"
+            
+            is_admin_user = is_admin(user_id)
+            admin_icon = "👑 " if is_admin_user else ""
+            
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    f"{status_icon} {admin_icon}{display_name}",
+                    callback_data=f"user_{user_id}"
+                )
+            )
+    
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(types.InlineKeyboardButton("◀️ Назад", callback_data=f"page_{page-1}_{filter_type}_{search_query or ''}"))
+    if page < total_pages - 1:
+        nav_buttons.append(types.InlineKeyboardButton("Вперед ▶️", callback_data=f"page_{page+1}_{filter_type}_{search_query or ''}"))
+    if nav_buttons:
+        keyboard.add(*nav_buttons)
+    
+    keyboard.row(
+        types.InlineKeyboardButton("🟢 Активные", callback_data=f"filter_active_{page}"),
+        types.InlineKeyboardButton("🔴 Неактивные", callback_data=f"filter_inactive_{page}")
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("👑 Админы", callback_data=f"filter_admins_{page}"),
+        types.InlineKeyboardButton("📋 Все", callback_data=f"filter_all_{page}")
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("🔍 Поиск", callback_data="search_user"),
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="refresh_list")
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
+    )
+    
+    return keyboard
+
+@bot.message_handler(commands=['manage'])
+def manage_users(message):
+    if message.chat.type != "private":
+        return
+    
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "⛔ У вас нет прав.")
+        return
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users ORDER BY user_id")
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    if not users:
+        bot.reply_to(message, "📭 Нет пользователей в базе.")
+        return
+    
+    user_cache[message.from_user.id] = users
+    search_cache[message.from_user.id] = None
+    
+    keyboard = build_user_list_keyboard(users, 0, 'all')
+    bot.reply_to(
+        message,
+        f"👥 Управление пользователями\n\nВсего: {len(users)}",
+        reply_markup=keyboard
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('user_'))
+def user_action_menu(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    user_id = int(call.data.split('_')[1])
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result:
+        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
+        return
+    
+    subscription_end = result[0]
+    current_time = int(time.time())
+    
+    if subscription_end > current_time:
+        status = "🟢 Активна"
+        days_left = (subscription_end - current_time) // (24*60*60)
+        status_text = f"{status} (осталось {days_left} дн)"
+    else:
+        status = "🔴 Неактивна"
+        status_text = status
+    
+    is_admin_user = is_admin(user_id)
+    admin_text = "✅ Да" if is_admin_user else "❌ Нет"
+    
+    display_name = get_user_display_name(user_id)
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("📅 Продлить (+30 дн)", callback_data=f"prolong_{user_id}_30"),
+        types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{user_id}")
+    )
+    if is_admin_user:
+        keyboard.add(
+            types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{user_id}")
+        )
+    else:
+        keyboard.add(
+            types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"add_admin_{user_id}")
+        )
+    keyboard.row(
+        types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
+        types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
+    )
+    
+    text = (
+        f"👤 *{display_name}*\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"📊 Статус: {status_text}\n"
+        f"👑 Админ: {admin_text}"
+    )
+    
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
+def inline_prolong(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    _, user_id, days = call.data.split('_')
+    user_id = int(user_id)
+    days = int(days)
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    
+    if not result:
+        conn.close()
+        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
+        return
+    
+    current_end = result[0] if result[0] > int(time.time()) else int(time.time())
+    new_end = current_end + days * 24 * 60 * 60
+    
+    cursor.execute(
+        "UPDATE users SET subscription_end = ?, notified_3days = 0 WHERE user_id = ?",
+        (new_end, user_id)
+    )
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, f"✅ Подписка продлена на {days} дней!", show_alert=True)
+    user_action_menu(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
+def inline_remove_sub(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    user_id = int(call.data.split('_')[2])
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if not cursor.fetchone():
+        conn.close()
+        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
+        return
+    
+    cursor.execute(
+        "UPDATE users SET subscription_end = ?, notified_3days = 0 WHERE user_id = ?",
+        (int(time.time()) - 1, user_id)
+    )
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Подписка удалена!", show_alert=True)
+    
+    try:
+        bot.send_message(
+            user_id,
+            "❌ Ваша подписка была отключена администратором.\nДля восстановления обратитесь в поддержку: @mel1ste"
+        )
+    except:
+        pass
+    
+    user_action_menu(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('add_admin_'))
+def inline_add_admin(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Только создатель может выдавать админку.", show_alert=True)
+        return
+    
+    user_id = int(call.data.split('_')[2])
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if not cursor.fetchone():
+        conn.close()
+        bot.answer_callback_query(call.id, "❌ Пользователь не найден.", show_alert=True)
+        return
+    
+    cursor.execute(
+        "INSERT OR REPLACE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)",
+        (user_id, call.from_user.id, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Админ-доступ выдан!", show_alert=True)
+    
+    try:
+        bot.send_message(
+            user_id,
+            "👑 Вам выдан админ-доступ к боту!"
+        )
+    except:
+        pass
+    
+    user_action_menu(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
+def inline_remove_admin(call):
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "⛔ Только создатель может забирать админку.", show_alert=True)
+        return
+    
+    user_id = int(call.data.split('_')[2])
+    
+    if user_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя удалить создателя.", show_alert=True)
+        return
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, "✅ Админ-доступ отозван!", show_alert=True)
+    
+    try:
+        bot.send_message(
+            user_id,
+            "❌ Ваш админ-доступ отозван."
+        )
+    except:
+        pass
+    
+    user_action_menu(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_list")
+def back_to_list(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    users = user_cache.get(call.from_user.id, [])
+    if not users:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users ORDER BY user_id")
+        users = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        user_cache[call.from_user.id] = users
+    
+    keyboard = build_user_list_keyboard(users, 0, 'all')
+    bot.edit_message_text(
+        f"👥 Управление пользователями\n\nВсего: {len(users)}",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboard
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "close_manage")
+def close_manage(call):
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "refresh_list")
+def refresh_list(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users ORDER BY user_id")
+    users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    user_cache[call.from_user.id] = users
+    search_cache[call.from_user.id] = None
+    
+    keyboard = build_user_list_keyboard(users, 0, 'all')
+    bot.edit_message_text(
+        f"👥 Управление пользователями\n\nВсего: {len(users)}",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboard
+    )
+    bot.answer_callback_query(call.id, "🔄 Список обновлен!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_'))
+def filter_users(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    filter_type = call.data.split('_')[1]
+    page = int(call.data.split('_')[2]) if len(call.data.split('_')) > 2 else 0
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users ORDER BY user_id")
+    all_users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    
+    current_time = int(time.time())
+    filtered_users = []
+    
+    if filter_type == 'active':
+        for user_id in all_users:
+            conn = sqlite3.connect('users.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            conn.close()
+            if result and result[0] > current_time:
+                filtered_users.append(user_id)
+    elif filter_type == 'inactive':
+        for user_id in all_users:
+            conn = sqlite3.connect('users.db')
+            cursor = conn.cursor()
+            cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            conn.close()
+            if not result or result[0] <= current_time:
+                filtered_users.append(user_id)
+    elif filter_type == 'admins':
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM admins")
+        filtered_users = [row[0] for row in cursor.fetchall()]
+        conn.close()
+    else:
+        filtered_users = all_users
+    
+    user_cache[call.from_user.id] = filtered_users
+    
+    keyboard = build_user_list_keyboard(filtered_users, page, filter_type)
+    label = {
+        'active': '🟢 Активные',
+        'inactive': '🔴 Неактивные',
+        'admins': '👑 Админы',
+        'all': '📋 Все'
+    }.get(filter_type, 'Все')
+    
+    bot.edit_message_text(
+        f"👥 Управление пользователями\n\n{label}: {len(filtered_users)}",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboard
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('page_'))
+def paginate_users(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    parts = call.data.split('_')
+    page = int(parts[1])
+    filter_type = parts[2]
+    search_query = parts[3] if len(parts) > 3 and parts[3] != '' else None
+    
+    users = user_cache.get(call.from_user.id, [])
+    if not users:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users ORDER BY user_id")
+        users = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        user_cache[call.from_user.id] = users
+    
+    keyboard = build_user_list_keyboard(users, page, filter_type, search_query)
+    bot.edit_message_reply_markup(
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=keyboard
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "search_user")
+def search_user_prompt(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔ У вас нет прав.", show_alert=True)
+        return
+    
+    bot.send_message(
+        call.message.chat.id,
+        "🔍 Введите username (с @) или ID пользователя для поиска:"
+    )
+    bot.answer_callback_query(call.id)
+    search_cache[call.from_user.id] = 'waiting_for_search'
+
+@bot.message_handler(func=lambda message: search_cache.get(message.from_user.id) == 'waiting_for_search')
+def handle_search_input(message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    query = message.text.strip()
+    search_cache[message.from_user.id] = None
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    if query.startswith('@'):
+        username = query[1:]
+        cursor.execute("SELECT user_id FROM users ORDER BY user_id")
+        all_users = [row[0] for row in cursor.fetchall()]
+        found_users = []
+        for user_id in all_users:
+            try:
+                user = bot.get_chat(user_id)
+                if user.username and user.username.lower() == username.lower():
+                    found_users.append(user_id)
+            except:
+                pass
+    else:
+        try:
+            user_id = int(query)
+            cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            found_users = [result[0]] if result else []
+        except:
+            found_users = []
+    
+    conn.close()
+    
+    if not found_users:
+        bot.reply_to(message, "❌ Пользователь не найден. Попробуйте другой запрос.")
+        return
+    
+    user_cache[message.from_user.id] = found_users
+    keyboard = build_user_list_keyboard(found_users, 0, 'all', query)
+    bot.reply_to(
+        message,
+        f"🔍 Результаты поиска: {len(found_users)}",
+        reply_markup=keyboard
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == "noop")
+def noop(call):
+    bot.answer_callback_query(call.id)
+
 # ========== ЭНДПОИНТ ДЛЯ ПИНГА ==========
 @app.route('/ping')
 def ping():
