@@ -155,6 +155,20 @@ def init_db():
             value TEXT
         )
     """)
+    
+    # ====== ПРИНУДИТЕЛЬНО ДОБАВЛЯЕМ СОЗДАТЕЛЯ ======
+    try:
+        cur.execute("""
+            INSERT INTO admins (user_id, added_by, added_at) 
+            VALUES (%s, %s, %s) 
+            ON CONFLICT (user_id) DO NOTHING
+        """, (ADMIN_ID, ADMIN_ID, int(time.time())))
+        conn.commit()
+        print(f"[init] ✅ Создатель {ADMIN_ID} добавлен в админы")
+    except Exception as e:
+        print(f"[init] Ошибка добавления создателя: {e}")
+    # ================================================
+    
     conn.commit()
     cur.close()
     conn.close()
@@ -936,7 +950,6 @@ def cmd_start(message):
     
     # ========== 2. ЕСЛИ НОВЫЙ — ОТПРАВЛЯЕМ КАПЧУ ==========
     if is_new_user:
-        # Проверяем скорость подписок (защита от накруток)
         ok, msg = check_subscribe_rate()
         if not ok:
             bot.reply_to(message, f"⚠️ {msg}")
@@ -944,7 +957,6 @@ def cmd_start(message):
         
         add_subscribe_record(user_id)
         
-        # Извлекаем referrer_id (если есть)
         referrer_id = None
         if message.text and 'start=ref_' in message.text:
             parts = message.text.split('start=ref_')
@@ -956,7 +968,6 @@ def cmd_start(message):
                 except:
                     pass
         
-        # Отправляем капчу
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("✅ Я НЕ РОБОТ", callback_data=f"captcha_verify_{user_id}"))
         
@@ -969,7 +980,6 @@ def cmd_start(message):
             reply_markup=kb
         )
         
-        # Сохраняем сессию с referrer_id (если есть)
         captcha_sessions[user_id] = {
             'timestamp': int(time.time()),
             'message_id': msg.message_id,
@@ -1023,7 +1033,6 @@ def callback_captcha_verify(call):
         bot.answer_callback_query(call.id, "⏰ Время вышло. Нажмите /start")
         return
     
-    # Удаляем сообщение с капчей
     try:
         bot.delete_message(call.message.chat.id, session['message_id'])
     except:
@@ -1031,30 +1040,24 @@ def callback_captcha_verify(call):
     
     bot.answer_callback_query(call.id, "✅ Капча пройдена!")
     
-    # ========== ПРОВЕРЯЕМ ПОДПИСКУ ==========
     if is_subscribed(user_id):
-        # Подписка есть — РЕГИСТРИРУЕМ
         bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
         _register_user(user_id, session.get('referrer_id'))
         del captcha_sessions[user_id]
     else:
-        # Подписки нет — показываем кнопку подписки
         bot.send_message(
             user_id,
             "⚠️ Подпишитесь на канал, чтобы завершить регистрацию.\n\n"
             "После подписки нажмите кнопку ниже.",
             reply_markup=subscribe_button()
         )
-        # Сохраняем сессию для проверки после подписки
         captcha_sessions[user_id]['waiting_for_sub'] = True
 
 # ==================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ====================
 
 def _register_user(user_id, referrer_id=None):
-    """Регистрирует нового пользователя (ТОЛЬКО 1 РАЗ)"""
     current_time = int(time.time())
     
-    # Проверяем, не зарегистрирован ли уже (защита от дублей)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
@@ -1063,7 +1066,6 @@ def _register_user(user_id, referrer_id=None):
         conn.close()
         return
     
-    # ====== СОЗДАЕМ ПОЛЬЗОВАТЕЛЯ ======
     token = generate_subscription_token()
     sub_end = current_time + 7 * 24 * 60 * 60
     
@@ -1075,9 +1077,7 @@ def _register_user(user_id, referrer_id=None):
     cur.close()
     conn.close()
     
-    # ====== ОБРАБАТЫВАЕМ РЕФЕРАЛА (ЕСЛИ ЕСТЬ) ======
     if referrer_id:
-        # Проверяем, что реферер существует и не равен пользователю
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referrer_id,))
@@ -1086,7 +1086,6 @@ def _register_user(user_id, referrer_id=None):
         conn.close()
         
         if referrer_exists and referrer_id != user_id:
-            # Проверяем, не был ли уже реферал засчитан
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute(
@@ -1098,9 +1097,7 @@ def _register_user(user_id, referrer_id=None):
             conn.close()
             
             if not already_ref:
-                # Проверяем лимит рефералов у реферера
                 if can_add_referral(referrer_id):
-                    # Сохраняем реферала
                     conn = get_db_connection()
                     cur = conn.cursor()
                     cur.execute(
@@ -1111,14 +1108,12 @@ def _register_user(user_id, referrer_id=None):
                     cur.close()
                     conn.close()
                     
-                    # Уведомляем реферера
                     name = get_user_display_name(user_id)
                     try:
                         bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {name} зарегистрировался по вашей ссылке.")
                     except:
                         pass
                     
-                    # Если реферальная система включена и реферер подписан — начисляем бонус
                     if get_setting('referral_enabled') == '1' and is_subscribed(referrer_id):
                         conn = get_db_connection()
                         cur = conn.cursor()
@@ -1144,7 +1139,6 @@ def _register_user(user_id, referrer_id=None):
                     except:
                         pass
     
-    # ====== ПРИВЕТСТВИЕ ======
     bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
     bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
 
@@ -1171,7 +1165,6 @@ def callback_check_sub(call):
         except:
             pass
         
-        # ====== ПРОВЕРЯЕМ, ЕСТЬ ЛИ НЕЗАВЕРШЕННАЯ РЕГИСТРАЦИЯ ======
         if user_id in captcha_sessions and captcha_sessions[user_id].get('waiting_for_sub'):
             session = captcha_sessions[user_id]
             bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
@@ -1179,7 +1172,6 @@ def callback_check_sub(call):
             del captcha_sessions[user_id]
             return
         
-        # ====== ПРОВЕРЯЕМ, ЕСТЬ ЛИ НЕПОЛУЧЕННЫЙ БОНУС ======
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -1209,7 +1201,6 @@ def callback_check_sub(call):
                 cur.close()
                 conn.close()
         
-        # ====== ПРОВЕРЯЕМ, ЗАРЕГИСТРИРОВАН ЛИ ПОЛЬЗОВАТЕЛЬ ======
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
@@ -3979,8 +3970,12 @@ def cmd_ref_status(message):
 
 @bot.message_handler(commands=['update_keys'])
 def cmd_update_keys(message):
-    if not is_admin(message.from_user.id):
+    if not is_admin(message.from_user.id) and message.from_user.id != ADMIN_ID:
+        bot.reply_to(message, "❌ Только для администраторов.")
         return
+    
+    status_msg = bot.reply_to(message, "⏳ Начинаю обновление ключей...")
+    
     if message.reply_to_message:
         reply = message.reply_to_message
         if reply.document:
@@ -3988,40 +3983,123 @@ def cmd_update_keys(message):
                 file_info = bot.get_file(reply.document.file_id)
                 downloaded = bot.download_file(file_info.file_path)
                 text = downloaded.decode('utf-8', errors='ignore')
-                bot.reply_to(message, "⏳ Читаю файл...")
+                
+                bot.edit_message_text("⏳ Читаю файл...", message.chat.id, status_msg.message_id)
                 keys = load_keys_from_text(text)
-                _finish_update_keys(message, keys, f"файл: {reply.document.file_name}")
+                
+                if keys:
+                    save_keys_to_db(keys)
+                    proto_stats = {}
+                    for k in keys:
+                        m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                        if m:
+                            p = m.group(1).lower()
+                            proto_stats[p] = proto_stats.get(p, 0) + 1
+                    stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+                    
+                    bot.edit_message_text(
+                        f"✅ *Ключи обновлены!*\n\n"
+                        f"📊 Загружено ключей: {len(keys)}\n"
+                        f"📋 По протоколам:\n{stats}\n"
+                        f"📦 Всего в базе: {len(get_keys_from_db())}",
+                        message.chat.id,
+                        status_msg.message_id,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    bot.edit_message_text(
+                        "❌ Не найдено ключей в файле.",
+                        message.chat.id,
+                        status_msg.message_id
+                    )
             except Exception as e:
-                bot.reply_to(message, f"❌ Ошибка чтения файла: {e}")
+                bot.edit_message_text(
+                    f"❌ Ошибка чтения файла: {e}",
+                    message.chat.id,
+                    status_msg.message_id
+                )
             return
+        
         if reply.text:
             t = reply.text.strip()
             if re.match(r'https?://', t) or re.match(
                 r'(?:incy|happ|v2rayng|shadowrocket|clash|sing-box)://', t, re.IGNORECASE
             ):
-                bot.reply_to(message, "⏳ Загружаю ключи...")
+                bot.edit_message_text("⏳ Загружаю ключи из URL...", message.chat.id, status_msg.message_id)
                 keys = load_keys_from_url(t)
-                _finish_update_keys(message, keys, t[:60])
             else:
-                bot.reply_to(message, "⏳ Читаю ключи из текста...")
+                bot.edit_message_text("⏳ Читаю ключи из текста...", message.chat.id, status_msg.message_id)
                 keys = load_keys_from_text(t)
-                _finish_update_keys(message, keys, "текстовое сообщение")
+            
+            if keys:
+                save_keys_to_db(keys)
+                proto_stats = {}
+                for k in keys:
+                    m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                    if m:
+                        p = m.group(1).lower()
+                        proto_stats[p] = proto_stats.get(p, 0) + 1
+                stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+                
+                bot.edit_message_text(
+                    f"✅ *Ключи обновлены!*\n\n"
+                    f"📊 Загружено ключей: {len(keys)}\n"
+                    f"📋 По протоколам:\n{stats}\n"
+                    f"📦 Всего в базе: {len(get_keys_from_db())}",
+                    message.chat.id,
+                    status_msg.message_id,
+                    parse_mode="Markdown"
+                )
+            else:
+                bot.edit_message_text(
+                    "❌ Не найдено ключей.",
+                    message.chat.id,
+                    status_msg.message_id
+                )
             return
+    
     args = message.text.split(maxsplit=1)
     if len(args) >= 2:
         url = args[1].strip()
-        bot.reply_to(message, "⏳ Загружаю ключи...")
+        bot.edit_message_text("⏳ Загружаю ключи из URL...", message.chat.id, status_msg.message_id)
         keys = load_keys_from_url(url)
-        _finish_update_keys(message, keys, url[:60])
+        
+        if keys:
+            save_keys_to_db(keys)
+            proto_stats = {}
+            for k in keys:
+                m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                if m:
+                    p = m.group(1).lower()
+                    proto_stats[p] = proto_stats.get(p, 0) + 1
+            stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+            
+            bot.edit_message_text(
+                f"✅ *Ключи обновлены!*\n\n"
+                f"📊 Загружено ключей: {len(keys)}\n"
+                f"📋 По протоколам:\n{stats}\n"
+                f"📦 Всего в базе: {len(get_keys_from_db())}",
+                message.chat.id,
+                status_msg.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.edit_message_text(
+                "❌ Не найдено ключей по ссылке.",
+                message.chat.id,
+                status_msg.message_id
+            )
         return
+    
     search_cache[message.from_user.id] = 'waiting_for_keys'
-    bot.reply_to(
-        message,
+    bot.edit_message_text(
         "📥 Отправьте ключи одним из способов:\n\n"
         "• Ссылка: `https://...`\n"
         "• Схема: `incy://add/...` `happ://add/...`\n"
         "• .txt файл с ключами\n"
         "• Текст с ключами",
+        message.chat.id,
+        status_msg.message_id,
         parse_mode="Markdown"
     )
 
@@ -4190,20 +4268,59 @@ def handle_text(message):
         _process_proxies(message, message.text or '', user_id)
         return
     
-    if search_cache.get(user_id) == 'waiting_for_keys' and is_admin(user_id):
+    # ====== ОБНОВЛЕНИЕ КЛЮЧЕЙ (waiting_for_keys) ======
+    if search_cache.get(user_id) == 'waiting_for_keys':
+        if not is_admin(user_id) and user_id != ADMIN_ID:
+            del search_cache[user_id]
+            return
+        
         del search_cache[user_id]
         t = (message.text or '').strip()
+        
+        status_msg = bot.reply_to(message, "⏳ Обрабатываю ключи...")
+        
         if re.match(r'https?://', t) or re.match(
             r'(?:incy|happ|v2rayng|shadowrocket|clash|sing-box)://', t, re.IGNORECASE
         ):
-            bot.reply_to(message, "⏳ Загружаю ключи...")
+            bot.edit_message_text("⏳ Загружаю ключи из URL...", message.chat.id, status_msg.message_id)
             keys = load_keys_from_url(t)
-            _finish_update_keys(message, keys, t[:60])
         else:
-            bot.reply_to(message, "⏳ Читаю ключи из текста...")
+            bot.edit_message_text("⏳ Читаю ключи из текста...", message.chat.id, status_msg.message_id)
             keys = load_keys_from_text(t)
-            _finish_update_keys(message, keys, "текстовое сообщение")
+        
+        if keys:
+            save_keys_to_db(keys)
+            proto_stats = {}
+            for k in keys:
+                m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                if m:
+                    p = m.group(1).lower()
+                    proto_stats[p] = proto_stats.get(p, 0) + 1
+            stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+            
+            bot.edit_message_text(
+                f"✅ *Ключи обновлены!*\n\n"
+                f"📊 Загружено ключей: {len(keys)}\n"
+                f"📋 По протоколам:\n{stats}\n"
+                f"📦 Всего в базе: {len(get_keys_from_db())}",
+                message.chat.id,
+                status_msg.message_id,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.edit_message_text(
+                "❌ *Не найдено ключей*\n\n"
+                "Проверьте формат.\n\n"
+                "Поддерживается:\n"
+                "• vless:// vmess:// trojan:// ss:// и др.\n"
+                "• Base64 подписка\n"
+                "• URL подписки",
+                message.chat.id,
+                status_msg.message_id,
+                parse_mode="Markdown"
+            )
         return
+    # ================================================
     
     if user_id in check_results and check_results[user_id].get('waiting'):
         if is_blocked(user_id):
@@ -4286,18 +4403,6 @@ if __name__ == '__main__':
     if not get_keys_from_db():
         save_keys_to_db(DEFAULT_KEYS)
     
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("INSERT INTO admins (user_id, added_by, added_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING", 
-                    (ADMIN_ID, ADMIN_ID, int(time.time())))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f"[main] ✅ Создатель {ADMIN_ID} добавлен в админы")
-    except Exception as e:
-        print(f"[main] Ошибка добавления в админы: {e}")
-    
     keep_alive_thread = Thread(target=keep_alive_ping)
     keep_alive_thread.daemon = True
     keep_alive_thread.start()
@@ -4316,4 +4421,3 @@ if __name__ == '__main__':
     print(f"[main] 🚀 Запуск веб-сервера на порту 10000")
     from waitress import serve
     serve(app, host='0.0.0.0', port=10000, threads=4, connection_limit=100)
-    
