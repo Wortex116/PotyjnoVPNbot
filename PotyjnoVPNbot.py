@@ -2074,7 +2074,7 @@ def format_key_for_post(key, latency, index):
 🔑 Ключ для подключения:
 `{key}`
 
-⏱ Проверено: {datetime.now().strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot
+⏱ Проверено: {datetime.now() + timedelta(hours=3).strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot
 🔗 @ciorsa"""
     
     return formatted
