@@ -19,8 +19,6 @@ import psycopg2
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask
-from Crypto.Cipher import PKCS1_OAEP, ChaCha20_Poly1305
-from Crypto.PublicKey import RSA
 
 try:
     import socks
@@ -123,57 +121,120 @@ APP_SCHEMES = (
     r'shadowrocket|stash|nekoray|nekobox|hiddify|streisand|karing|mihomo|flclash'
 )
 
-# ==================== CRYPT5 ДЕШИФРАТОР ====================
+# ==================== СИСТЕМА ПРАВ АДМИНОВ ====================
 
-CRYPT5_KEYS = {}
+PERMISSIONS = {
+    'check_user': 'Проверка пользователя (/check)',
+    'user_info': 'Информация о пользователе (/user)',
+    'add_days': 'Выдача дней (/add_days)',
+    'remove_days': 'Забирание дней (/remove_days)',
+    'block_user': 'Блокировка (/block)',
+    'unblock_user': 'Разблокировка (/unblock)',
+    'announce': 'Рассылка',
+    'manage_keys': 'Управление ключами',
+    'autopost': 'Автопостинг',
+    'manage_admins': 'Управление админами',
+    'manage_users': 'Управление пользователями',
+    'admin_stats': 'Статистика бота',
+    'admin_panel': 'Доступ к админ-панели',
+}
 
-def load_crypt5_keys():
-    global CRYPT5_KEYS
-    try:
-        url = "https://raw.githubusercontent.com/Potyk1/happ-decrypt-universal/main/keys/rsa_keys.json"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            CRYPT5_KEYS = data.get('keys', {})
-            print(f"[crypt5] ✅ Загружено {len(CRYPT5_KEYS)} RSA ключей")
-            return True
-    except Exception as e:
-        print(f"[crypt5] ❌ Ошибка загрузки ключей: {e}")
-    return False
+ROLE_PRESETS = {
+    'owner': {
+        'name': '👑 Владелец',
+        'permissions': {p: True for p in PERMISSIONS}
+    },
+    'senior': {
+        'name': '⭐ Старший админ',
+        'permissions': {
+            'check_user': True, 'user_info': True, 'add_days': True, 'remove_days': True,
+            'block_user': True, 'unblock_user': True, 'announce': True, 'manage_keys': True,
+            'autopost': True, 'manage_admins': False, 'manage_users': True, 'admin_stats': True,
+            'admin_panel': True,
+        }
+    },
+    'junior': {
+        'name': '🔹 Младший админ',
+        'permissions': {
+            'check_user': True, 'user_info': True, 'add_days': True, 'remove_days': True,
+            'block_user': True, 'unblock_user': True, 'announce': False, 'manage_keys': False,
+            'autopost': False, 'manage_admins': False, 'manage_users': False, 'admin_stats': False,
+            'admin_panel': True,
+        }
+    },
+    'support': {
+        'name': '🟢 Поддержка',
+        'permissions': {
+            'check_user': True, 'user_info': True, 'add_days': False, 'remove_days': False,
+            'block_user': False, 'unblock_user': False, 'announce': False, 'manage_keys': False,
+            'autopost': False, 'manage_admins': False, 'manage_users': False, 'admin_stats': False,
+            'admin_panel': False,
+        }
+    }
+}
 
-def decrypt_crypt5_payload(payload):
-    if not CRYPT5_KEYS:
-        load_crypt5_keys()
-        if not CRYPT5_KEYS:
-            return None
-    try:
-        payload = re.sub(r'\s+', '', payload)
-        data = base64.b64decode(payload + '=' * (4 - len(payload) % 4))
-        if len(data) < 288:
-            return None
-        marker = data[:16].decode('utf-8', errors='ignore')
-        if marker not in CRYPT5_KEYS:
-            return None
-        rsa_key = RSA.import_key(CRYPT5_KEYS[marker])
-        rsa_encrypted_key = data[16:272]
-        chacha_encrypted = data[272:]
-        cipher_rsa = PKCS1_OAEP.new(rsa_key)
-        chacha_key = cipher_rsa.decrypt(rsa_encrypted_key)
-        if len(chacha_encrypted) < 28:
-            return None
-        iv = chacha_encrypted[:12]
-        ciphertext = chacha_encrypted[12:-16]
-        tag = chacha_encrypted[-16:]
-        cipher_chacha = ChaCha20_Poly1305.new(key=chacha_key, nonce=iv)
-        plaintext = cipher_chacha.decrypt_and_verify(ciphertext, tag)
+def get_admin_permissions(user_id):
+    if user_id == ADMIN_ID:
+        return ROLE_PRESETS['owner']['permissions'].copy()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT permissions FROM admins WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    if result and result[0]:
         try:
-            result = base64.b64decode(plaintext).decode('utf-8', errors='ignore')
-            return result
+            return json.loads(result[0])
         except:
-            return plaintext.decode('utf-8', errors='ignore')
-    except Exception as e:
-        print(f"[crypt5] Ошибка: {e}")
-        return None
+            pass
+    return {p: False for p in PERMISSIONS}
+
+def has_permission(user_id, permission):
+    if user_id == ADMIN_ID:
+        return True
+    perms = get_admin_permissions(user_id)
+    return perms.get(permission, False)
+
+def update_admin_permissions(user_id, permissions_dict):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE admins SET permissions = %s WHERE user_id = %s", (json.dumps(permissions_dict), user_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_admin_role(user_id):
+    if user_id == ADMIN_ID:
+        return 'owner'
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM admins WHERE user_id = %s", (user_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result[0] if result else None
+
+def get_admin_role_name(user_id):
+    role = get_admin_role(user_id)
+    if role == 'owner': return "👑 Владелец"
+    elif role == 'senior': return "⭐ Старший админ"
+    elif role == 'junior': return "🔹 Младший админ"
+    elif role == 'support': return "🟢 Поддержка"
+    return "❌ Не админ"
+
+def is_admin(user_id):
+    if user_id == ADMIN_ID:
+        return True
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM admins WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result is not None
+    except:
+        return False
 
 # ==================== DATABASE ====================
 
@@ -602,148 +663,6 @@ def get_user_id_from_input(user_input):
         return int(user_input)
     except:
         return None
-
-# ==================== СИСТЕМА ПРАВ АДМИНОВ ====================
-
-PERMISSIONS = {
-    'check_user': 'Проверка пользователя (/check)',
-    'user_info': 'Информация о пользователе (/user)',
-    'add_days': 'Выдача дней (/add_days)',
-    'remove_days': 'Забирание дней (/remove_days)',
-    'block_user': 'Блокировка (/block)',
-    'unblock_user': 'Разблокировка (/unblock)',
-    'announce': 'Рассылка',
-    'manage_keys': 'Управление ключами',
-    'autopost': 'Автопостинг',
-    'manage_admins': 'Управление админами',
-    'manage_users': 'Управление пользователями',
-    'admin_stats': 'Статистика бота',
-    'admin_panel': 'Доступ к админ-панели',
-}
-
-ROLE_PRESETS = {
-    'owner': {
-        'name': '👑 Владелец',
-        'permissions': {p: True for p in PERMISSIONS}
-    },
-    'senior': {
-        'name': '⭐ Старший админ',
-        'permissions': {
-            'check_user': True,
-            'user_info': True,
-            'add_days': True,
-            'remove_days': True,
-            'block_user': True,
-            'unblock_user': True,
-            'announce': True,
-            'manage_keys': True,
-            'autopost': True,
-            'manage_admins': False,
-            'manage_users': True,
-            'admin_stats': True,
-            'admin_panel': True,
-        }
-    },
-    'junior': {
-        'name': '🔹 Младший админ',
-        'permissions': {
-            'check_user': True,
-            'user_info': True,
-            'add_days': True,
-            'remove_days': True,
-            'block_user': True,
-            'unblock_user': True,
-            'announce': False,
-            'manage_keys': False,
-            'autopost': False,
-            'manage_admins': False,
-            'manage_users': False,
-            'admin_stats': False,
-            'admin_panel': True,
-        }
-    },
-    'support': {
-        'name': '🟢 Поддержка',
-        'permissions': {
-            'check_user': True,
-            'user_info': True,
-            'add_days': False,
-            'remove_days': False,
-            'block_user': False,
-            'unblock_user': False,
-            'announce': False,
-            'manage_keys': False,
-            'autopost': False,
-            'manage_admins': False,
-            'manage_users': False,
-            'admin_stats': False,
-            'admin_panel': False,
-        }
-    }
-}
-
-def get_admin_permissions(user_id):
-    if user_id == ADMIN_ID:
-        return ROLE_PRESETS['owner']['permissions'].copy()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT permissions FROM admins WHERE user_id = %s", (user_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    if result and result[0]:
-        try:
-            return json.loads(result[0])
-        except:
-            pass
-    return {p: False for p in PERMISSIONS}
-
-def has_permission(user_id, permission):
-    if user_id == ADMIN_ID:
-        return True
-    perms = get_admin_permissions(user_id)
-    return perms.get(permission, False)
-
-def update_admin_permissions(user_id, permissions_dict):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE admins SET permissions = %s WHERE user_id = %s", (json.dumps(permissions_dict), user_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def get_admin_role(user_id):
-    if user_id == ADMIN_ID:
-        return 'owner'
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT role FROM admins WHERE user_id = %s", (user_id,))
-    result = cur.fetchone()
-    cur.close()
-    conn.close()
-    return result[0] if result else None
-
-def get_admin_role_name(user_id):
-    role = get_admin_role(user_id)
-    if role == 'owner': return "👑 Владелец"
-    elif role == 'senior': return "⭐ Старший админ"
-    elif role == 'junior': return "🔹 Младший админ"
-    elif role == 'support': return "🟢 Поддержка"
-    return "❌ Не админ"
-
-def is_admin(user_id):
-    if user_id == ADMIN_ID:
-        return True
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM admins WHERE user_id = %s", (user_id,))
-        result = cur.fetchone()
-        cur.close()
-        conn.close()
-        return result is not None
-    except:
-        return False
 
 # ==================== KEYBOARDS ====================
 
@@ -1367,7 +1286,6 @@ def decrypt_subscription_start(message):
         "• Base64 (все уровни)\n"
         "• HTML/JSON\n"
         "• Схемы: happ://, incy:// и др.\n"
-        "• crypt5 ссылки\n"
         "• Файлы с ключами\n\n"
         "📄 Получите `.txt` файл со всеми ключами.\n\n"
         "❗ Чтобы выйти из режима расшифровки - нажмите /cancel",
@@ -1436,38 +1354,6 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка: {e}")
             return [], steps
-
-    # CRYPT5
-    crypt5_match = re.match(r'^(?:happ|incy)://crypt5/+(.+)$', text, re.IGNORECASE)
-    if crypt5_match:
-        steps.append("🔐 Обнаружена crypt5 ссылка")
-        payload = crypt5_match.group(1).strip()
-        decrypted = decrypt_crypt5_payload(payload)
-        if decrypted:
-            steps.append("✅ Расшифровка успешна")
-            if re.match(r'^https?://', decrypted.strip(), re.IGNORECASE):
-                try:
-                    resp = requests.get(decrypted.strip(), timeout=30)
-                    if resp.status_code == 200:
-                        return _parse_subscription_any(resp.text, steps)
-                except:
-                    pass
-            keys = _extract_vpn_keys(decrypted)
-            if keys:
-                steps.append(f"🔍 Найдено {len(keys)} ключей")
-                return keys, steps
-            if re.match(r'^[A-Za-z0-9+/_\-=]+$', decrypted.strip()) and len(decrypted) > 50:
-                decoded = _try_multilevel_b64(decrypted.strip(), max_depth=5)
-                if decoded:
-                    all_keys = []
-                    for item in decoded:
-                        all_keys.extend(_extract_vpn_keys(item))
-                    if all_keys:
-                        steps.append(f"🔍 Найдено {len(all_keys)} ключей")
-                        return _dedup(all_keys), steps
-            return [], steps
-        steps.append("❌ Не удалось расшифровать crypt5")
-        return [], steps
 
     # СХЕМЫ ПРИЛОЖЕНИЙ
     app_scheme_match = re.match(r'^(?:' + APP_SCHEMES + r')://(?:add|sub|crypt\d*|import|install|update|get|fetch)/+(.+)$', text, re.IGNORECASE)
@@ -1866,7 +1752,6 @@ def build_user_list_keyboard(users, page, filter_type='all'):
         display = f"{icon} {admin_icon}{name}"[:40]
         kb.add(types.InlineKeyboardButton(display, callback_data=f"user_{uid}"))
     
-    # Навигация
     nav_row = []
     if page > 0:
         nav_row.append(types.InlineKeyboardButton("◀️ Назад", callback_data=f"page_{page-1}_{filter_type}"))
@@ -1875,7 +1760,6 @@ def build_user_list_keyboard(users, page, filter_type='all'):
     if nav_row:
         kb.row(*nav_row)
     
-    # Фильтры
     kb.row(
         types.InlineKeyboardButton("🟢 Активные", callback_data="filter_active"),
         types.InlineKeyboardButton("🔴 Неактивные", callback_data="filter_inactive")
@@ -1995,7 +1879,6 @@ def callback_manage_filters(call):
             pass
         return
 
-    # Фильтры
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -2075,7 +1958,6 @@ def callback_user_detail(call):
     admin_text = "✅ Да" if is_admin_user else "❌ Нет"
     name = get_user_display_name(target_id)
     
-    # Проверяем есть ли юзернейм
     username = ""
     try:
         chat = bot.get_chat(target_id)
@@ -2088,28 +1970,24 @@ def callback_user_detail(call):
     
     kb = types.InlineKeyboardMarkup(row_width=2)
     
-    # ВЫДАЧА ПОДПИСКИ
     if has_permission(user_id, 'add_days'):
         kb.add(types.InlineKeyboardButton("✅ Выдать подписку", callback_data=f"give_sub_{target_id}"))
     
-    # Управление подпиской
     if has_permission(user_id, 'add_days'):
         kb.add(types.InlineKeyboardButton("📅 +30 дн", callback_data=f"prolong_{target_id}_30"))
     if has_permission(user_id, 'remove_days'):
         kb.add(types.InlineKeyboardButton("📅 -30 дн", callback_data=f"remove_days_{target_id}_30"))
     
-    # Удалить подписку
     if has_permission(user_id, 'add_days') or has_permission(user_id, 'remove_days'):
         kb.add(types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{target_id}"))
     
-    # Блокировка/Разблокировка
     if has_permission(user_id, 'block_user'):
         if blk:
             kb.add(types.InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock_{target_id}"))
         else:
             kb.add(types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{target_id}"))
     
-    # Управление админкой (только для владельца)
+    # Управление админкой
     if has_permission(user_id, 'manage_admins'):
         if is_admin_user and target_id != ADMIN_ID:
             kb.add(types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{target_id}"))
@@ -2185,7 +2063,6 @@ def callback_give_sub(call):
     except:
         pass
 
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
 def callback_prolong(call):
     if not is_admin(call.from_user.id):
@@ -2226,7 +2103,6 @@ def callback_prolong(call):
         bot.send_message(target_id, f"🎉 Ваша подписка продлена на {days} дней администратором!")
     except:
         pass
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_days_'))
 def callback_remove_days(call):
@@ -2271,7 +2147,6 @@ def callback_remove_days(call):
         bot.send_message(target_id, f"⚠️ Администратор забрал {days} дней подписки!")
     except:
         pass
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
 def callback_remove_sub(call):
@@ -2331,7 +2206,6 @@ def callback_block(call):
         bot.send_message(target_id, f"🚫 Вы заблокированы администратором.\n\nОбратитесь в поддержку: {SUPPORT}")
     except:
         pass
-
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
 def callback_unblock(call):
@@ -3557,7 +3431,6 @@ def subscription(token):
 # ==================== MAIN ====================
 
 if __name__ == "__main__":
-    load_crypt5_keys()
     init_db()
     ensure_bot_start_time()
     print("✅ Бот запущен!")
@@ -3574,4 +3447,3 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-                                                     
