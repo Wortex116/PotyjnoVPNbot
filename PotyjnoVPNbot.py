@@ -308,14 +308,6 @@ def get_user_channels(user_id):
             FROM autopost_channels 
             ORDER BY is_default DESC, id
         """)
-    elif is_admin(user_id):
-        cur.execute("""
-            SELECT c.id, c.channel_id, c.channel_name, c.topic_id, c.enabled, c.interval_seconds, c.last_post, c.is_default
-            FROM autopost_channels c
-            INNER JOIN autopost_user_access a ON c.channel_id = a.channel_id
-            WHERE a.user_id = %s AND a.can_post = TRUE
-            ORDER BY c.is_default DESC, c.id
-        """, (user_id,))
     else:
         cur.execute("""
             SELECT c.id, c.channel_id, c.channel_name, c.topic_id, c.enabled, c.interval_seconds, c.last_post, c.is_default
@@ -1848,6 +1840,11 @@ def admin_panel(message):
         bot.reply_to(message, "❌ Только создатель бота.")
         return
     
+    kb = admin_panel_keyboard()
+    text = "👑 *АДМИН-ПАНЕЛЬ*\n\nВыберите действие:"
+    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+
+def admin_panel_keyboard():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("📢 Каналы", callback_data="admin_channels"),
@@ -1862,11 +1859,12 @@ def admin_panel(message):
         types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")
     )
     kb.add(
+        types.InlineKeyboardButton("🗑️ Очистить ключи", callback_data="admin_clear_keys")
+    )
+    kb.add(
         types.InlineKeyboardButton("❌ Закрыть", callback_data="admin_close")
     )
-    
-    text = "👑 *АДМИН-ПАНЕЛЬ*\n\nВыберите действие:"
-    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+    return kb
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
 def admin_callback(call):
@@ -1968,7 +1966,6 @@ def admin_callback(call):
         config['enabled'] = not config['enabled']
         save_autopost_config(config)
         bot.answer_callback_query(call.id, f"Автопостинг {'включен' if config['enabled'] else 'выключен'}")
-        # Обновляем
         admin_callback(call)
         return
     
@@ -1997,8 +1994,88 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         return
     
+    # ====== ОЧИСТКА КЛЮЧЕЙ ======
+    if data == 'clear_keys':
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🗑️ Очистить все ключи", callback_data="admin_clear_all"),
+            types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="admin_clear_dead"),
+            types.InlineKeyboardButton("🔙 Отмена", callback_data="admin_back")
+        )
+        
+        keys = get_keys_from_db()
+        text = f"🗑️ *Очистка ключей*\n\n"
+        text += f"📦 Всего ключей в базе: {len(keys)}\n\n"
+        text += "Выберите действие:"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        bot.answer_callback_query(call.id)
+        return
+    
+    if data == 'clear_all':
+        save_keys_to_db([])
+        set_setting('total_keys_issued', '0')
+        bot.answer_callback_query(call.id, "✅ Все ключи удалены")
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back"))
+        
+        bot.edit_message_text(
+            "✅ *Все ключи удалены!*\n\nБаза ключей очищена.",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+    
+    if data == 'clear_dead':
+        keys = get_keys_from_db()
+        if not keys:
+            bot.answer_callback_query(call.id, "❌ Нет ключей для проверки")
+            return
+        
+        bot.answer_callback_query(call.id, "⏳ Проверяю ключи...")
+        
+        alive_keys = []
+        dead_keys = []
+        
+        for key in keys:
+            status, _ = ping_key_advanced(key)
+            if status:
+                alive_keys.append(key)
+            else:
+                dead_keys.append(key)
+        
+        save_keys_to_db(alive_keys)
+        
+        current_issued = int(get_setting('total_keys_issued', '0'))
+        set_setting('total_keys_issued', str(current_issued - len(dead_keys) if current_issued >= len(dead_keys) else 0))
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back"))
+        
+        text = f"🧹 *Очистка нерабочих ключей завершена!*\n\n"
+        text += f"✅ Оставлено живых: {len(alive_keys)}\n"
+        text += f"🗑️ Удалено нерабочих: {len(dead_keys)}\n"
+        text += f"📦 Всего в базе: {len(alive_keys)}"
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+    
     if data == 'back':
-        # Создаем новое сообщение с админ-панелью
         bot.send_message(call.message.chat.id, "👑 *АДМИН-ПАНЕЛЬ*\n\nВыберите действие:", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -2010,25 +2087,6 @@ def admin_callback(call):
 def admin_back_button():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back"))
-    return kb
-
-def admin_panel_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📢 Каналы", callback_data="admin_channels"),
-        types.InlineKeyboardButton("👥 Доступ", callback_data="admin_access")
-    )
-    kb.add(
-        types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="admin_loadkeys"),
-        types.InlineKeyboardButton("🚀 Автопостинг", callback_data="admin_autopost")
-    )
-    kb.add(
-        types.InlineKeyboardButton("📢 Объявление", callback_data="admin_announce"),
-        types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")
-    )
-    kb.add(
-        types.InlineKeyboardButton("❌ Закрыть", callback_data="admin_close")
-    )
     return kb
 
 # ==================== МЕНЮ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ (/user) ====================
@@ -2253,7 +2311,8 @@ def user_callback(call):
         kb.add(
             types.InlineKeyboardButton("📥 Начать проверку", callback_data="load_start_check"),
             types.InlineKeyboardButton("🗑️ Очистить", callback_data="load_clear"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data="load_cancel")
+            types.InlineKeyboardButton("❌ Отмена", callback_data="load_cancel"),
+            types.InlineKeyboardButton("❌ Закрыть", callback_data="load_close")
         )
         
         bot.edit_message_text(
@@ -2324,6 +2383,21 @@ def load_callback(call):
             del channel_selection[user_id]
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.answer_callback_query(call.id, "❌ Отменено")
+        if is_admin(user_id):
+            admin_panel(call.message)
+        else:
+            user_panel(call.message)
+        return
+    
+    if data == 'close':
+        if user_id in channel_selection:
+            del channel_selection[user_id]
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id, "❌ Закрыто")
+        if is_admin(user_id):
+            admin_panel(call.message)
+        else:
+            user_panel(call.message)
         return
     
     if data == 'clear':
@@ -2382,7 +2456,8 @@ def load_callback(call):
         kb.add(
             types.InlineKeyboardButton("📥 Начать проверку", callback_data="load_start_check"),
             types.InlineKeyboardButton("🗑️ Очистить", callback_data="load_clear"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data="load_cancel")
+            types.InlineKeyboardButton("❌ Отмена", callback_data="load_cancel"),
+            types.InlineKeyboardButton("❌ Закрыть", callback_data="load_close")
         )
         
         bot.edit_message_text(
@@ -2409,10 +2484,7 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
     if not keys:
         print(f"[autopost] Нет ключей")
         try:
-            if topic_id and topic_id != 0:
-                bot.send_message(channel_id, "❌ Нет ключей для постинга", message_thread_id=topic_id)
-            else:
-                bot.send_message(channel_id, "❌ Нет ключей для постинга")
+            bot.send_message(ADMIN_ID, f"❌ Автопостинг: нет ключей для выдачи\n🕐 {datetime.now().strftime('%d.%m.%Y %H:%M')}")
         except:
             pass
         return
@@ -2422,7 +2494,6 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
         channel_id = config['channel_id']
         topic_id = config['topic_id']
     
-    # Проверяем ключи
     working = []
     not_working = []
     
@@ -2433,10 +2504,8 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
         else:
             not_working.append({'key': key})
     
-    # Сортируем по пингу (лучшие сверху)
     working.sort(key=lambda x: x['latency'] if x['latency'] else 9999)
     
-    # Отправляем ключи в красивом формате
     sent_keys = []
     for i, key_data in enumerate(working[:10], 1):
         formatted = format_key_for_post(key_data['key'], key_data['latency'], i)
@@ -2451,12 +2520,10 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
         except Exception as e:
             print(f"[autopost] Ошибка отправки: {e}")
     
-    # Удаляем выданные ключи
     if sent_keys:
         remove_used_keys(sent_keys)
         increment_setting('total_keys_issued', len(sent_keys))
     
-    # Статистика
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
     stats_msg = f"""📊 *АВТОПОСТИНГ*
 
@@ -2466,44 +2533,39 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
 🗑️ Выдано: {len(sent_keys)}
 📦 Осталось: {len(get_keys_from_db())}
 
+📢 Канал: {channel_id}
+📝 Ветка: {topic_id if topic_id else 'Нет'}
+
 🔗 @ciorsa"""
     
     try:
-        if topic_id and topic_id != 0:
-            bot.send_message(channel_id, stats_msg, parse_mode="Markdown", message_thread_id=topic_id)
-        else:
-            bot.send_message(channel_id, stats_msg, parse_mode="Markdown")
-    except:
-        pass
+        bot.send_message(ADMIN_ID, stats_msg, parse_mode="Markdown")
+        print(f"[autopost] ✅ Статистика отправлена админу {ADMIN_ID}")
+    except Exception as e:
+        print(f"[autopost] Ошибка отправки статистики админу: {e}")
 
 def format_key_for_post(key, latency, index):
     """Форматирует ключ для постинга в красивом виде"""
     
-    # Извлекаем протокол
     protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
     protocol = protocol_match.group(1).upper() if protocol_match else "UNKNOWN"
     
-    # Извлекаем название (после #)
     name_match = re.search(r'#([^#\s]+)', key)
     if name_match:
         name = urllib.parse.unquote(name_match.group(1))
-        # Удаляем лишние метки
         name = re.sub(r'\|.*$', '', name)
         name = re.sub(r'@\w+', '', name)
         name = name.strip()
     else:
         name = "VPN Server"
     
-    # Извлекаем IP/домен
     ip_match = re.search(r'@([^:]+):(\d+)', key)
     ip = ip_match.group(1) if ip_match else "Unknown"
     port = ip_match.group(2) if ip_match else "0"
     
-    # Извлекаем город/страну из названия
     country = "Unknown"
     city = "Unknown"
     
-    # Пытаемся найти страну в названии
     countries = {
         'united states': '🇺🇸', 'usa': '🇺🇸', 'us': '🇺🇸',
         'united kingdom': '🇬🇧', 'uk': '🇬🇧',
@@ -2533,16 +2595,13 @@ def format_key_for_post(key, latency, index):
     for country_name, flag in countries.items():
         if country_name in name_lower:
             country = country_name.title()
-            # Пытаемся найти город
             city_match = re.search(r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)', name)
             if city_match and city_match.group(1).lower() != country_name:
                 city = city_match.group(1)
             break
     
-    # Флаг
     flag = get_country_flag(country)
     
-    # Скорость (оценка по пингу)
     if latency and latency < 50:
         speed = "100+ Mbps"
     elif latency and latency < 100:
@@ -2554,7 +2613,6 @@ def format_key_for_post(key, latency, index):
     else:
         speed = "1-5 Mbps"
     
-    # Иконка протокола
     protocol_icons = {
         'VLESS': '🔹',
         'VMESS': '🔸',
@@ -2567,7 +2625,6 @@ def format_key_for_post(key, latency, index):
     }
     proto_icon = protocol_icons.get(protocol.upper(), '🔹')
     
-    # Формируем красивое сообщение
     formatted = f"""🚀 #{index} | {flag} {country}
 
 ┌ 🏷 Название: {flag} {country} | @ciorsa
@@ -2585,9 +2642,7 @@ def format_key_for_post(key, latency, index):
     
     return formatted
 
-
 def get_country_flag(country):
-    """Возвращает флаг для страны"""
     flags = {
         'united states': '🇺🇸', 'usa': '🇺🇸',
         'united kingdom': '🇬🇧', 'uk': '🇬🇧',
@@ -2758,7 +2813,7 @@ def announce_callback(call):
     if data == 'all':
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT channel_id, topic_id FROM autopost_channels WHERE enabled = TRUE")
+        cur.execute("SELECT channel_id, topic_id, channel_name FROM autopost_channels WHERE enabled = TRUE")
         channels = cur.fetchall()
         cur.close()
         conn.close()
@@ -2768,7 +2823,9 @@ def announce_callback(call):
             return
         
         success = 0
-        for ch_id, topic_id in channels:
+        fail = 0
+        
+        for ch_id, topic_id, ch_name in channels:
             try:
                 if topic_id and topic_id != 0:
                     bot.send_message(ch_id, formatted, parse_mode="Markdown", message_thread_id=topic_id)
@@ -2777,10 +2834,11 @@ def announce_callback(call):
                 success += 1
                 time.sleep(0.3)
             except Exception as e:
-                print(f"[announce] Ошибка: {e}")
+                print(f"[announce] Ошибка отправки в {ch_name}: {e}")
+                fail += 1
         
-        bot.answer_callback_query(call.id, f"✅ Отправлено в {success} каналов")
-        bot.send_message(call.message.chat.id, f"✅ Объявление отправлено в {success} каналов")
+        bot.answer_callback_query(call.id, f"✅ Отправлено в {success} каналов, ошибок: {fail}")
+        bot.send_message(call.message.chat.id, f"✅ Объявление отправлено в {success} каналов\n❌ Ошибок: {fail}")
         
     else:
         try:
@@ -2805,10 +2863,12 @@ def announce_callback(call):
         try:
             if topic_id and topic_id != 0:
                 bot.send_message(channel_id, formatted, parse_mode="Markdown", message_thread_id=topic_id)
+                bot.answer_callback_query(call.id, f"✅ Отправлено в {ch_name} (ветка {topic_id})")
+                bot.send_message(call.message.chat.id, f"✅ Объявление отправлено в {ch_name} (ветка {topic_id})")
             else:
                 bot.send_message(channel_id, formatted, parse_mode="Markdown")
-            bot.answer_callback_query(call.id, f"✅ Отправлено в {ch_name}")
-            bot.send_message(call.message.chat.id, f"✅ Объявление отправлено в {ch_name}")
+                bot.answer_callback_query(call.id, f"✅ Отправлено в {ch_name}")
+                bot.send_message(call.message.chat.id, f"✅ Объявление отправлено в {ch_name}")
         except Exception as e:
             bot.answer_callback_query(call.id, f"❌ Ошибка: {e}")
     
@@ -3394,6 +3454,7 @@ def callback_user_detail(call):
         kb.add(types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{target_id}"))
     else:
         kb.add(types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"add_admin_{target_id}"))
+    kb.add(types.InlineKeyboardButton("📊 Права в каналах", callback_data=f"user_rights_{target_id}"))
     kb.row(
         types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
         types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
@@ -3409,6 +3470,247 @@ def callback_user_detail(call):
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
     except:
         pass
+
+# ==================== ПРАВА В КАНАЛАХ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('user_rights_'))
+def callback_user_rights(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    target_id = int(call.data.split('_')[2])
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT c.channel_id, c.channel_name, a.can_post, a.can_manage, a.can_announce
+        FROM autopost_user_access a
+        JOIN autopost_channels c ON a.channel_id = c.channel_id
+        WHERE a.user_id = %s
+    """, (target_id,))
+    rights = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    name = get_user_display_name(target_id)
+    
+    if not rights:
+        text = f"👤 *{name}*\n\n❌ Нет доступа ни к одному каналу."
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("➕ Выдать доступ", callback_data=f"user_grant_{target_id}"))
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"user_back_{target_id}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+        bot.answer_callback_query(call.id)
+        return
+    
+    text = f"👤 *{name}*\n\n📊 *Права в каналах:*\n\n"
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    
+    for ch_id, ch_name, can_post, can_manage, can_announce in rights:
+        rights_text = []
+        if can_post:
+            rights_text.append("📤 пост")
+        if can_manage:
+            rights_text.append("⚙️ упр")
+        if can_announce:
+            rights_text.append("📢 объявл")
+        rights_str = ", ".join(rights_text) if rights_text else "❌ нет прав"
+        
+        text += f"📢 {ch_name}\n└ {rights_str}\n\n"
+        
+        kb.add(types.InlineKeyboardButton(
+            f"📢 {ch_name} — изменить права",
+            callback_data=f"rights_edit_{target_id}_{ch_id}"
+        ))
+    
+    kb.add(types.InlineKeyboardButton("➕ Выдать доступ к новому каналу", callback_data=f"user_grant_{target_id}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"user_back_{target_id}"))
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rights_edit_'))
+def callback_rights_edit(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    channel_id = int(parts[3])
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT can_post, can_manage, can_announce
+        FROM autopost_user_access
+        WHERE user_id = %s AND channel_id = %s
+    """, (target_id, channel_id))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not result:
+        bot.answer_callback_query(call.id, "❌ Доступ не найден.")
+        return
+    
+    can_post, can_manage, can_announce = result
+    
+    name = get_user_display_name(target_id)
+    conn2 = get_db_connection()
+    cur2 = conn2.cursor()
+    cur2.execute("SELECT channel_name FROM autopost_channels WHERE channel_id = %s", (channel_id,))
+    ch_name = cur2.fetchone()[0]
+    cur2.close()
+    conn2.close()
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton(
+            f"{'✅' if can_post else '❌'} Постинг",
+            callback_data=f"rights_toggle_{target_id}_{channel_id}_post"
+        ),
+        types.InlineKeyboardButton(
+            f"{'✅' if can_manage else '❌'} Управление",
+            callback_data=f"rights_toggle_{target_id}_{channel_id}_manage"
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            f"{'✅' if can_announce else '❌'} Объявления",
+            callback_data=f"rights_toggle_{target_id}_{channel_id}_announce"
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton("🗑️ Отозвать доступ", callback_data=f"rights_revoke_{target_id}_{channel_id}"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data=f"user_rights_{target_id}")
+    )
+    
+    text = f"👤 *{name}*\n📢 *{ch_name}*\n\n"
+    text += f"📤 Постинг: {'✅' if can_post else '❌'}\n"
+    text += f"⚙️ Управление: {'✅' if can_manage else '❌'}\n"
+    text += f"📢 Объявления: {'✅' if can_announce else '❌'}\n\n"
+    text += "Нажмите на право, чтобы изменить:"
+    
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rights_toggle_'))
+def callback_rights_toggle(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    channel_id = int(parts[3])
+    right = parts[4]
+    
+    field_map = {
+        'post': 'can_post',
+        'manage': 'can_manage',
+        'announce': 'can_announce'
+    }
+    field = field_map.get(right)
+    if not field:
+        bot.answer_callback_query(call.id, "❌ Неизвестное право.")
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(f"SELECT {field} FROM autopost_user_access WHERE user_id = %s AND channel_id = %s", (target_id, channel_id))
+    result = cur.fetchone()
+    if not result:
+        cur.close()
+        conn.close()
+        bot.answer_callback_query(call.id, "❌ Доступ не найден.")
+        return
+    
+    current = result[0]
+    new_value = not current
+    
+    cur.execute(f"UPDATE autopost_user_access SET {field} = %s WHERE user_id = %s AND channel_id = %s", (new_value, target_id, channel_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    bot.answer_callback_query(call.id, f"✅ Право изменено: {'включено' if new_value else 'выключено'}")
+    callback_rights_edit(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('rights_revoke_'))
+def callback_rights_revoke(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    channel_id = int(parts[3])
+    
+    remove_channel_access(target_id, channel_id)
+    bot.answer_callback_query(call.id, "✅ Доступ отозван")
+    callback_user_rights(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('user_grant_'))
+def callback_user_grant(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    target_id = int(call.data.split('_')[2])
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT channel_id, channel_name FROM autopost_channels WHERE enabled = TRUE")
+    channels = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not channels:
+        bot.answer_callback_query(call.id, "❌ Нет активных каналов.")
+        return
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch_id, ch_name in channels:
+        kb.add(types.InlineKeyboardButton(f"📢 {ch_name}", callback_data=f"grant_confirm_{target_id}_{ch_id}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"user_rights_{target_id}"))
+    
+    name = get_user_display_name(target_id)
+    bot.edit_message_text(
+        f"👤 *{name}*\n\nВыберите канал для выдачи доступа:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('grant_confirm_'))
+def callback_grant_confirm(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    channel_id = int(parts[3])
+    
+    grant_channel_access(target_id, channel_id, can_manage=False, can_announce=False, granted_by=call.from_user.id)
+    
+    bot.answer_callback_query(call.id, "✅ Доступ выдан")
+    callback_user_rights(call)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('user_back_'))
+def callback_user_back(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    
+    target_id = int(call.data.split('_')[2])
+    fake_call = call
+    fake_call.data = f"user_{target_id}"
+    callback_user_detail(fake_call)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
 def callback_prolong(call):
@@ -3754,8 +4056,37 @@ def handle_text(message):
     if message.chat.type != 'private':
         return
     user_id = message.from_user.id
+    
+    # ====== ЗАГРУЗКА КЛЮЧЕЙ ======
+    if user_id in channel_selection:
+        text = message.text.strip()
+        if not text:
+            return
+        
+        new_keys = []
+        
+        if re.match(r'https?://', text, re.IGNORECASE):
+            bot.reply_to(message, "⏳ Загружаю ключи из URL...")
+            new_keys = load_keys_from_url(text)
+        else:
+            new_keys = load_keys_from_text(text)
+        
+        if new_keys:
+            channel_selection[user_id]['keys'].extend(new_keys)
+            channel_selection[user_id]['keys'] = _dedup(channel_selection[user_id]['keys'])
+            bot.reply_to(
+                message,
+                f"✅ Загружено {len(new_keys)} ключей.\n"
+                f"📊 Всего в списке: {len(channel_selection[user_id]['keys'])} ключей"
+            )
+        else:
+            bot.reply_to(message, "❌ Не удалось найти ключи. Проверьте ссылку или текст.")
+        return
+    # =================================
+    
     if message.text and message.text.startswith('/'):
         return
+    
     if user_id in decrypt_results and decrypt_results[user_id].get('waiting'):
         if is_blocked(user_id):
             bot.reply_to(message, "🚫 Вы заблокированы.")
@@ -3763,6 +4094,7 @@ def handle_text(message):
             return
         _do_decrypt(message, user_id, text=message.text or '')
         return
+    
     if user_id in proxy_check_results and proxy_check_results[user_id].get('waiting'):
         if is_blocked(user_id):
             bot.reply_to(message, "🚫 Вы заблокированы.")
@@ -3771,6 +4103,7 @@ def handle_text(message):
         del proxy_check_results[user_id]
         _process_proxies(message, message.text or '', user_id)
         return
+    
     if search_cache.get(user_id) == 'waiting_for_keys' and is_admin(user_id):
         del search_cache[user_id]
         t = (message.text or '').strip()
@@ -3785,6 +4118,7 @@ def handle_text(message):
             keys = load_keys_from_text(t)
             _finish_update_keys(message, keys, "текстовое сообщение")
         return
+    
     if user_id in check_results and check_results[user_id].get('waiting'):
         if is_blocked(user_id):
             bot.reply_to(message, "🚫 Вы заблокированы.")
@@ -3792,6 +4126,7 @@ def handle_text(message):
         keys = re.findall(r'vless://[^\s<>"\']+', message.text or '')
         _process_keys(message, keys, user_id)
         return
+    
     if search_cache.get(user_id) == 'waiting_for_search':
         del search_cache[user_id]
         query = (message.text or '').strip()
@@ -3828,6 +4163,7 @@ def handle_text(message):
             except:
                 bot.reply_to(message, "❌ Неверный запрос.")
         return
+    
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
@@ -3864,7 +4200,6 @@ if __name__ == '__main__':
     if not get_keys_from_db():
         save_keys_to_db(DEFAULT_KEYS)
     
-    # Принудительно добавляем создателя в админы
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -3895,4 +4230,4 @@ if __name__ == '__main__':
     print(f"[main] 🚀 Запуск веб-сервера на порту 10000")
     from waitress import serve
     serve(app, host='0.0.0.0', port=10000, threads=4, connection_limit=100)
-        
+    
