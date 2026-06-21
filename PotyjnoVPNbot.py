@@ -313,14 +313,11 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
-            id SERIAL PRIMARY KEY,
             referrer_id BIGINT,
             referred_id BIGINT,
             reward_date BIGINT,
             rewarded INTEGER DEFAULT 0,
-            referrer_subscribed INTEGER DEFAULT 0,
-            referred_subscribed INTEGER DEFAULT 0,
-            UNIQUE(referrer_id, referred_id)
+            PRIMARY KEY (referrer_id, referred_id)
         )
     """)
     cur.execute("""
@@ -1011,6 +1008,7 @@ def get_user_display_name(user_id):
         return str(user_id)
 
 def get_user_id_from_input(user_input):
+    """Получить ID пользователя из ID или юзернейма"""
     user_input = user_input.strip()
     
     if user_input.startswith('@'):
@@ -1125,6 +1123,7 @@ def add_subscribe_record(user_id):
 # ==================== РЕФЕРАЛЬНАЯ СИСТЕМА ====================
 
 def process_referral(referrer_id, referred_id):
+    """Обработка реферала с начислением бонусов"""
     if referrer_id == referred_id:
         return False, "Нельзя пригласить самого себя"
     
@@ -1134,12 +1133,14 @@ def process_referral(referrer_id, referred_id):
     conn = get_db_connection()
     cur = conn.cursor()
     
+    # Проверяем существует ли реферер
     cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referrer_id,))
     if not cur.fetchone():
         cur.close()
         conn.close()
         return False, "Реферер не найден"
     
+    # Проверяем не было ли уже реферала
     cur.execute(
         "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
         (referrer_id, referred_id)
@@ -1149,19 +1150,22 @@ def process_referral(referrer_id, referred_id):
         conn.close()
         return False, "Этот пользователь уже был приглашен"
     
+    # Проверяем лимит рефералов
     if not can_add_referral(referrer_id):
         cur.close()
         conn.close()
         return False, "Лимит рефералов (10 в день) превышен"
     
+    # Сохраняем реферала
     current_time = int(time.time())
     cur.execute(
-        "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded, referrer_subscribed, referred_subscribed) VALUES (%s, %s, %s, 0, %s, %s)",
-        (referrer_id, referred_id, current_time, 1 if is_subscribed(referrer_id) else 0, 1)
+        "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (%s, %s, %s, 0)",
+        (referrer_id, referred_id, current_time)
     )
     conn.commit()
     print(f"[referral] Сохранен реферал: {referrer_id} -> {referred_id}")
     
+    # Начисляем бонусы если реферер подписан на канал
     if is_subscribed(referrer_id):
         cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
         ref_result = cur.fetchone()
@@ -1176,6 +1180,7 @@ def process_referral(referrer_id, referred_id):
             print(f"[referral] Начислено +3 дня рефереру {referrer_id}")
             cur.close()
             conn.close()
+            
             try:
                 bot.send_message(referrer_id, "🎉 Вам начислено +3 дня за нового реферала!")
             except:
@@ -1198,13 +1203,11 @@ def cmd_start(message):
     user_id = message.from_user.id
     current_time = int(time.time())
 
-    print(f"[DEBUG] /start от пользователя {user_id}")
-    print(f"[DEBUG] Текст сообщения: {message.text}")
-
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
 
+    # Парсим реферальную ссылку
     referrer_id = None
     if message.text and 'start=ref_' in message.text:
         parts = message.text.split('start=ref_')
@@ -1213,15 +1216,9 @@ def cmd_start(message):
                 ref = int(parts[1].strip())
                 if ref != user_id:
                     referrer_id = ref
-                    print(f"[DEBUG] ✅ Найден реферер: {referrer_id} для пользователя {user_id}")
-                else:
-                    print(f"[DEBUG] ❌ Пользователь {user_id} пытался пригласить самого себя")
-            except Exception as e:
-                print(f"[DEBUG] ❌ Ошибка парсинга реферера: {e}")
-        else:
-            print(f"[DEBUG] ❌ Не удалось распарсить start=ref_")
-    else:
-        print(f"[DEBUG] ❌ В сообщении нет start=ref_")
+                    print(f"[referral] Найден реферер: {referrer_id} для пользователя {user_id}")
+            except:
+                pass
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1231,7 +1228,6 @@ def cmd_start(message):
     conn.close()
 
     is_new_user = existing_user is None
-    print(f"[DEBUG] Новый пользователь? {is_new_user}")
 
     if is_new_user:
         ok, msg = check_subscribe_rate()
@@ -1259,7 +1255,6 @@ def cmd_start(message):
             'referrer_id': referrer_id,
             'waiting_for_sub': False
         }
-        print(f"[DEBUG] Сохранен реферер в сессию: {referrer_id} для {user_id}")
         return
 
     if not is_subscribed(user_id):
@@ -1311,12 +1306,9 @@ def callback_captcha_verify(call):
 
     bot.answer_callback_query(call.id, "✅ Капча пройдена!")
 
-    referrer_id = session.get('referrer_id')
-    print(f"[DEBUG] Капча пройдена для {user_id}, реферер: {referrer_id}")
-
     if is_subscribed(user_id):
         bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
-        _register_user(user_id, referrer_id)
+        _register_user(user_id, session.get('referrer_id'))
         del captcha_sessions[user_id]
     else:
         bot.send_message(
@@ -1326,7 +1318,46 @@ def callback_captcha_verify(call):
             reply_markup=subscribe_button()
         )
         captcha_sessions[user_id]['waiting_for_sub'] = True
-        print(f"[DEBUG] Пользователь {user_id} ждет подписки, реферер: {referrer_id}")
+
+# ==================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ====================
+
+def _register_user(user_id, referrer_id=None):
+    """Регистрация пользователя с реферальной системой"""
+    current_time = int(time.time())
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return
+
+    token = generate_subscription_token()
+    sub_end = current_time + 7 * 24 * 60 * 60
+
+    cur.execute(
+        "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (%s, %s, %s, 0, %s)",
+        (user_id, sub_end, current_time, token)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    # Обработка реферала
+    if referrer_id:
+        print(f"[referral] Попытка регистрации реферала {user_id} от {referrer_id}")
+        success, message = process_referral(referrer_id, user_id)
+        print(f"[referral] Результат: {success} - {message}")
+
+        if success:
+            try:
+                bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {get_user_display_name(user_id)} зарегистрировался по вашей ссылке.")
+            except:
+                pass
+
+    bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
+    bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
 
 # ==================== ОБРАБОТЧИК "Я ПОДПИСАЛСЯ" ====================
 
@@ -1340,8 +1371,6 @@ def callback_check_sub(call):
     user_id = call.from_user.id
     current_time = int(time.time())
 
-    print(f"[DEBUG] check_sub от {user_id}")
-
     if is_blocked(user_id):
         bot.answer_callback_query(call.id, "🚫 Вы заблокированы.")
         return
@@ -1353,29 +1382,27 @@ def callback_check_sub(call):
         except:
             pass
 
+        # Если пользователь ждал подписку после капчи
         if user_id in captcha_sessions and captcha_sessions[user_id].get('waiting_for_sub'):
             session = captcha_sessions[user_id]
-            referrer_id = session.get('referrer_id')
-            print(f"[DEBUG] Пользователь {user_id} подтвердил подписку, реферер: {referrer_id}")
             bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
-            _register_user(user_id, referrer_id)
+            _register_user(user_id, session.get('referrer_id'))
             del captcha_sessions[user_id]
             return
 
+        # Проверяем необработанные рефералы
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT id, referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
+            "SELECT referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
             (user_id,)
         )
-        pending = cur.fetchall()
+        pending = cur.fetchone()
         cur.close()
         conn.close()
-        
-        print(f"[DEBUG] Необработанных рефералов для {user_id}: {len(pending)}")
 
-        for ref_id, referrer_id in pending:
-            print(f"[DEBUG] Проверяем реферала {ref_id} от {referrer_id}")
+        if pending:
+            referrer_id = pending[0]
             if is_subscribed(referrer_id):
                 conn = get_db_connection()
                 cur = conn.cursor()
@@ -1384,17 +1411,14 @@ def callback_check_sub(call):
                 if ref_result:
                     new_end = ref_result[0] + 3 * 24 * 60 * 60
                     cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, referrer_id))
-                    cur.execute("UPDATE referrals SET rewarded = 1, referrer_subscribed = 1 WHERE id = %s", (ref_id,))
+                    cur.execute("UPDATE referrals SET rewarded = 1 WHERE referred_id = %s", (user_id,))
                     conn.commit()
-                    print(f"[DEBUG] ✅ Начислено +3 дня рефереру {referrer_id} за реферала {user_id}")
                     try:
                         bot.send_message(referrer_id, "🎉 Ваш реферал подтвердил подписку! Вам начислено +3 дня.")
                     except:
                         pass
                 cur.close()
                 conn.close()
-            else:
-                print(f"[DEBUG] ❌ Реферер {referrer_id} не подписан на канал")
 
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1410,112 +1434,6 @@ def callback_check_sub(call):
             bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
     else:
         bot.answer_callback_query(call.id, "❌ Вы ещё не подписались на канал!")
-
-# ==================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ====================
-
-def _register_user(user_id, referrer_id=None):
-    current_time = int(time.time())
-    
-    print(f"[DEBUG] _register_user: {user_id}, реферер: {referrer_id}")
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-    if cur.fetchone():
-        print(f"[DEBUG] Пользователь {user_id} уже существует")
-        cur.close()
-        conn.close()
-        return
-
-    token = generate_subscription_token()
-    sub_end = current_time + 7 * 24 * 60 * 60
-
-    cur.execute(
-        "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (%s, %s, %s, 0, %s)",
-        (user_id, sub_end, current_time, token)
-    )
-    conn.commit()
-    print(f"[DEBUG] Пользователь {user_id} зарегистрирован")
-    cur.close()
-    conn.close()
-
-    if referrer_id:
-        print(f"[DEBUG] 🔥 Обработка реферала: {referrer_id} -> {user_id}")
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referrer_id,))
-        referrer_exists = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if not referrer_exists:
-            print(f"[DEBUG] ❌ Реферер {referrer_id} не найден в базе")
-        elif referrer_id == user_id:
-            print(f"[DEBUG] ❌ Реферер равен пользователю")
-        else:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
-                (referrer_id, user_id)
-            )
-            already_ref = cur.fetchone()
-            cur.close()
-            conn.close()
-
-            if already_ref:
-                print(f"[DEBUG] ❌ Реферал уже существует: {referrer_id} -> {user_id}")
-            else:
-                if can_add_referral(referrer_id):
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute(
-                        "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded, referrer_subscribed, referred_subscribed) VALUES (%s, %s, %s, 0, %s, %s)",
-                        (referrer_id, user_id, current_time, 1 if is_subscribed(referrer_id) else 0, 1)
-                    )
-                    conn.commit()
-                    cur.close()
-                    conn.close()
-                    print(f"[DEBUG] ✅ Реферал сохранен: {referrer_id} -> {user_id}")
-
-                    name = get_user_display_name(user_id)
-                    try:
-                        bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {name} зарегистрировался по вашей ссылке.")
-                    except Exception as e:
-                        print(f"[DEBUG] ❌ Ошибка уведомления реферера: {e}")
-
-                    if is_subscribed(referrer_id):
-                        conn = get_db_connection()
-                        cur = conn.cursor()
-                        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
-                        ref_result = cur.fetchone()
-                        if ref_result:
-                            new_end = ref_result[0] + 3 * 24 * 60 * 60
-                            cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, referrer_id))
-                            cur.execute(
-                                "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
-                                (referrer_id, user_id)
-                            )
-                            conn.commit()
-                            print(f"[DEBUG] ✅ Начислено +3 дня рефереру {referrer_id}")
-                            try:
-                                bot.send_message(referrer_id, "🎉 Вам начислено +3 дня за нового реферала!")
-                            except:
-                                pass
-                        cur.close()
-                        conn.close()
-                    else:
-                        print(f"[DEBUG] ❌ Реферер {referrer_id} не подписан на канал, бонус не начислен")
-                else:
-                    print(f"[DEBUG] ❌ Лимит рефералов для {referrer_id} превышен")
-                    try:
-                        bot.send_message(referrer_id, "⚠️ Лимит рефералов (10 в день). Попробуйте завтра.")
-                    except:
-                        pass
-
-    bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
-    bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
 
 # ==================== ЛИЧНЫЙ КАБИНЕТ ====================
 
@@ -2787,72 +2705,6 @@ def admin_panel(message):
     role_name = get_admin_role_name(user_id)
     bot.send_message(user_id, f"🏛️ Админ панель\n\n👤 Ваша роль: {role_name}", reply_markup=admin_menu())
 
-@bot.message_handler(commands=['ref'])
-def cmd_ref_link(message):
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    
-    bot_username = bot.get_me().username
-    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
-    total = cur.fetchone()[0]
-    cur.close()
-    conn.close()
-    
-    text = f"""🔗 *Ваша реферальная ссылка:*
-
-`{ref_link}`
-
-📊 Всего рефералов: {total}
-📅 Лимит: 10 в день
-
-📌 *Как это работает:*
-1. Пригласите друга по ссылке
-2. Он должен пройти регистрацию и подписаться на канал
-3. Вы получите +3 дня подписки
-
-💬 Поддержка: {SUPPORT}"""
-    
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['ref_debug'])
-def cmd_ref_debug(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, referrer_id, referred_id, reward_date, rewarded, referrer_subscribed, referred_subscribed
-        FROM referrals 
-        ORDER BY id DESC LIMIT 20
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    
-    if not rows:
-        bot.reply_to(message, "📭 Нет записей в реферальной системе.")
-        return
-    
-    text = "📊 *Реферальная система (последние 20):*\n\n"
-    for row in rows:
-        ref_id, refr_id, refd_id, date, rewarded, ref_sub, refd_sub = row
-        status = "✅" if rewarded else "⏳"
-        ref_sub_status = "✅" if ref_sub else "❌"
-        refd_sub_status = "✅" if refd_sub else "❌"
-        name = get_user_display_name(refd_id)
-        date_str = datetime.fromtimestamp(date).strftime("%d.%m %H:%M")
-        text += f"{status} #{ref_id} {name} (`{refd_id}`) → реферер: `{refr_id}` | Реф подписан: {ref_sub_status} | Реф-р подписан: {refd_sub_status} | {date_str}\n"
-    
-    bot.reply_to(message, text, parse_mode="Markdown")
-
 @bot.message_handler(commands=['check'])
 def cmd_check_user(message):
     if message.chat.type != 'private':
@@ -3791,4 +3643,3 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-    
