@@ -87,6 +87,9 @@ check_results = {}
 search_cache = {}
 decrypt_results = {}
 proxy_check_results = {}
+loading_sessions = {}
+announce_data = {}
+channel_selection = {}
 
 KEY_TEMPLATE = """\
 #profile-title: 🌐 Потужно VPN Free
@@ -107,6 +110,13 @@ APP_SCHEMES = (
     r'incy|happ|v2ray|v2rayng|v2box|clash|sing-box|quantumult|surge|loon|'
     r'shadowrocket|stash|nekoray|nekobox|hiddify|streisand|karing|mihomo|flclash'
 )
+
+# ==================== AUTO POSTING CONFIG ====================
+AUTO_POST_CHANNEL = -1003668283208
+AUTO_POST_TOPIC_ID = 461
+AUTO_POST_INTERVAL = 1800
+AUTO_POST_ENABLED = True
+AUTO_POST_EXTRA_USERS = set()
 
 # ==================== DATABASE ====================
 
@@ -151,6 +161,7 @@ def init_db():
     conn.commit()
     cur.close()
     conn.close()
+    init_autopost_tables()
 
 def get_setting(key, default='0'):
     try:
@@ -232,6 +243,185 @@ def ensure_bot_start_time():
     if not existing:
         set_setting('bot_start_time', str(int(time.time())))
 
+# ==================== AUTO POSTING TABLES ====================
+
+def init_autopost_tables():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS autopost_channels (
+            id SERIAL PRIMARY KEY,
+            channel_id BIGINT NOT NULL,
+            channel_name TEXT,
+            topic_id BIGINT DEFAULT 0,
+            enabled BOOLEAN DEFAULT TRUE,
+            interval_seconds INTEGER DEFAULT 1800,
+            max_working INTEGER DEFAULT 10,
+            max_not_working INTEGER DEFAULT 5,
+            last_post BIGINT DEFAULT 0,
+            created_by BIGINT,
+            created_at BIGINT,
+            is_default BOOLEAN DEFAULT FALSE,
+            UNIQUE(channel_id, topic_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS autopost_user_access (
+            user_id BIGINT,
+            channel_id BIGINT,
+            can_post BOOLEAN DEFAULT TRUE,
+            can_manage BOOLEAN DEFAULT FALSE,
+            can_announce BOOLEAN DEFAULT FALSE,
+            granted_by BIGINT,
+            granted_at BIGINT,
+            PRIMARY KEY (user_id, channel_id)
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    add_default_channel()
+
+def add_default_channel():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM autopost_channels WHERE is_default = TRUE")
+    if not cur.fetchone():
+        cur.execute("""
+            INSERT INTO autopost_channels 
+            (channel_id, channel_name, topic_id, created_by, created_at, is_default, enabled)
+            VALUES (%s, %s, %s, %s, %s, TRUE, TRUE)
+        """, (AUTO_POST_CHANNEL, "Ciorsa VPN", AUTO_POST_TOPIC_ID, ADMIN_ID, int(time.time())))
+        conn.commit()
+    cur.close()
+    conn.close()
+
+# ==================== AUTO POSTING FUNCTIONS ====================
+
+def get_user_channels(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if is_admin(user_id):
+        cur.execute("""
+            SELECT id, channel_id, channel_name, topic_id, enabled, interval_seconds, last_post, is_default 
+            FROM autopost_channels 
+            ORDER BY is_default DESC, id
+        """)
+    else:
+        cur.execute("""
+            SELECT c.id, c.channel_id, c.channel_name, c.topic_id, c.enabled, c.interval_seconds, c.last_post, c.is_default
+            FROM autopost_channels c
+            JOIN autopost_user_access a ON c.channel_id = a.channel_id
+            WHERE a.user_id = %s AND a.can_post = TRUE
+            ORDER BY c.is_default DESC, c.id
+        """, (user_id,))
+    channels = cur.fetchall()
+    cur.close()
+    conn.close()
+    return channels
+
+def get_channel_access(user_id, channel_id):
+    if is_admin(user_id):
+        return True, True
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT can_post, can_manage FROM autopost_user_access WHERE user_id = %s AND channel_id = %s",
+        (user_id, channel_id)
+    )
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    if result:
+        return result[0], result[1]
+    return False, False
+
+def can_announce_in_channel(user_id, channel_id):
+    if is_admin(user_id):
+        return True
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT can_announce FROM autopost_user_access WHERE user_id = %s AND channel_id = %s",
+        (user_id, channel_id)
+    )
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    return result[0] if result else False
+
+def get_user_announce_channels(user_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if is_admin(user_id):
+        cur.execute("SELECT channel_id, channel_name, topic_id FROM autopost_channels WHERE enabled = TRUE")
+    else:
+        cur.execute("""
+            SELECT c.channel_id, c.channel_name, c.topic_id
+            FROM autopost_channels c
+            JOIN autopost_user_access a ON c.channel_id = a.channel_id
+            WHERE a.user_id = %s AND a.can_announce = TRUE AND c.enabled = TRUE
+        """, (user_id,))
+    channels = cur.fetchall()
+    cur.close()
+    conn.close()
+    return channels
+
+def add_channel(channel_id, channel_name, topic_id=0, created_by=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO autopost_channels 
+        (channel_id, channel_name, topic_id, created_by, created_at)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (channel_id, topic_id) DO UPDATE SET 
+        channel_name = EXCLUDED.channel_name,
+        enabled = TRUE
+        RETURNING id
+    """, (channel_id, channel_name, topic_id, created_by, int(time.time())))
+    channel_db_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return channel_db_id
+
+def grant_channel_access(user_id, channel_id, can_manage=False, can_announce=False, granted_by=None):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO autopost_user_access 
+        (user_id, channel_id, can_post, can_manage, can_announce, granted_by, granted_at)
+        VALUES (%s, %s, TRUE, %s, %s, %s, %s)
+        ON CONFLICT (user_id, channel_id) DO UPDATE SET
+        can_post = TRUE,
+        can_manage = EXCLUDED.can_manage,
+        can_announce = EXCLUDED.can_announce,
+        granted_by = EXCLUDED.granted_by,
+        granted_at = EXCLUDED.granted_at
+    """, (user_id, channel_id, can_manage, can_announce, granted_by, int(time.time())))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def remove_channel_access(user_id, channel_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM autopost_user_access WHERE user_id = %s AND channel_id = %s",
+        (user_id, channel_id)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def remove_used_keys(keys_to_remove):
+    current_keys = get_keys_from_db()
+    for key in keys_to_remove:
+        if key in current_keys:
+            current_keys.remove(key)
+    save_keys_to_db(current_keys)
+    print(f"[keys] Удалено {len(keys_to_remove)} выданных ключей")
+
 # ==================== KEY PARSING UTILS ====================
 
 def _dedup(lst):
@@ -293,16 +483,27 @@ def _resolve_url(raw_url):
     if app_scheme:
         payload = urllib.parse.unquote(app_scheme.group(1).strip())
         payload = payload.split('#')[0]
+        decoded = _try_b64(payload)
+        if decoded and re.match(r'https?://', decoded.strip(), re.IGNORECASE):
+            return decoded.strip()
         return payload
     qs_scheme = re.match(
         r'^(?:' + APP_SCHEMES + r')://[^?]*\?(?:.*&)?url=([^&]+)',
         raw_url, re.IGNORECASE
     )
     if qs_scheme:
-        return urllib.parse.unquote(qs_scheme.group(1).strip())
+        payload = urllib.parse.unquote(qs_scheme.group(1).strip())
+        decoded = _try_b64(payload)
+        if decoded and re.match(r'https?://', decoded.strip(), re.IGNORECASE):
+            return decoded.strip()
+        return payload
     proxy_wrap = re.match(r'^https?://[^/]+/+(https?://.+)$', raw_url, re.IGNORECASE)
     if proxy_wrap:
-        return proxy_wrap.group(1)
+        inner = proxy_wrap.group(1)
+        decoded = _try_b64(inner)
+        if decoded and re.match(r'https?://', decoded.strip(), re.IGNORECASE):
+            return decoded.strip()
+        return inner
     proxy_qs = re.match(r'^https?://[^?]+\?(?:.*&)?url=(https?[^&]+)', raw_url, re.IGNORECASE)
     if proxy_qs:
         return urllib.parse.unquote(proxy_qs.group(1))
@@ -314,21 +515,42 @@ def _resolve_url(raw_url):
         decoded = _try_b64(candidate)
         if decoded and re.match(r'https?://', decoded.strip(), re.IGNORECASE):
             return decoded.strip()
+        return candidate
+    if re.match(r'https?://[^/]+/[A-Za-z0-9_\-]+$', raw_url):
+        path = raw_url.split('/')[-1]
+        if len(path) >= 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', path):
+            decoded = _try_multilevel_b64(path, max_depth=5)
+            if decoded:
+                for item in decoded:
+                    if re.match(r'https?://', item.strip(), re.IGNORECASE):
+                        return item.strip()
+                    keys = _extract_vpn_keys(item)
+                    if keys:
+                        return item
+    if raw_url.endswith('=') or '=' in raw_url.split('/')[-1]:
+        path = raw_url.split('/')[-1]
+        decoded = _try_multilevel_b64(path, max_depth=5)
+        if decoded:
+            for item in decoded:
+                if re.match(r'https?://', item.strip(), re.IGNORECASE):
+                    return item.strip()
+                keys = _extract_vpn_keys(item)
+                if keys:
+                    return item
     return raw_url
 
 def _parse_keys_from_content(content):
-    """Извлекает VPN-ключи ИЗ ВСЕХ ВОЗМОЖНЫХ ИСТОЧНИКОВ"""
     all_keys = []
     if not content:
         return []
-    
-    # 1. Прямые ключи
     all_keys.extend(_extract_vpn_keys(content))
-    
-    # 2. Base64
-    all_keys.extend(_try_multilevel_b64(content.strip()))
-    
-    # 3. Построчный разбор
+    cleaned = re.sub(r'\s+', '', content.strip())
+    if len(cleaned) >= 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', cleaned):
+        decoded = _try_multilevel_b64(cleaned, max_depth=5)
+        if decoded:
+            for item in decoded:
+                all_keys.extend(_extract_vpn_keys(item))
+                all_keys.extend(_try_multilevel_b64(item, max_depth=3))
     for line in content.splitlines():
         line = line.strip()
         if not line:
@@ -336,8 +558,6 @@ def _parse_keys_from_content(content):
         all_keys.extend(_extract_vpn_keys(line))
         if len(line) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', line):
             all_keys.extend(_try_multilevel_b64(line, max_depth=4))
-        
-        # Ссылки в строке
         urls = re.findall(r'https?://[^\s<>"\']+', line)
         for url in urls:
             try:
@@ -349,8 +569,6 @@ def _parse_keys_from_content(content):
             encoded = urllib.parse.unquote(url)
             if len(encoded) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', encoded):
                 all_keys.extend(_try_multilevel_b64(encoded, max_depth=3))
-    
-    # 4. HTML
     if '<' in content and '>' in content:
         try:
             soup = BeautifulSoup(content, 'html.parser')
@@ -372,8 +590,6 @@ def _parse_keys_from_content(content):
                             all_keys.extend(_try_multilevel_b64(decoded, max_depth=4))
         except:
             pass
-    
-    # 5. JSON
     try:
         json_str_matches = re.findall(r'"((?:[^"\\]|\\.)*)"', content)
         for m in json_str_matches:
@@ -388,21 +604,6 @@ def _parse_keys_from_content(content):
                 all_keys.extend(_try_multilevel_b64(unescaped, max_depth=4))
     except:
         pass
-    
-    # 6. Все URL в контенте
-    all_urls = re.findall(r'https?://[^\s<>"\']+', content)
-    for url in all_urls:
-        try:
-            resp = requests.get(url, timeout=10, headers={'User-Agent': 'v2rayNG/1.8.7'})
-            if resp.status_code == 200:
-                all_keys.extend(_parse_keys_from_content(resp.text))
-        except:
-            pass
-        encoded = urllib.parse.unquote(url)
-        if len(encoded) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', encoded):
-            all_keys.extend(_try_multilevel_b64(encoded, max_depth=3))
-    
-    # 7. Схемы приложений
     app_schemes = re.findall(
         r'(?:incy|happ|v2ray|v2rayng|shadowrocket|clash|sing-box|quantumult|surge|nekoray|hiddify|streisand|karing|mihomo|flclash)://[^\s<>"\']+',
         content, re.IGNORECASE
@@ -420,8 +621,6 @@ def _parse_keys_from_content(content):
             all_keys.extend(_extract_vpn_keys(resolved))
             if re.match(r'^[A-Za-z0-9+/_\-=]+$', resolved):
                 all_keys.extend(_try_multilevel_b64(resolved, max_depth=4))
-    
-    # 8. Прокси-обертки
     proxy_wraps = re.findall(
         r'https?://[^/]+/+(https?://[^\s<>"\']+)',
         content, re.IGNORECASE
@@ -433,16 +632,12 @@ def _parse_keys_from_content(content):
                 all_keys.extend(_parse_keys_from_content(resp.text))
         except:
             pass
-    
-    # 9. Key=value пары
     key_value_pairs = re.findall(r'([a-zA-Z0-9_\-]+)=([^&\s]+)', content)
     for key, value in key_value_pairs:
         if len(value) >= 16:
             decoded = urllib.parse.unquote(value)
             if re.match(r'^[A-Za-z0-9+/_\-=]+$', decoded):
                 all_keys.extend(_try_multilevel_b64(decoded, max_depth=3))
-    
-    # 10. Подписки
     sub_patterns = re.findall(
         r'(?:sub|subscription|config|link|url|uri)=([^&\s]+)',
         content, re.IGNORECASE
@@ -458,7 +653,6 @@ def _parse_keys_from_content(content):
                 pass
         elif len(decoded) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', decoded):
             all_keys.extend(_try_multilevel_b64(decoded, max_depth=4))
-    
     return _dedup(all_keys)
 
 def load_keys_from_url(raw_url):
@@ -594,31 +788,34 @@ def get_user_display_name(user_id):
 
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(
+    kb.row(
         types.KeyboardButton("👤 Личный кабинет"),
         types.KeyboardButton("📡 Моя подписка")
     )
-    kb.add(
+    kb.row(
         types.KeyboardButton("👥 Рефералы"),
         types.KeyboardButton("🏆 Топ рефералов")
     )
-    kb.add(
+    kb.row(
         types.KeyboardButton("🔓 Decrypt")
     )
-    kb.add(
+    kb.row(
         types.KeyboardButton("❓ Поддержка")
     )
     return kb
 
 def decryptor_menu():
+    """Клавиатура раздела Decrypt"""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(
+    kb.row(
         types.KeyboardButton("📊 Стаж бота"),
-        types.KeyboardButton("🔍 Проверка ключей"),
+        types.KeyboardButton("🔍 Проверка ключей")
+    )
+    kb.row(
         types.KeyboardButton("🛡️ Проверка прокси"),
         types.KeyboardButton("🔓 Расшифровать подписку")
     )
-    kb.add(
+    kb.row(
         types.KeyboardButton("🏠 Главное меню")
     )
     return kb
@@ -654,6 +851,8 @@ def get_bot_stats():
     total_keys_checked = int(get_setting('total_keys_checked', '0'))
     total_decryptions = int(get_setting('total_decryptions_success', '0'))
     total_proxies_checked = int(get_setting('total_proxies_checked', '0'))
+    total_keys_issued = int(get_setting('total_keys_issued', '0'))
+    current_keys = len(get_keys_from_db())
     return {
         'start_time': start_time,
         'uptime_seconds': uptime_seconds,
@@ -661,6 +860,8 @@ def get_bot_stats():
         'total_keys_checked': total_keys_checked,
         'total_decryptions': total_decryptions,
         'total_proxies_checked': total_proxies_checked,
+        'total_keys_issued': total_keys_issued,
+        'current_keys': current_keys,
     }
 
 # ==================== /start ====================
@@ -954,6 +1155,8 @@ def stat_uptime(message):
     total_keys = int(get_setting('total_keys_checked', '0'))
     total_proxies = int(get_setting('total_proxies_checked', '0'))
     total_decryptions = int(get_setting('total_decryptions_success', '0'))
+    total_keys_issued = int(get_setting('total_keys_issued', '0'))
+    current_keys = len(get_keys_from_db())
     bot.reply_to(
         message,
         f"📊 *Статистика бота*\n\n"
@@ -961,9 +1164,21 @@ def stat_uptime(message):
         f"⏳ Работает: {stats['uptime_text']}\n"
         f"🔑 Проверено ключей: {total_keys}\n"
         f"🌐 Проверено прокси: {total_proxies}\n"
-        f"🔓 Расшифровано подписок: {total_decryptions}",
+        f"🔓 Расшифровано подписок: {total_decryptions}\n"
+        f"🗑️ Выдано ключей: {total_keys_issued}\n"
+        f"📦 Ключей в базе: {current_keys}",
         parse_mode="Markdown"
     )
+
+@bot.message_handler(func=lambda m: m.text == "🏠 Главное меню")
+def back_to_main_menu(message):
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    if is_blocked(message.from_user.id):
+        bot.reply_to(message, blocked_message())
+        return
+    bot.reply_to(message, "🏠 Главное меню", reply_markup=main_menu())
 
 # ==================== ПРОВЕРКА КЛЮЧЕЙ ====================
 
@@ -1298,17 +1513,14 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
                     except:
                         pass
                 return
-            
             try:
                 increment_setting('total_decryptions_success', 1)
             except:
                 pass
-            
             try:
                 file_number = get_next_file_number()
             except:
                 file_number = 0
-            
             filename = f"{file_number:06d}_{datetime.now().strftime('%d.%m.%Y')}.txt"
             now = datetime.now().strftime("%Y-%m-%d %H:%M")
             src = text[:80] if text else (file_name or 'файл')
@@ -1361,8 +1573,6 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
 def _parse_subscription_any(raw, source_label=None):
     steps = []
     text = raw.strip()
-    
-    # Схемы приложений
     app_m = re.match(
         r'^(?:' + APP_SCHEMES + r')://(?:add|sub|crypt\d*|import|install|update)/+(.+)$',
         text, re.IGNORECASE
@@ -1371,7 +1581,6 @@ def _parse_subscription_any(raw, source_label=None):
         payload = urllib.parse.unquote(app_m.group(1).strip()).split('#')[0]
         steps.append(f"📱 Схема приложения → {payload[:50]}")
         text = payload
-    
     qs_scheme_m = re.match(
         r'^(?:' + APP_SCHEMES + r')://[^?]*\?(?:.*&)?url=([^&]+)',
         text, re.IGNORECASE
@@ -1380,38 +1589,37 @@ def _parse_subscription_any(raw, source_label=None):
         payload = urllib.parse.unquote(qs_scheme_m.group(1).strip())
         steps.append(f"📱 Схема приложения (query) → {payload[:50]}")
         text = payload
-    
-    # Прокси-обертки
     proxy_m = re.match(r'^https?://[^/]+/+(https?://.+)$', text, re.IGNORECASE)
     if proxy_m:
         real_url = proxy_m.group(1)
         steps.append(f"🔄 Прокси-обёртка → {real_url[:50]}")
         text = real_url
-    
     proxy_qs_m = re.match(r'^https?://[^?]+\?(?:.*&)?url=(https?[^&]+)', text, re.IGNORECASE)
     if proxy_qs_m:
         real_url = urllib.parse.unquote(proxy_qs_m.group(1))
         steps.append(f"🔄 Прокси-обёртка (query) → {real_url[:50]}")
         text = real_url
-    
-    # Загрузка URL
     if re.match(r'https?://', text, re.IGNORECASE):
         steps.append(f"🌐 Загружаю: {text[:60]}")
         headers = {'User-Agent': 'v2rayNG/1.8.7', 'Accept': '*/*'}
         content = None
-        for verify in [True, False]:
+        for timeout in [10, 20, 30]:
             try:
-                resp = requests.get(text, headers=headers, timeout=20, verify=verify)
-                content = resp.text
-                steps.append(f"✅ Получено {len(content)} байт")
-                break
+                resp = requests.get(text, headers=headers, timeout=timeout, verify=False)
+                if resp.status_code == 200:
+                    content = resp.text
+                    steps.append(f"✅ Получено {len(content)} байт за {timeout}с")
+                    break
+            except requests.exceptions.Timeout:
+                steps.append(f"⏰ Таймаут {timeout}с, пробую ещё...")
+                continue
             except Exception as e:
-                steps.append(f"⚠️ Попытка: {e}")
+                steps.append(f"⚠️ Ошибка: {str(e)[:50]}")
+                continue
         if not content:
-            return [], steps + ["❌ Не удалось загрузить URL"]
+            steps.append("❌ Не удалось загрузить URL после всех попыток")
+            return [], steps
         text = content
-    
-    # Парсинг
     keys = _parse_keys_from_content(text)
     if keys:
         steps.append(f"🔑 Извлечено ключей: {len(keys)}")
@@ -1523,7 +1731,8 @@ def cmd_stats(message):
         f"📊 Стаж бота: {bot_stats['uptime_text']}\n"
         f"🔑 Проверено ключей: {bot_stats['total_keys_checked']}\n"
         f"🔓 Расшифровано подписок: {bot_stats['total_decryptions']}\n"
-        f"🌐 Проверено прокси: {bot_stats['total_proxies_checked']}"
+        f"🌐 Проверено прокси: {bot_stats['total_proxies_checked']}\n"
+        f"🗑️ Выдано ключей: {bot_stats['total_keys_issued']}"
     )
 
 @bot.message_handler(commands=['check'])
