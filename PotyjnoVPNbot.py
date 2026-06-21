@@ -158,7 +158,6 @@ def init_db():
         )
     """)
 
-    # ====== ПРИНУДИТЕЛЬНО ДОБАВЛЯЕМ СОЗДАТЕЛЯ ======
     try:
         cur.execute("""
             INSERT INTO admins (user_id, added_by, added_at) 
@@ -169,7 +168,6 @@ def init_db():
         print(f"[init] ✅ Создатель {ADMIN_ID} добавлен в админы")
     except Exception as e:
         print(f"[init] Ошибка добавления создателя: {e}")
-    # ================================================
 
     conn.commit()
     cur.close()
@@ -893,9 +891,7 @@ def get_bot_stats():
 
 # ==================== КАПЧА ====================
 
-CAPTCHA_TIMEOUT = 300  # 5 минут
-
-# ==================== МОНИТОРИНГ ПОДПИСОК ====================
+CAPTCHA_TIMEOUT = 300
 
 SUBSCRIBE_MONITOR = {
     'timestamps': [],
@@ -940,7 +936,6 @@ def cmd_start(message):
         bot.reply_to(message, blocked_message())
         return
 
-    # ========== 1. ПРОВЕРЯЕМ, ЕСТЬ ЛИ ПОЛЬЗОВАТЕЛЬ В БД ==========
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
@@ -950,7 +945,6 @@ def cmd_start(message):
 
     is_new_user = existing_user is None
 
-    # ========== 2. ЕСЛИ НОВЫЙ — ОТПРАВЛЯЕМ КАПЧУ ==========
     if is_new_user:
         ok, msg = check_subscribe_rate()
         if not ok:
@@ -991,12 +985,10 @@ def cmd_start(message):
 
         return
 
-    # ========== 3. ЕСЛИ ПОЛЬЗОВАТЕЛЬ УЖЕ ЕСТЬ — ПРОВЕРЯЕМ ПОДПИСКУ ==========
     if not is_subscribed(user_id):
         bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
         return
 
-    # ========== 4. ПОЛЬЗОВАТЕЛЬ ПОДПИСАН — ПРИВЕТСТВУЕМ ==========
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT last_activity FROM users WHERE user_id = %s", (user_id,))
@@ -1928,13 +1920,9 @@ def get_country_flag(country):
     return '🌍'
 
 def format_key_for_post(key, latency, index):
-    """Форматирует ключ для постинга в красивом виде"""
-    
-    # Извлекаем протокол
     protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
     protocol = protocol_match.group(1).upper() if protocol_match else "UNKNOWN"
     
-    # Извлекаем название (после #)
     name_match = re.search(r'#([^#\s]+)', key)
     if name_match:
         name = urllib.parse.unquote(name_match.group(1))
@@ -1944,11 +1932,9 @@ def format_key_for_post(key, latency, index):
     else:
         name = "VPN Server"
     
-    # Извлекаем IP/домен
     ip_match = re.search(r'@([^:]+):(\d+)', key)
     ip = ip_match.group(1) if ip_match else "Unknown"
     
-    # Определяем страну
     country = "Unknown"
     city = "Unknown"
     
@@ -2077,6 +2063,16 @@ def admin_callback(call):
         except:
             pass
         bot.send_message(user_id, "🏠 Главное меню", reply_markup=main_menu())
+        bot.answer_callback_query(call.id)
+        return
+
+    # ====== НАЗАД В АДМИН-ПАНЕЛЬ ======
+    if data == "admin_back_panel":
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        bot.send_message(user_id, "🏛️ Админ панель:", reply_markup=admin_menu())
         bot.answer_callback_query(call.id)
         return
 
@@ -2213,22 +2209,43 @@ def admin_callback(call):
     # ====== АВТОПОСТИНГ ======
     if data == "admin_autopost":
         bot.answer_callback_query(call.id)
-        callback_admin_autopost(call)
+        
+        config = get_autopost_config()
+        status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
+        
+        text = (
+            "📡 *АВТОПОСТИНГ*\n\n"
+            f"📊 Статус: {status}\n"
+            f"⏱ Интервал: {config['interval'] // 60} мин\n"
+            f"📢 Канал: {config['channel_id']}\n"
+            f"📝 Ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="autopost_load_keys"),
+            types.InlineKeyboardButton("🚀 Начать автопостинг", callback_data="autopost_start")
+        )
+        kb.add(
+            types.InlineKeyboardButton("⚙️ Настройки канала", callback_data="autopost_channel_settings"),
+            types.InlineKeyboardButton("⏱ Настройки интервала", callback_data="autopost_interval_settings")
+        )
+        kb.add(
+            types.InlineKeyboardButton("📊 История", callback_data="autopost_history_menu")
+        )
+        kb.add(
+            types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_back_panel")
-def callback_admin_back_panel(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    
-    bot.answer_callback_query(call.id)
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
-        pass
-    admin_panel(call.message)
 
 # ==================== УПРАВЛЕНИЕ АДМИНАМИ (ДЕТАЛИ) ====================
 
@@ -2390,501 +2407,313 @@ def handle_add_admin_input(message):
     )
     admin_panel(fake_msg)
 
-# ==================== АВТОПОСТИНГ (МЕНЮ И ОБРАБОТЧИКИ) ====================
+# ==================== АВТОПОСТИНГ (ОБРАБОТЧИКИ) ====================
 
-def autopost_main_menu():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="autopost_load_keys"),
-        types.InlineKeyboardButton("🚀 Начать автопостинг", callback_data="autopost_start")
-    )
-    kb.add(
-        types.InlineKeyboardButton("⚙️ Настройки канала", callback_data="autopost_channel_settings"),
-        types.InlineKeyboardButton("⏱ Настройки интервала", callback_data="autopost_interval_settings")
-    )
-    kb.add(
-        types.InlineKeyboardButton("📊 История", callback_data="autopost_history_menu")
-    )
-    kb.add(
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
-    )
-    return kb
-
-def autopost_channel_settings_menu():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("📢 Сменить канал", callback_data="autopost_change_channel"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    return kb
-
-def autopost_change_channel_menu():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("🔄 Сбросить канал", callback_data="autopost_reset_channel"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_channel_settings")
-    )
-    return kb
-
-def autopost_interval_menu():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("⏱ Изменить интервал", callback_data="autopost_set_interval"),
-        types.InlineKeyboardButton("🔄 Сбросить интервал", callback_data="autopost_reset_interval"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    return kb
-
-def autopost_history_menu_keyboard():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📊 Активные постинги", callback_data="autopost_active_history"),
-        types.InlineKeyboardButton("📁 Завершенные", callback_data="autopost_completed_history")
-    )
-    kb.add(
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    return kb
-
-def autopost_clear_menu():
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("🗑️ Очистить все", callback_data="autopost_clear_all"),
-        types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="autopost_clear_dead"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    return kb
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_back")
-def callback_autopost_back(call):
+@bot.callback_query_handler(func=lambda call: call.data.startswith('autopost_'))
+def callback_autopost_handlers(call):
     user_id = call.from_user.id
     if not is_admin(user_id):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
-    
-    bot.answer_callback_query(call.id)
-    callback_admin_autopost(call)
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_load_keys")
-def callback_autopost_load_keys(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    
-    bot.answer_callback_query(call.id, "📥 Отправьте ключи")
-    bot.send_message(
-        user_id,
-        "📥 *Загрузка ключей*\n\n"
-        "Отправьте ключи одним из способов:\n"
-        "• Текст с ключами (vless://, vmess:// и др.)\n"
-        "• .txt файл с ключами\n"
-        "• URL подписки\n"
-        "• Ссылку на GitHub репозиторий (view raw)\n\n"
-        "После загрузки бот проверит ключи и покажет результат.",
-        parse_mode="Markdown"
-    )
-    loading_sessions[user_id] = {'waiting': True, 'source': 'autopost'}
+    data = call.data
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_channel_settings")
-def callback_autopost_channel_settings(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== НАЗАД В АДМИН-ПАНЕЛЬ ======
+    if data == "autopost_back":
+        bot.answer_callback_query(call.id)
+        callback_admin_autopost(call)
         return
-    
-    bot.answer_callback_query(call.id)
-    config = get_autopost_config()
-    
-    text = (
-        "⚙️ *Настройки канала*\n\n"
-        f"📢 Текущий канал: {config['channel_id']}\n"
-        f"📝 Текущая ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}\n\n"
-        "Выберите действие:"
-    )
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=autopost_channel_settings_menu()
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_change_channel")
-def callback_autopost_change_channel(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== ЗАГРУЗКА КЛЮЧЕЙ ======
+    if data == "autopost_load_keys":
+        bot.answer_callback_query(call.id, "📥 Отправьте ключи")
+        bot.send_message(
+            user_id,
+            "📥 *Загрузка ключей*\n\n"
+            "Отправьте ключи одним из способов:\n"
+            "• Текст с ключами (vless://, vmess:// и др.)\n"
+            "• .txt файл с ключами\n"
+            "• URL подписки\n"
+            "• Ссылку на GitHub репозиторий (view raw)\n\n"
+            "После загрузки бот проверит ключи и покажет результат.",
+            parse_mode="Markdown"
+        )
+        loading_sessions[user_id] = {'waiting': True, 'source': 'autopost'}
         return
-    
-    bot.answer_callback_query(call.id)
-    
-    text = (
-        "📢 *Смена канала*\n\n"
-        "Текущий канал можно сбросить и выбрать новый.\n\n"
-        "После сброса отправьте мне ссылку на канал или чат.\n"
-        "Пример: `https://t.me/ciorsa` или `-1001234567890`"
-    )
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=autopost_change_channel_menu()
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_reset_channel")
-def callback_autopost_reset_channel(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== НАСТРОЙКИ КАНАЛА ======
+    if data == "autopost_channel_settings":
+        bot.answer_callback_query(call.id)
+        config = get_autopost_config()
+        
+        text = (
+            "⚙️ *Настройки канала*\n\n"
+            f"📢 Текущий канал: {config['channel_id']}\n"
+            f"📝 Текущая ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📢 Сменить канал", callback_data="autopost_change_channel"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
-    
-    bot.answer_callback_query(call.id, "🔄 Канал сброшен. Отправьте новый канал.")
-    bot.send_message(
-        user_id,
-        "📢 *Сброс канала*\n\n"
-        "Канал сброшен.\n"
-        "Отправьте ссылку на канал или ID чата.\n\n"
-        "Пример: `https://t.me/ciorsa` или `-1001234567890`"
-    )
-    search_cache[user_id] = {'action': 'autopost_set_channel'}
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_interval_settings")
-def callback_autopost_interval_settings(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== СМЕНА КАНАЛА ======
+    if data == "autopost_change_channel":
+        bot.answer_callback_query(call.id)
+        
+        text = (
+            "📢 *Смена канала*\n\n"
+            "Текущий канал можно сбросить и выбрать новый.\n\n"
+            "После сброса отправьте мне ссылку на канал или чат.\n"
+            "Пример: `https://t.me/ciorsa` или `-1001234567890`"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🔄 Сбросить канал", callback_data="autopost_reset_channel"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_channel_settings")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
-    
-    bot.answer_callback_query(call.id)
-    config = get_autopost_config()
-    
-    text = (
-        "⏱ *Настройки интервала*\n\n"
-        f"⏱ Текущий интервал: {config['interval'] // 60} минут\n\n"
-        "Выберите действие:"
-    )
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=autopost_interval_menu()
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_set_interval")
-def callback_autopost_set_interval(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== СБРОС КАНАЛА ======
+    if data == "autopost_reset_channel":
+        bot.answer_callback_query(call.id, "🔄 Канал сброшен. Отправьте новый канал.")
+        bot.send_message(
+            user_id,
+            "📢 *Сброс канала*\n\n"
+            "Канал сброшен.\n"
+            "Отправьте ссылку на канал или ID чата.\n\n"
+            "Пример: `https://t.me/ciorsa` или `-1001234567890`"
+        )
+        search_cache[user_id] = {'action': 'autopost_set_channel'}
         return
-    
-    bot.answer_callback_query(call.id, "⏱ Введите интервал в минутах")
-    bot.send_message(
-        user_id,
-        "⏱ *Установка интервала*\n\n"
-        "Введите интервал автопостинга в минутах.\n"
-        "Минимальное значение: 5 минут\n"
-        "Максимальное значение: 1440 минут (24 часа)\n\n"
-        "Пример: `30`",
-        parse_mode="Markdown"
-    )
-    search_cache[user_id] = {'action': 'autopost_set_interval'}
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_reset_interval")
-def callback_autopost_reset_interval(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== НАСТРОЙКИ ИНТЕРВАЛА ======
+    if data == "autopost_interval_settings":
+        bot.answer_callback_query(call.id)
+        config = get_autopost_config()
+        
+        text = (
+            "⏱ *Настройки интервала*\n\n"
+            f"⏱ Текущий интервал: {config['interval'] // 60} минут\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("⏱ Изменить интервал", callback_data="autopost_set_interval"),
+            types.InlineKeyboardButton("🔄 Сбросить интервал", callback_data="autopost_reset_interval"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
-    
-    bot.answer_callback_query(call.id, "🔄 Интервал сброшен на 30 минут")
-    config = get_autopost_config()
-    config['interval'] = 1800
-    save_autopost_config(config)
-    
-    callback_autopost_interval_settings(call)
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_history_menu")
-def callback_autopost_history_menu(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== УСТАНОВКА ИНТЕРВАЛА ======
+    if data == "autopost_set_interval":
+        bot.answer_callback_query(call.id, "⏱ Введите интервал в минутах")
+        bot.send_message(
+            user_id,
+            "⏱ *Установка интервала*\n\n"
+            "Введите интервал автопостинга в минутах.\n"
+            "Минимальное значение: 5 минут\n"
+            "Максимальное значение: 1440 минут (24 часа)\n\n"
+            "Пример: `30`",
+            parse_mode="Markdown"
+        )
+        search_cache[user_id] = {'action': 'autopost_set_interval'}
         return
-    
-    bot.answer_callback_query(call.id)
-    
-    text = (
-        "📊 *История автопостинга*\n\n"
-        "Выберите раздел:"
-    )
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=autopost_history_menu_keyboard()
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_active_history")
-def callback_autopost_active_history(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== СБРОС ИНТЕРВАЛА ======
+    if data == "autopost_reset_interval":
+        bot.answer_callback_query(call.id, "🔄 Интервал сброшен на 30 минут")
+        config = get_autopost_config()
+        config['interval'] = 1800
+        save_autopost_config(config)
+        callback_autopost_handlers(call)
         return
-    
-    bot.answer_callback_query(call.id)
-    
-    config = get_autopost_config()
-    keys = get_keys_from_db()
-    
-    text = (
-        "📊 *Активные постинги*\n\n"
-        f"📢 Канал: {config['channel_id']}\n"
-        f"⏱ Интервал: {config['interval'] // 60} мин\n"
-        f"📦 Всего ключей: {len(keys)}\n"
-        f"🗑️ Выдано: {int(get_setting('total_keys_issued', '0'))}\n"
-        f"📦 Осталось: {len(keys) - int(get_setting('total_keys_issued', '0'))}\n"
-        f"📊 Статус: {'✅ Активен' if config['enabled'] else '❌ Остановлен'}\n\n"
-        "Выберите действие:"
-    )
-    
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("🔄 Сбросить автопостинг", callback_data="autopost_reset_active"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_history_menu")
-    )
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_reset_active")
-def callback_autopost_reset_active(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== ИСТОРИЯ ======
+    if data == "autopost_history_menu":
+        bot.answer_callback_query(call.id)
+        
+        text = "📊 *История автопостинга*\n\nВыберите раздел:"
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📊 Активные постинги", callback_data="autopost_active_history"),
+            types.InlineKeyboardButton("📁 Завершенные", callback_data="autopost_completed_history")
+        )
+        kb.add(
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
-    
-    bot.answer_callback_query(call.id, "🔄 Автопостинг сброшен")
-    
-    config = get_autopost_config()
-    config['enabled'] = False
-    save_autopost_config(config)
-    
-    callback_autopost_active_history(call)
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_completed_history")
-def callback_autopost_completed_history(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== АКТИВНЫЕ ПОСТИНГИ ======
+    if data == "autopost_active_history":
+        bot.answer_callback_query(call.id)
+        
+        config = get_autopost_config()
+        keys = get_keys_from_db()
+        
+        text = (
+            "📊 *Активные постинги*\n\n"
+            f"📢 Канал: {config['channel_id']}\n"
+            f"⏱ Интервал: {config['interval'] // 60} мин\n"
+            f"📦 Всего ключей: {len(keys)}\n"
+            f"🗑️ Выдано: {int(get_setting('total_keys_issued', '0'))}\n"
+            f"📦 Осталось: {len(keys) - int(get_setting('total_keys_issued', '0'))}\n"
+            f"📊 Статус: {'✅ Активен' if config['enabled'] else '❌ Остановлен'}\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🔄 Сбросить автопостинг", callback_data="autopost_reset_active"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_history_menu")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
-    
-    bot.answer_callback_query(call.id)
-    
-    # Получаем завершенные постинги из истории
-    history = autopost_history.get('completed', [])
-    
-    if not history:
-        text = "📁 *Завершенные постинги*\n\nНет завершенных постингов."
-    else:
-        text = "📁 *Завершенные постинги*\n\n"
-        for i, item in enumerate(history[-10:], 1):
-            text += f"{i}. Канал: {item.get('channel_id', 'Unknown')}\n"
-            text += f"   📦 Выдано: {item.get('issued', 0)}\n"
-            text += f"   📅 {item.get('date', 'Unknown')}\n\n"
-    
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_history_menu"))
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_clear_all")
-def callback_autopost_clear_all(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== СБРОС АКТИВНОГО ======
+    if data == "autopost_reset_active":
+        bot.answer_callback_query(call.id, "🔄 Автопостинг сброшен")
+        config = get_autopost_config()
+        config['enabled'] = False
+        save_autopost_config(config)
+        callback_autopost_handlers(call)
         return
-    
-    save_keys_to_db([])
-    set_setting('total_keys_issued', '0')
-    bot.answer_callback_query(call.id, "🗑️ Все ключи удалены")
-    
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back"))
-    
-    bot.edit_message_text(
-        "🗑️ *Все ключи удалены*\n\nБаза ключей очищена.",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_clear_dead")
-def callback_autopost_clear_dead(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    
-    keys = get_keys_from_db()
-    if not keys:
-        bot.answer_callback_query(call.id, "❌ Нет ключей для проверки")
-        return
-    
-    bot.answer_callback_query(call.id, "⏳ Проверяю ключи...")
-    
-    alive_keys = []
-    dead_keys = []
-    
-    for key in keys:
-        status, _ = ping_key_advanced(key)
-        if status:
-            alive_keys.append(key)
+    # ====== ЗАВЕРШЕННЫЕ ПОСТИНГИ ======
+    if data == "autopost_completed_history":
+        bot.answer_callback_query(call.id)
+        
+        history = autopost_history.get('completed', [])
+        
+        if not history:
+            text = "📁 *Завершенные постинги*\n\nНет завершенных постингов."
         else:
-            dead_keys.append(key)
-    
-    save_keys_to_db(alive_keys)
-    
-    current_issued = int(get_setting('total_keys_issued', '0'))
-    set_setting('total_keys_issued', str(current_issued - len(dead_keys) if current_issued >= len(dead_keys) else 0))
-    
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back"))
-    
-    text = f"🧹 *Очистка нерабочих ключей завершена!*\n\n"
-    text += f"✅ Оставлено живых: {len(alive_keys)}\n"
-    text += f"🗑️ Удалено нерабочих: {len(dead_keys)}\n"
-    text += f"📦 Всего в базе: {len(alive_keys)}"
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+            text = "📁 *Завершенные постинги*\n\n"
+            for i, item in enumerate(history[-10:], 1):
+                text += f"{i}. Канал: {item.get('channel_id', 'Unknown')}\n"
+                text += f"   📦 Выдано: {item.get('issued', 0)}\n"
+                text += f"   📅 {item.get('date', 'Unknown')}\n\n"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_history_menu"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
 
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_start")
-def callback_autopost_start(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+    # ====== ОЧИСТКА ВСЕХ ======
+    if data == "autopost_clear_all":
+        bot.answer_callback_query(call.id)
+        save_keys_to_db([])
+        set_setting('total_keys_issued', '0')
+        bot.send_message(user_id, "🗑️ Все ключи удалены")
         return
-    
-    keys = get_keys_from_db()
-    if not keys:
-        bot.answer_callback_query(call.id, "❌ Нет ключей для постинга")
-        return
-    
-    config = get_autopost_config()
-    config['enabled'] = True
-    save_autopost_config(config)
-    
-    bot.answer_callback_query(call.id, "🚀 Автопостинг запущен!")
-    bot.send_message(
-        user_id,
-        f"🚀 *Автопостинг запущен!*\n\n"
-        f"📢 Канал: {config['channel_id']}\n"
-        f"⏱ Интервал: {config['interval'] // 60} мин\n"
-        f"📦 Ключей: {len(keys)}\n\n"
-        "Автопостинг будет выполняться автоматически.",
-        parse_mode="Markdown"
-    )
-    
-    # Запускаем автопостинг
-    auto_post_keys_to_channel()
 
-@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel')
-def handle_autopost_set_channel(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    
-    text = message.text.strip()
-    del search_cache[user_id]
-    
-    # Пробуем извлечь ID канала
-    channel_id = None
-    topic_id = 0
-    
-    # Проверяем, является ли текст ссылкой
-    if 't.me/' in text:
-        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
-        if match:
-            username = match.group(1)
-            try:
-                chat = bot.get_chat(f"@{username}")
-                channel_id = chat.id
-            except:
-                pass
-    
-    # Проверяем, является ли текст числом (ID канала)
-    if not channel_id:
-        try:
-            channel_id = int(text)
-        except:
-            pass
-    
-    # Проверяем, есть ли ветка
-    if 'thread_id=' in text:
-        match = re.search(r'thread_id=(\d+)', text)
-        if match:
-            topic_id = int(match.group(1))
-    
-    if not channel_id:
-        bot.reply_to(message, "❌ Не удалось распознать канал. Отправьте ссылку или ID.")
-        return
-    
-    config = get_autopost_config()
-    config['channel_id'] = channel_id
-    config['topic_id'] = topic_id
-    save_autopost_config(config)
-    
-    bot.reply_to(message, f"✅ Канал установлен!\n📢 ID: {channel_id}\n📝 Ветка: {topic_id if topic_id else 'Нет'}")
-
-@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval')
-def handle_autopost_set_interval(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    
-    try:
-        minutes = int(message.text.strip())
-        if minutes < 5:
-            bot.reply_to(message, "❌ Минимальное значение: 5 минут")
+    # ====== ОЧИСТКА НЕРАБОЧИХ ======
+    if data == "autopost_clear_dead":
+        bot.answer_callback_query(call.id, "⏳ Проверяю ключи...")
+        
+        keys = get_keys_from_db()
+        if not keys:
+            bot.send_message(user_id, "❌ Нет ключей для проверки")
             return
-        if minutes > 1440:
-            bot.reply_to(message, "❌ Максимальное значение: 1440 минут (24 часа)")
-            return
-    except:
-        bot.reply_to(message, "❌ Введите число (минуты).")
+        
+        alive_keys = []
+        dead_keys = []
+        
+        for key in keys:
+            status, _ = ping_key_advanced(key)
+            if status:
+                alive_keys.append(key)
+            else:
+                dead_keys.append(key)
+        
+        save_keys_to_db(alive_keys)
+        
+        current_issued = int(get_setting('total_keys_issued', '0'))
+        set_setting('total_keys_issued', str(current_issued - len(dead_keys) if current_issued >= len(dead_keys) else 0))
+        
+        text = f"🧹 *Очистка нерабочих ключей завершена!*\n\n"
+        text += f"✅ Оставлено живых: {len(alive_keys)}\n"
+        text += f"🗑️ Удалено нерабочих: {len(dead_keys)}\n"
+        text += f"📦 Всего в базе: {len(alive_keys)}"
+        
+        bot.send_message(user_id, text, parse_mode="Markdown")
         return
-    
-    del search_cache[user_id]
-    
-    config = get_autopost_config()
-    config['interval'] = minutes * 60
-    save_autopost_config(config)
-    
-    bot.reply_to(message, f"✅ Интервал установлен: {minutes} минут")
+
+    # ====== ЗАПУСК АВТОПОСТИНГА ======
+    if data == "autopost_start":
+        keys = get_keys_from_db()
+        if not keys:
+            bot.answer_callback_query(call.id, "❌ Нет ключей для постинга")
+            return
+        
+        config = get_autopost_config()
+        config['enabled'] = True
+        save_autopost_config(config)
+        
+        bot.answer_callback_query(call.id, "🚀 Автопостинг запущен!")
+        bot.send_message(
+            user_id,
+            f"🚀 *Автопостинг запущен!*\n\n"
+            f"📢 Канал: {config['channel_id']}\n"
+            f"⏱ Интервал: {config['interval'] // 60} мин\n"
+            f"📦 Ключей: {len(keys)}\n\n"
+            "Автопостинг будет выполняться автоматически.",
+            parse_mode="Markdown"
+        )
+        
+        auto_post_keys_to_channel()
+        return
 
 # ==================== АВТОПОСТИНГ (ОСНОВНАЯ ФУНКЦИЯ) ====================
 
@@ -2950,7 +2779,6 @@ def auto_post_keys_to_channel():
         remove_used_keys(sent_keys)
         increment_setting('total_keys_issued', len(sent_keys))
     
-    # Статистика для админа
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
     stats_msg = f"""📊 *АВТОПОСТИНГ*
 
@@ -2970,7 +2798,7 @@ def auto_post_keys_to_channel():
     except Exception as e:
         print(f"[autopost] Ошибка отправки статистики: {e}")
 
-# ==================== ЗАГРУЗКА КЛЮЧЕЙ ДЛЯ АВТОПОСТИНГА ====================
+# ==================== ЗАГРУЗКА КЛЮЧЕЙ ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in loading_sessions)
 def admin_load_keys_autopost(message):
@@ -3689,6 +3517,78 @@ def handle_private_messages(message):
 
     bot.reply_to(message, "Используйте кнопки меню.", reply_markup=main_menu())
 
+# ==================== ОБРАБОТЧИКИ НАСТРОЕК АВТОПОСТИНГА ====================
+
+@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel')
+def handle_autopost_set_channel(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    
+    text = message.text.strip()
+    del search_cache[user_id]
+    
+    channel_id = None
+    topic_id = 0
+    
+    if 't.me/' in text:
+        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
+        if match:
+            username = match.group(1)
+            try:
+                chat = bot.get_chat(f"@{username}")
+                channel_id = chat.id
+            except:
+                pass
+    
+    if not channel_id:
+        try:
+            channel_id = int(text)
+        except:
+            pass
+    
+    if 'thread_id=' in text:
+        match = re.search(r'thread_id=(\d+)', text)
+        if match:
+            topic_id = int(match.group(1))
+    
+    if not channel_id:
+        bot.reply_to(message, "❌ Не удалось распознать канал. Отправьте ссылку или ID.")
+        return
+    
+    config = get_autopost_config()
+    config['channel_id'] = channel_id
+    config['topic_id'] = topic_id
+    save_autopost_config(config)
+    
+    bot.reply_to(message, f"✅ Канал установлен!\n📢 ID: {channel_id}\n📝 Ветка: {topic_id if topic_id else 'Нет'}")
+
+@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval')
+def handle_autopost_set_interval(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    
+    try:
+        minutes = int(message.text.strip())
+        if minutes < 5:
+            bot.reply_to(message, "❌ Минимальное значение: 5 минут")
+            return
+        if minutes > 1440:
+            bot.reply_to(message, "❌ Максимальное значение: 1440 минут (24 часа)")
+            return
+    except:
+        bot.reply_to(message, "❌ Введите число (минуты).")
+        return
+    
+    del search_cache[user_id]
+    
+    config = get_autopost_config()
+    config['interval'] = minutes * 60
+    save_autopost_config(config)
+    
+    bot.reply_to(message, f"✅ Интервал установлен: {minutes} минут")
+
 # ==================== FLASK APP ====================
 
 @app.route('/')
@@ -3736,11 +3636,9 @@ if __name__ == "__main__":
     Thread(target=keep_alive_ping, daemon=True).start()
     Thread(target=auto_restart_monitor, daemon=True).start()
 
-    # Запуск веб-сервера в отдельном потоке
     from waitress import serve
     Thread(target=lambda: serve(app, host='0.0.0.0', port=int(os.getenv('PORT', 5000))), daemon=True).start()
 
-    # Запуск бота
     try:
         bot.infinity_polling()
     except Exception as e:
