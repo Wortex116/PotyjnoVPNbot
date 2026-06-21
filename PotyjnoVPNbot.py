@@ -894,7 +894,8 @@ def get_user_display_name(user_id):
         return name.strip() or str(user_id)
     except:
         return str(user_id)
-        # ==================== KEYBOARDS ====================
+
+# ==================== KEYBOARDS ====================
 
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -907,7 +908,10 @@ def main_menu():
         types.KeyboardButton("🏆 Топ рефералов")
     )
     kb.row(
-        types.KeyboardButton("🔓 Decrypt"),
+        types.KeyboardButton("ℹ️ Стаж бота"),
+        types.KeyboardButton("🔓 Расшифровать подписку")
+    )
+    kb.row(
         types.KeyboardButton("❓ Поддержка")
     )
     return kb
@@ -1433,10 +1437,10 @@ def top_referrals(message):
         text += f"{icon} {name} — {count} реф.\n"
     bot.reply_to(message, text, parse_mode="Markdown")
 
-# ==================== DECRYPT ====================
+# ==================== СТАЖ БОТА ====================
 
-@bot.message_handler(func=lambda m: m.text == "🔓 Decrypt")
-def decryptor_section(message):
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Стаж бота")
+def bot_stats_command(message):
     update_activity()
     if message.chat.type != 'private':
         return
@@ -1444,347 +1448,39 @@ def decryptor_section(message):
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
+    
+    stats = get_bot_stats()
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_users = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    
+    total_keys = int(get_setting('total_keys_checked', '0'))
+    total_proxies = int(get_setting('total_proxies_checked', '0'))
+    total_decryptions = int(get_setting('total_decryptions_success', '0'))
+    current_keys = len(get_keys_from_db())
+    
+    text = f"""📊 *Статистика бота*
 
-    text = "🔓 *Decrypt*\n\nВыберите действие:"
-    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=decryptor_menu())
+⏳ Стаж бота: {stats['uptime_text']}
+👥 Всего пользователей: {total_users}
 
-def decryptor_menu():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📊 Стаж бота", callback_data="decrypt_stats"),
-        types.InlineKeyboardButton("🔍 Проверка ключей", callback_data="decrypt_check_keys")
-    )
-    kb.add(
-        types.InlineKeyboardButton("🛡️ Проверка прокси", callback_data="decrypt_check_proxy"),
-        types.InlineKeyboardButton("🔓 Расшифровать подписку", callback_data="decrypt_decrypt_sub")
-    )
-    kb.add(
-        types.InlineKeyboardButton("🏠 Главное меню", callback_data="decrypt_back")
-    )
-    return kb
+📦 Ключей в базе: {current_keys}
+🔑 Проверено ключей: {total_keys}
+🌐 Проверено прокси: {total_proxies}
+🔓 Расшифровано подписок: {total_decryptions}
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('decrypt_'))
-def decryptor_callback(call):
-    user_id = call.from_user.id
-
-    if call.data == "decrypt_back":
-        bot.edit_message_text(
-            "🏠 Главное меню",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=None
-        )
-        bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
-        bot.answer_callback_query(call.id)
-        return
-
-    if call.data == "decrypt_stats":
-        stats = get_bot_stats()
-        total_keys = int(get_setting('total_keys_checked', '0'))
-        total_proxies = int(get_setting('total_proxies_checked', '0'))
-        total_decryptions = int(get_setting('total_decryptions_success', '0'))
-        total_keys_issued = int(get_setting('total_keys_issued', '0'))
-        current_keys = len(get_keys_from_db())
-
-        text = f"📊 *Статистика бота*\n\n"
-        text += f"⏳ Стаж: {stats['uptime_text']}\n"
-        text += f"🔑 Проверено ключей: {total_keys}\n"
-        text += f"🌐 Проверено прокси: {total_proxies}\n"
-        text += f"🔓 Расшифровано подписок: {total_decryptions}\n"
-        text += f"🗑️ Выдано ключей: {total_keys_issued}\n"
-        text += f"📦 Ключей в базе: {current_keys}"
-
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=decryptor_menu())
-        bot.answer_callback_query(call.id)
-        return
-
-    if call.data == "decrypt_check_keys":
-        bot.answer_callback_query(call.id)
-        check_keys_start(call.message)
-        return
-
-    if call.data == "decrypt_check_proxy":
-        bot.answer_callback_query(call.id)
-        proxy_check_start(call.message)
-        return
-
-    if call.data == "decrypt_decrypt_sub":
-        bot.answer_callback_query(call.id)
-        decrypt_subscription_start(call.message)
-        return
-
-# ==================== ПРОВЕРКА КЛЮЧЕЙ ====================
-
-@bot.message_handler(func=lambda m: m.text == "🔍 Проверка ключей" and m.chat.type == 'private')
-def check_keys_start(message):
-    update_activity()
-    if message.chat.type != 'private':
-        return
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    check_results[user_id] = {'waiting': True}
-    bot.reply_to(
-        message,
-        "📡 Отправьте файл или текст с ключами (в формате vless://...)\n\n"
-        "Я проверю их на доступность (пинг).\n"
-        "⏳ Проверка может занять до 30 секунд."
-    )
-
-def ping_key(key):
-    match = re.search(r'@([\d\.]+):(\d+)', key)
-    if not match:
-        return False
-    ip = match.group(1)
-    port = int(match.group(2))
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
-        result = sock.connect_ex((ip, port))
-        sock.close()
-        return result == 0
-    except:
-        return False
-
-def check_keys_async(chat_id, keys, user_id, message_id):
-    results = []
-    working = 0
-    not_working = 0
-    for i, key in enumerate(keys):
-        if i % 3 == 0:
-            try:
-                bot.edit_message_text(
-                    f"🔍 Проверяю ключи...\n⏳ Прогресс: {i}/{len(keys)}",
-                    chat_id, message_id
-                )
-            except:
-                pass
-        status = ping_key(key)
-        results.append((key, status))
-        if status:
-            working += 1
-        else:
-            not_working += 1
-    try:
-        increment_setting('total_keys_checked', len(keys))
-    except:
-        pass
-    report = (
-        f"📊 *Результаты проверки*\n\n"
-        f"✅ Работает: {working}\n"
-        f"❌ Не работает: {not_working}\n"
-        f"📡 Всего проверено: {len(keys)}\n\n"
-    )
-    if not_working > 0:
-        report += "*❌ Не работающие ключи:*\n"
-        for key, status in results:
-            if not status:
-                short_key = key[:60] + '...' if len(key) > 60 else key
-                report += f"└ `{short_key}`\n"
-    else:
-        report += "🎉 *Все ключи работают!*"
-    try:
-        bot.send_message(chat_id, report, parse_mode="Markdown")
-    except:
-        bot.send_message(chat_id, report)
-    if user_id in check_results:
-        del check_results[user_id]
-
-# ==================== ПРОВЕРКА ПРОКСИ ====================
-
-PROXY_LINE_PATTERN = re.compile(
-    r'^(?:(?P<scheme>https?|socks5h?|socks4)://)?'
-    r'(?:(?P<user>[^:@\s]+):(?P<pass>[^:@\s]*)@)?'
-    r'(?P<host>[A-Za-z0-9\.\-]+):(?P<port>\d{1,5})'
-    r'(?::(?P<user2>[^:@\s]+):(?P<pass2>[^:@\s]*))?'
-    r'$',
-    re.IGNORECASE
-)
-
-def _parse_proxy_line(line):
-    line = line.strip().strip(',;')
-    if not line:
-        return None
-    m = PROXY_LINE_PATTERN.match(line)
-    if not m:
-        return None
-    gd = m.groupdict()
-    host = gd.get('host')
-    port = gd.get('port')
-    if not host or not port:
-        return None
-    user = gd.get('user') or gd.get('user2')
-    password = gd.get('pass') or gd.get('pass2')
-    scheme_hint = gd.get('scheme')
-    if scheme_hint:
-        scheme_hint = scheme_hint.lower()
-        if scheme_hint in ('socks5h',):
-            scheme_hint = 'socks5'
-    return {
-        'host': host,
-        'port': int(port),
-        'user': user,
-        'password': password,
-        'scheme_hint': scheme_hint,
-        'raw': line,
-    }
-
-def _build_proxy_url(proxy_info, scheme):
-    host = proxy_info['host']
-    port = proxy_info['port']
-    user = proxy_info.get('user')
-    password = proxy_info.get('password')
-    auth = ''
-    if user:
-        auth = urllib.parse.quote(user, safe='')
-        if password:
-            auth += ':' + urllib.parse.quote(password, safe='')
-        auth += '@'
-    return f"{scheme}://{auth}{host}:{port}"
-
-TEST_URL = "http://httpbin.org/ip"
-TEST_URL_FALLBACK = "https://api.ipify.org?format=json"
-
-def _test_proxy(proxy_info, timeout=8):
-    schemes_to_try = []
-    if proxy_info.get('scheme_hint'):
-        hint = proxy_info['scheme_hint']
-        if hint == 'socks4':
-            schemes_to_try = ['socks4']
-        elif hint == 'socks5':
-            schemes_to_try = ['socks5']
-        else:
-            schemes_to_try = ['http']
-    else:
-        schemes_to_try = ['http', 'socks5']
-    last_error = None
-    for scheme in schemes_to_try:
-        if scheme in ('socks5', 'socks4') and not SOCKS_AVAILABLE:
-            last_error = "PySocks не установлен"
-            continue
-        proxy_url = _build_proxy_url(proxy_info, scheme)
-        proxies = {'http': proxy_url, 'https': proxy_url}
-        start = time.time()
-        try:
-            resp = requests.get(TEST_URL, proxies=proxies, timeout=timeout)
-            if resp.status_code == 200:
-                latency_ms = int((time.time() - start) * 1000)
-                return {'ok': True, 'scheme': scheme, 'latency_ms': latency_ms, 'error': None}
-            last_error = f"HTTP {resp.status_code}"
-        except:
-            try:
-                start2 = time.time()
-                resp2 = requests.get(TEST_URL_FALLBACK, proxies=proxies, timeout=timeout)
-                if resp2.status_code == 200:
-                    latency_ms = int((time.time() - start2) * 1000)
-                    return {'ok': True, 'scheme': scheme, 'latency_ms': latency_ms, 'error': None}
-                last_error = f"HTTP {resp2.status_code}"
-            except:
-                continue
-    return {'ok': False, 'scheme': None, 'latency_ms': None, 'error': last_error}
-
-@bot.message_handler(func=lambda m: m.text == "🛡️ Проверка прокси" and m.chat.type == 'private')
-def proxy_check_start(message):
-    update_activity()
-    if message.chat.type != 'private':
-        return
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    proxy_check_results[user_id] = {'waiting': True}
-    socks_note = "" if SOCKS_AVAILABLE else "\n⚠️ PySocks не установлен"
-    bot.reply_to(
-        message,
-        "🛡️ *Проверка прокси*\n\n"
-        "Отправьте список прокси (каждая на новой строке).\n\n"
-        "Форматы:\n"
-        "• `ip:port`\n"
-        "• `ip:port:user:pass`\n"
-        "• `user:pass@ip:port`\n"
-        "• `http://ip:port` или `socks5://ip:port`\n\n"
-        f"⏳ Проверка может занять время.{socks_note}",
-        parse_mode="Markdown"
-    )
-
-def proxy_check_async(chat_id, proxy_lines, user_id, message_id):
-    results = []
-    working = 0
-    not_working = 0
-    total = len(proxy_lines)
-    for i, line in enumerate(proxy_lines):
-        if i % 3 == 0:
-            try:
-                bot.edit_message_text(
-                    f"🛡️ Проверяю прокси...\n⏳ Прогресс: {i}/{total}",
-                    chat_id, message_id
-                )
-            except:
-                pass
-        proxy_info = _parse_proxy_line(line)
-        if not proxy_info:
-            results.append((line, {'ok': False, 'scheme': None, 'latency_ms': None, 'error': 'Не удалось распознать'}))
-            not_working += 1
-            continue
-        test_result = _test_proxy(proxy_info)
-        results.append((line, test_result))
-        if test_result['ok']:
-            working += 1
-        else:
-            not_working += 1
-    try:
-        increment_setting('total_proxies_checked', total)
-    except:
-        pass
-    report = (
-        f"📊 *Результаты проверки прокси*\n\n"
-        f"✅ Работает: {working}\n"
-        f"❌ Не работает: {not_working}\n"
-        f"🌐 Всего проверено: {total}\n\n"
-    )
-    if working > 0:
-        report += "*✅ Работающие прокси:*\n"
-        for line, res in results:
-            if res['ok']:
-                short_line = line[:50] + '...' if len(line) > 50 else line
-                report += f"└ `{short_line}` — {res['scheme']}, {res['latency_ms']} мс\n"
-        report += "\n"
-    if not_working > 0:
-        report += "*❌ Не работающие прокси:*\n"
-        for line, res in results:
-            if not res['ok']:
-                short_line = line[:50] + '...' if len(line) > 50 else line
-                report += f"└ `{short_line}`\n"
-    if len(report) > 4000:
-        report = report[:3950].rstrip() + "\n…"
-    try:
-        bot.send_message(chat_id, report, parse_mode="Markdown")
-    except:
-        try:
-            bot.send_message(chat_id, report)
-        except:
-            pass
-    if user_id in proxy_check_results:
-        del proxy_check_results[user_id]
-
-def _process_proxies(message, raw_text, user_id):
-    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-    if not lines:
-        bot.reply_to(message, "❌ Не найдено ни одной строки с прокси.")
-        return
-    lines = list(dict.fromkeys(lines))
-    msg = bot.reply_to(
-        message,
-        f"🔍 Найдено прокси: {len(lines)}\n⏳ Начинаю проверку..."
-    )
-    t = threading.Thread(target=proxy_check_async, args=(message.chat.id, lines, user_id, msg.message_id))
-    t.daemon = True
-    t.start()
+---
+💬 Поддержка: {SUPPORT}"""
+    
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 # ==================== РАСШИФРОВКА ПОДПИСКИ ====================
 
-@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку" and m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
 def decrypt_subscription_start(message):
     update_activity()
     if message.chat.type != 'private':
@@ -1952,6 +1648,7 @@ def _parse_subscription_any(raw, source_label=None):
     else:
         steps.append(f"🔍 Извлечено {len(keys)} ключей через парсер")
     return keys, steps
+
 # ==================== ФУНКЦИИ ФОРМАТИРОВАНИЯ КЛЮЧЕЙ ====================
 
 def get_country_flag(country):
@@ -3593,7 +3290,8 @@ def callback_remove_admin_cb(call):
         bot.send_message(target_id, "❌ Ваш доступ администратора был отозван.")
     except:
         pass
-        # ==================== ОБРАБОТЧИК ОСТАЛЬНЫХ СООБЩЕНИЙ ====================
+
+# ==================== ОБРАБОТЧИК ОСТАЛЬНЫХ СООБЩЕНИЙ ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private')
 def handle_private_messages(message):
@@ -3749,4 +3447,4 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-        
+    
