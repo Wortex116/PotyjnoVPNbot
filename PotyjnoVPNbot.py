@@ -583,7 +583,11 @@ def _parse_keys_from_content(content):
     all_keys = []
     if not content:
         return []
+    
+    # ====== ПРЯМЫЕ КЛЮЧИ ======
     all_keys.extend(_extract_vpn_keys(content))
+    
+    # ====== BASE64 ======
     cleaned = re.sub(r'\s+', '', content.strip())
     if len(cleaned) >= 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', cleaned):
         decoded = _try_multilevel_b64(cleaned, max_depth=5)
@@ -591,6 +595,38 @@ def _parse_keys_from_content(content):
             for item in decoded:
                 all_keys.extend(_extract_vpn_keys(item))
                 all_keys.extend(_try_multilevel_b64(item, max_depth=3))
+    
+    # ====== ПАРСИНГ JSON МАССИВА ======
+    if '"vnext"' in content or '"outbounds"' in content or '"address"' in content:
+        try:
+            json_keys = re.findall(
+                r'"address"\s*:\s*"([^"]+)"\s*,\s*"port"\s*:\s*(\d+).*?"users"\s*:\s*\[\s*\{\s*"id"\s*:\s*"([^"]+)"',
+                content,
+                re.IGNORECASE | re.DOTALL
+            )
+            if json_keys:
+                for address, port, uuid in json_keys:
+                    key = f"vless://{uuid}@{address}:{port}?type=tcp&security=tls&sni={address}#VPN"
+                    all_keys.append(key)
+                all_keys = _dedup(all_keys)
+                if all_keys:
+                    return all_keys
+        except:
+            pass
+        
+        try:
+            vless_in_json = re.findall(
+                r'vless://[a-f0-9-]+@[^"]+:\d+\?[^"]*',
+                content,
+                re.IGNORECASE
+            )
+            if vless_in_json:
+                all_keys.extend(vless_in_json)
+                return _dedup(all_keys)
+        except:
+            pass
+    
+    # ====== ПОСТРОЧНЫЙ РАЗБОР ======
     for line in content.splitlines():
         line = line.strip()
         if not line:
@@ -609,6 +645,8 @@ def _parse_keys_from_content(content):
             encoded = urllib.parse.unquote(url)
             if len(encoded) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', encoded):
                 all_keys.extend(_try_multilevel_b64(encoded, max_depth=3))
+    
+    # ====== HTML ======
     if '<' in content and '>' in content:
         try:
             soup = BeautifulSoup(content, 'html.parser')
@@ -630,6 +668,8 @@ def _parse_keys_from_content(content):
                             all_keys.extend(_try_multilevel_b64(decoded, max_depth=4))
         except:
             pass
+    
+    # ====== JSON СТРОКИ ======
     try:
         json_str_matches = re.findall(r'"((?:[^"\\]|\\.)*)"', content)
         for m in json_str_matches:
@@ -644,6 +684,8 @@ def _parse_keys_from_content(content):
                 all_keys.extend(_try_multilevel_b64(unescaped, max_depth=4))
     except:
         pass
+    
+    # ====== СХЕМЫ ПРИЛОЖЕНИЙ ======
     app_schemes = re.findall(
         r'(?:incy|happ|v2ray|v2rayng|shadowrocket|clash|sing-box|quantumult|surge|nekoray|hiddify|streisand|karing|mihomo|flclash)://[^\s<>"\']+',
         content, re.IGNORECASE
@@ -661,6 +703,8 @@ def _parse_keys_from_content(content):
             all_keys.extend(_extract_vpn_keys(resolved))
             if re.match(r'^[A-Za-z0-9+/_\-=]+$', resolved):
                 all_keys.extend(_try_multilevel_b64(resolved, max_depth=4))
+    
+    # ====== ПРОКСИ-ОБЕРТКИ ======
     proxy_wraps = re.findall(
         r'https?://[^/]+/+(https?://[^\s<>"\']+)',
         content, re.IGNORECASE
@@ -672,12 +716,16 @@ def _parse_keys_from_content(content):
                 all_keys.extend(_parse_keys_from_content(resp.text))
         except:
             pass
+    
+    # ====== KEY=VALUE ПАРЫ ======
     key_value_pairs = re.findall(r'([a-zA-Z0-9_\-]+)=([^&\s]+)', content)
     for key, value in key_value_pairs:
         if len(value) >= 16:
             decoded = urllib.parse.unquote(value)
             if re.match(r'^[A-Za-z0-9+/_\-=]+$', decoded):
                 all_keys.extend(_try_multilevel_b64(decoded, max_depth=3))
+    
+    # ====== SUB ПАТТЕРНЫ ======
     sub_patterns = re.findall(
         r'(?:sub|subscription|config|link|url|uri)=([^&\s]+)',
         content, re.IGNORECASE
@@ -693,6 +741,7 @@ def _parse_keys_from_content(content):
                 pass
         elif len(decoded) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', decoded):
             all_keys.extend(_try_multilevel_b64(decoded, max_depth=4))
+    
     return _dedup(all_keys)
 
 def load_keys_from_url(raw_url):
@@ -704,17 +753,35 @@ def load_keys_from_url(raw_url):
             if keys:
                 return _dedup(keys)
         return _dedup(_extract_vpn_keys(url))
-    headers = {'User-Agent': 'v2rayNG/1.8.7', 'Accept': '*/*'}
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive'
+    }
     content = None
+    
     for verify in [True, False]:
         try:
-            resp = requests.get(url, headers=headers, timeout=30, verify=verify)
-            content = resp.text
-            break
+            session = requests.Session()
+            resp = session.get(
+                url,
+                headers=headers,
+                timeout=30,
+                verify=verify,
+                allow_redirects=True,
+                max_redirects=10
+            )
+            if resp.status_code == 200:
+                content = resp.text
+                break
         except:
             continue
+    
     if not content:
         return []
+    
     return _parse_keys_from_content(content)
 
 def load_keys_from_text(text):
@@ -826,8 +893,7 @@ def get_user_display_name(user_id):
         return name.strip() or str(user_id)
     except:
         return str(user_id)
-
-# ==================== KEYBOARDS ====================
+            # ==================== KEYBOARDS ====================
 
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -1885,8 +1951,7 @@ def _parse_subscription_any(raw, source_label=None):
     else:
         steps.append(f"🔍 Извлечено {len(keys)} ключей через парсер")
     return keys, steps
-
-# ==================== ФУНКЦИИ ФОРМАТИРОВАНИЯ КЛЮЧЕЙ ====================
+    # ==================== ФУНКЦИИ ФОРМАТИРОВАНИЯ КЛЮЧЕЙ ====================
 
 def get_country_flag(country):
     flags = {
@@ -2184,14 +2249,29 @@ def admin_callback(call):
     # ====== УПРАВЛЕНИЕ КЛЮЧАМИ ======
     if data == "admin_keys":
         bot.answer_callback_query(call.id)
-        bot.send_message(
-            user_id,
-            "🔑 *Управление ключами*\n\n"
-            "Отправьте файл или текст с ключами (vless://, vmess:// и др.)\n"
-            "Или просто отправьте ссылку на подписку для загрузки.",
-            parse_mode="Markdown"
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📥 Задать ключи", callback_data="admin_keys_set"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
         )
-        loading_sessions[user_id] = {'waiting': True, 'source': 'admin_keys'}
+        
+        keys = get_keys_from_db()
+        text = (
+            "🔑 *Управление ключами*\n\n"
+            f"📦 Ключей в базе: {len(keys)}\n"
+            f"🗑️ Выдано ключей: {int(get_setting('total_keys_issued', '0'))}\n"
+            f"📊 Всего проверено: {int(get_setting('total_keys_checked', '0'))}\n\n"
+            "Выберите действие:"
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
 
     # ====== БЛОКИРОВКА ======
@@ -2262,27 +2342,17 @@ def callback_admin_detail(call):
         bot.answer_callback_query(call.id, "❌ Это создатель, его нельзя удалить.")
         return
     
-    name = get_user_display_name(target_id)
-    
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("🗑️ Снять админку", callback_data=f"admin_remove_{target_id}"),
-        types.InlineKeyboardButton("🚫 Заблокировать", callback_data=f"admin_block_{target_id}")
+    fake_call = types.CallbackQuery(
+        id=call.id,
+        from_user=call.from_user,
+        message=call.message,
+        chat_instance=call.chat_instance,
+        data=f"user_{target_id}",
+        game_short_name=None,
+        inline_message_id=call.inline_message_id
     )
-    kb.add(
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_manage_admins")
-    )
-    
-    text = f"👤 *{name}*\n🆔 ID: `{target_id}`\n\nВыберите действие:"
-    
-    bot.edit_message_text(
-        text,
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    bot.answer_callback_query(call.id)
+    callback_user_detail(fake_call)
+    return
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_remove_'))
 def callback_admin_remove(call):
@@ -2305,7 +2375,8 @@ def callback_admin_remove(call):
     conn.close()
     
     bot.answer_callback_query(call.id, f"✅ Админ {target_id} снят")
-    callback_admin_manage_admins(call)
+    admin_callback(call)
+    return
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_block_'))
 def callback_admin_block_from_manage(call):
@@ -2338,7 +2409,8 @@ def callback_admin_block_from_manage(call):
     
     cur.close()
     conn.close()
-    callback_admin_manage_admins(call)
+    admin_callback(call)
+    return
 
 @bot.callback_query_handler(func=lambda call: call.data == "admin_add_user")
 def callback_admin_add_user(call):
@@ -2356,6 +2428,7 @@ def callback_admin_add_user(call):
         parse_mode="Markdown"
     )
     search_cache[user_id] = {'action': 'add_admin_waiting'}
+    return
 
 @bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'add_admin_waiting')
 def handle_add_admin_input(message):
@@ -2406,8 +2479,103 @@ def handle_add_admin_input(message):
         text="/admin"
     )
     admin_panel(fake_msg)
+    return
 
-# ==================== АВТОПОСТИНГ (ОБРАБОТЧИКИ) ====================
+# ==================== ЗАГРУЗКА КЛЮЧЕЙ (ADMIN KEYS SET) ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_set")
+def callback_admin_keys_set(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    bot.answer_callback_query(call.id, "📥 Отправьте ключи")
+    bot.send_message(
+        user_id,
+        "📥 *Загрузка ключей*\n\n"
+        "Отправьте ключи одним из способов:\n"
+        "• Текст с ключами (vless://, vmess:// и др.)\n"
+        "• .txt файл с ключами\n"
+        "• Прокси-ссылку (например, https://happ.dska.su/https://sub.example.com/...)\n\n"
+        "После загрузки ключи будут сохранены в базу.",
+        parse_mode="Markdown"
+    )
+    loading_sessions[user_id] = {'waiting': True, 'source': 'admin_keys_set'}
+    return
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in loading_sessions)
+def admin_load_keys_autopost(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    if user_id not in loading_sessions:
+        return
+    
+    source = loading_sessions[user_id].get('source', 'admin_keys')
+    del loading_sessions[user_id]
+    
+    raw_text = message.text or message.caption or ''
+    
+    if message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(file.file_path)
+            text = file_bytes.decode('utf-8', errors='ignore')
+            keys = load_keys_from_text(text)
+            _finish_admin_keys_load(message, keys, "файл")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+        return
+    
+    if raw_text.strip().startswith('http'):
+        keys = load_keys_from_url(raw_text.strip())
+        _finish_admin_keys_load(message, keys, f"URL: {raw_text[:50]}...")
+        return
+    
+    if raw_text.strip():
+        keys = load_keys_from_text(raw_text)
+        _finish_admin_keys_load(message, keys, "текст")
+        return
+    
+    bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
+
+def _finish_admin_keys_load(message, keys, source_label):
+    if not keys:
+        bot.reply_to(message, "❌ Не найдено ни одного VPN ключа.")
+        return
+    
+    save_keys_to_db(keys)
+    
+    proto_stats = {}
+    for k in keys:
+        m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+        if m:
+            p = m.group(1).lower()
+            proto_stats[p] = proto_stats.get(p, 0) + 1
+    stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+    
+    bot.reply_to(
+        message,
+        f"✅ *Ключи загружены!*\n\n"
+        f"📊 Загружено ключей: {len(keys)}\n"
+        f"📋 По протоколам:\n{stats}\n"
+        f"📦 Всего в базе: {len(get_keys_from_db())}\n"
+        f"🔗 Источник: {source_label}",
+        parse_mode="Markdown"
+    )
+    
+    # Возврат в админ-панель
+    fake_msg = types.Message(
+        message_id=message.message_id,
+        date=int(time.time()),
+        chat=message.chat,
+        from_user=message.from_user,
+        text="/admin"
+    )
+    admin_panel(fake_msg)
+    return
+    # ==================== АВТОПОСТИНГ (ОБРАБОТЧИКИ) ====================
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('autopost_'))
 def callback_autopost_handlers(call):
@@ -2418,7 +2586,7 @@ def callback_autopost_handlers(call):
 
     data = call.data
 
-    # ====== НАЗАД В АДМИН-ПАНЕЛЬ ======
+    # ====== НАЗАД В МЕНЮ АВТОПОСТИНГА ======
     if data == "autopost_back":
         bot.answer_callback_query(call.id)
         callback_admin_autopost(call)
@@ -2798,69 +2966,77 @@ def auto_post_keys_to_channel():
     except Exception as e:
         print(f"[autopost] Ошибка отправки статистики: {e}")
 
-# ==================== ЗАГРУЗКА КЛЮЧЕЙ ====================
+# ==================== ОБРАБОТЧИКИ НАСТРОЕК АВТОПОСТИНГА ====================
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in loading_sessions)
-def admin_load_keys_autopost(message):
+@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel')
+def handle_autopost_set_channel(message):
     user_id = message.from_user.id
     if not is_admin(user_id):
         return
-    if user_id not in loading_sessions:
-        return
     
-    source = loading_sessions[user_id].get('source', 'admin_keys')
-    del loading_sessions[user_id]
+    text = message.text.strip()
+    del search_cache[user_id]
     
-    raw_text = message.text or message.caption or ''
+    channel_id = None
+    topic_id = 0
     
-    if message.document:
+    if 't.me/' in text:
+        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
+        if match:
+            username = match.group(1)
+            try:
+                chat = bot.get_chat(f"@{username}")
+                channel_id = chat.id
+            except:
+                pass
+    
+    if not channel_id:
         try:
-            file = bot.get_file(message.document.file_id)
-            file_bytes = bot.download_file(file.file_path)
-            text = file_bytes.decode('utf-8', errors='ignore')
-            keys = load_keys_from_text(text)
-            _finish_autopost_load(message, keys, "файл")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+            channel_id = int(text)
+        except:
+            pass
+    
+    if 'thread_id=' in text:
+        match = re.search(r'thread_id=(\d+)', text)
+        if match:
+            topic_id = int(match.group(1))
+    
+    if not channel_id:
+        bot.reply_to(message, "❌ Не удалось распознать канал. Отправьте ссылку или ID.")
         return
     
-    if raw_text.strip().startswith('http'):
-        keys = load_keys_from_url(raw_text.strip())
-        _finish_autopost_load(message, keys, f"URL: {raw_text[:50]}...")
-        return
+    config = get_autopost_config()
+    config['channel_id'] = channel_id
+    config['topic_id'] = topic_id
+    save_autopost_config(config)
     
-    if raw_text.strip():
-        keys = load_keys_from_text(raw_text)
-        _finish_autopost_load(message, keys, "текст")
-        return
-    
-    bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
+    bot.reply_to(message, f"✅ Канал установлен!\n📢 ID: {channel_id}\n📝 Ветка: {topic_id if topic_id else 'Нет'}")
 
-def _finish_autopost_load(message, keys, source_label):
-    if not keys:
-        bot.reply_to(message, "❌ Не найдено ни одного VPN ключа.")
+@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval')
+def handle_autopost_set_interval(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
         return
     
-    save_keys_to_db(keys)
+    try:
+        minutes = int(message.text.strip())
+        if minutes < 5:
+            bot.reply_to(message, "❌ Минимальное значение: 5 минут")
+            return
+        if minutes > 1440:
+            bot.reply_to(message, "❌ Максимальное значение: 1440 минут (24 часа)")
+            return
+    except:
+        bot.reply_to(message, "❌ Введите число (минуты).")
+        return
     
-    proto_stats = {}
-    for k in keys:
-        m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
-        if m:
-            p = m.group(1).lower()
-            proto_stats[p] = proto_stats.get(p, 0) + 1
-    stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+    del search_cache[user_id]
     
-    bot.reply_to(
-        message,
-        f"✅ *Ключи загружены!*\n\n"
-        f"📊 Загружено ключей: {len(keys)}\n"
-        f"📋 По протоколам:\n{stats}\n"
-        f"📦 Всего в базе: {len(get_keys_from_db())}\n"
-        f"🔗 Источник: {source_label}\n\n"
-        "Теперь вы можете запустить автопостинг через меню.",
-        parse_mode="Markdown"
-    )
+    config = get_autopost_config()
+    config['interval'] = minutes * 60
+    save_autopost_config(config)
+    
+    bot.reply_to(message, f"✅ Интервал установлен: {minutes} минут")
 
 # ==================== ОБРАБОТЧИКИ РАССЫЛКИ ====================
 
@@ -3517,78 +3693,6 @@ def handle_private_messages(message):
 
     bot.reply_to(message, "Используйте кнопки меню.", reply_markup=main_menu())
 
-# ==================== ОБРАБОТЧИКИ НАСТРОЕК АВТОПОСТИНГА ====================
-
-@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel')
-def handle_autopost_set_channel(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    
-    text = message.text.strip()
-    del search_cache[user_id]
-    
-    channel_id = None
-    topic_id = 0
-    
-    if 't.me/' in text:
-        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
-        if match:
-            username = match.group(1)
-            try:
-                chat = bot.get_chat(f"@{username}")
-                channel_id = chat.id
-            except:
-                pass
-    
-    if not channel_id:
-        try:
-            channel_id = int(text)
-        except:
-            pass
-    
-    if 'thread_id=' in text:
-        match = re.search(r'thread_id=(\d+)', text)
-        if match:
-            topic_id = int(match.group(1))
-    
-    if not channel_id:
-        bot.reply_to(message, "❌ Не удалось распознать канал. Отправьте ссылку или ID.")
-        return
-    
-    config = get_autopost_config()
-    config['channel_id'] = channel_id
-    config['topic_id'] = topic_id
-    save_autopost_config(config)
-    
-    bot.reply_to(message, f"✅ Канал установлен!\n📢 ID: {channel_id}\n📝 Ветка: {topic_id if topic_id else 'Нет'}")
-
-@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval')
-def handle_autopost_set_interval(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    
-    try:
-        minutes = int(message.text.strip())
-        if minutes < 5:
-            bot.reply_to(message, "❌ Минимальное значение: 5 минут")
-            return
-        if minutes > 1440:
-            bot.reply_to(message, "❌ Максимальное значение: 1440 минут (24 часа)")
-            return
-    except:
-        bot.reply_to(message, "❌ Введите число (минуты).")
-        return
-    
-    del search_cache[user_id]
-    
-    config = get_autopost_config()
-    config['interval'] = minutes * 60
-    save_autopost_config(config)
-    
-    bot.reply_to(message, f"✅ Интервал установлен: {minutes} минут")
-
 # ==================== FLASK APP ====================
 
 @app.route('/')
@@ -3645,3 +3749,4 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
+    
