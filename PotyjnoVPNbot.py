@@ -2817,7 +2817,21 @@ def user_info(message):
         conn.close()
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
-
+@bot.message_handler(commands=['update_keys'])
+def cmd_update_keys(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        bot.reply_to(message, "❌ Только для администраторов.")
+        return
+    
+    bot.reply_to(
+        message,
+        "🔑 *Управление ключами*\n\n"
+        "Отправьте файл или текст с ключами (vless://, vmess:// и др.)\n"
+        "Или просто отправьте ссылку на подписку для загрузки.",
+        parse_mode="Markdown"
+    )
+    loading_sessions[user_id] = {'waiting': True}
 # ==================== ОБРАБОТЧИК ОСТАЛЬНЫХ СООБЩЕНИЙ ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private')
