@@ -1946,11 +1946,16 @@ def admin_callback(call):
     # ====== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (MANAGE) ======
     if call.data == "admin_manage_users":
         bot.answer_callback_query(call.id)
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        cmd_manage(call.message)
+        # Создаем фейковое сообщение для cmd_manage
+        fake_msg = types.Message(
+            message_id=call.message.message_id,
+            date=int(time.time()),
+            chat=call.message.chat,
+            from_user=call.from_user,
+            text="/manage"
+        )
+        # Запускаем manage
+        cmd_manage(fake_msg)
         return
 
     if call.data == "admin_manage_admins":
@@ -2082,7 +2087,7 @@ def cmd_manage(message):
     kb = build_user_list_keyboard(users, 0, 'all')
     bot.reply_to(message, f"👥 Пользователи ({len(users)}):", reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_') or call.data.startswith('page_') or call.data in ['close_manage', 'back_to_list', 'top_refs_admin'])
+@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_') or call.data.startswith('page_') or call.data in ['close_manage', 'back_to_list', 'top_refs_admin', 'admin_back'])
 def callback_manage_filters(call):
     if not is_admin(call.from_user.id):
         bot.answer_callback_query(call.id, "❌ Нет доступа.")
@@ -2099,14 +2104,17 @@ def callback_manage_filters(call):
         bot.answer_callback_query(call.id)
         return
 
+    # ====== ВОЗВРАТ В АДМИН-ПАНЕЛЬ ======
     if data == 'admin_back':
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
         except:
             pass
+        # Открываем админ-панель
         admin_panel(call.message)
         bot.answer_callback_query(call.id)
         return
+    # ===================================
 
     if data == 'top_refs_admin':
         conn = get_db_connection()
@@ -2948,4 +2956,4 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-        
+            
