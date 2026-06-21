@@ -890,31 +890,51 @@ def cmd_start(message):
     if message.chat.type != 'private':
         bot.reply_to(message, "⚠️ Бот работает только в личных сообщениях.")
         return
+    
     user_id = message.from_user.id
     current_time = int(time.time())
+    
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
+    
+    # ========== 1. ПРОВЕРЯЕМ, НОВЫЙ ЛИ ПОЛЬЗОВАТЕЛЬ ==========
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+    existing_user = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    is_new_user = existing_user is None
+    
+    # ========== 2. ОБРАБАТЫВАЕМ РЕФЕРАЛА (ТОЛЬКО ДЛЯ НОВЫХ) ==========
     referrer_id = None
-    if message.text and 'start=ref_' in message.text:
+    if is_new_user and message.text and 'start=ref_' in message.text:
         parts = message.text.split('start=ref_')
         if len(parts) > 1:
             try:
                 referrer_id = int(parts[1].strip())
             except:
                 referrer_id = None
-    if referrer_id and referrer_id != user_id:
+    
+    # Если есть реферал, это новый пользователь и реферал не сам пользователь
+    if referrer_id and referrer_id != user_id and is_new_user:
+        # Проверяем, не было ли уже реферала у этого пользователя
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
-            "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
-            (referrer_id, user_id)
+            "SELECT * FROM referrals WHERE referred_id = %s",
+            (user_id,)
         )
         already_ref = cur.fetchone()
         cur.close()
         conn.close()
+        
         if not already_ref:
+            # Проверяем лимит рефералов у реферера
             if can_add_referral(referrer_id):
+                # Сохраняем реферала
                 conn = get_db_connection()
                 cur = conn.cursor()
                 cur.execute(
@@ -924,12 +944,17 @@ def cmd_start(message):
                 conn.commit()
                 cur.close()
                 conn.close()
+                
+                # Уведомляем реферера
                 name = message.from_user.first_name or str(user_id)
                 try:
-                    bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {name} присоединился по вашей реферальной ссылке.")
+                    bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {name} присоединился по вашей ссылке.")
                 except:
                     pass
+                
+                # Если реферальная система включена и реферер подписан
                 if get_setting('referral_enabled') == '1' and is_subscribed(referrer_id):
+                    # Начисляем бонус ТОЛЬКО 1 раз
                     conn = get_db_connection()
                     cur = conn.cursor()
                     cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
@@ -943,26 +968,63 @@ def cmd_start(message):
                         )
                         conn.commit()
                         try:
-                            bot.send_message(referrer_id, "🎉 Вам начислено +3 дня!")
+                            bot.send_message(referrer_id, "🎉 Вам начислено +3 дня за нового реферала!")
                         except:
                             pass
                     cur.close()
                     conn.close()
             else:
                 try:
-                    bot.send_message(referrer_id, "⚠️ Вы достигли лимита рефералов (10 в день). Попробуйте завтра.")
+                    bot.send_message(referrer_id, "⚠️ Лимит рефералов (10 в день). Попробуйте завтра.")
                 except:
                     pass
+    
+    # ========== 3. ПРОВЕРЯЕМ ПОДПИСКУ ==========
     if not is_subscribed(user_id):
+        # Если пользователь новый и есть неполученный бонус
+        if is_new_user:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
+                (user_id,)
+            )
+            pending = cur.fetchone()
+            cur.close()
+            conn.close()
+            
+            if pending and get_setting('referral_enabled') == '1':
+                referrer_id = pending[0]
+                if is_subscribed(referrer_id):
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
+                    ref_result = cur.fetchone()
+                    if ref_result:
+                        new_end = ref_result[0] + 3 * 24 * 60 * 60
+                        cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, referrer_id))
+                        cur.execute(
+                            "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
+                            (referrer_id, user_id)
+                        )
+                        conn.commit()
+                        try:
+                            bot.send_message(referrer_id, "🎉 Ваш реферал подтвердил подписку! +3 дня.")
+                        except:
+                            pass
+                    cur.close()
+                    conn.close()
+        
+        # Показываем кнопку подписки
         bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
         return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, last_activity FROM users WHERE user_id = %s", (user_id,))
-    user = cur.fetchone()
-    if not user:
+    
+    # ========== 4. РЕГИСТРАЦИЯ НОВОГО ПОЛЬЗОВАТЕЛЯ ==========
+    if is_new_user:
         token = generate_subscription_token()
         sub_end = current_time + 7 * 24 * 60 * 60
+        conn = get_db_connection()
+        cur = conn.cursor()
         cur.execute(
             "INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) VALUES (%s, %s, %s, 0, %s)",
             (user_id, sub_end, current_time, token)
@@ -970,16 +1032,58 @@ def cmd_start(message):
         conn.commit()
         cur.close()
         conn.close()
-        bot.reply_to(message, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
-    else:
-        last_activity = user[1] or 0
-        days_since_last = (current_time - last_activity) // (24 * 60 * 60)
-        welcome_text = "👋 С возвращением!" if days_since_last >= 3 else "👋 Добро пожаловать!"
-        cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (current_time, user_id))
-        conn.commit()
+        
+        # Проверяем, есть ли неполученный бонус после подписки
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
+            (user_id,)
+        )
+        pending = cur.fetchone()
         cur.close()
         conn.close()
-        bot.reply_to(message, welcome_text)
+        
+        if pending and get_setting('referral_enabled') == '1':
+            referrer_id = pending[0]
+            if is_subscribed(referrer_id):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
+                ref_result = cur.fetchone()
+                if ref_result:
+                    new_end = ref_result[0] + 3 * 24 * 60 * 60
+                    cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, referrer_id))
+                    cur.execute(
+                        "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
+                        (referrer_id, user_id)
+                    )
+                    conn.commit()
+                    try:
+                        bot.send_message(referrer_id, "🎉 Ваш реферал зарегистрировался! +3 дня.")
+                    except:
+                        pass
+                cur.close()
+                conn.close()
+        
+        bot.reply_to(message, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
+    
+    else:
+        # ========== 5. ВХОД СУЩЕСТВУЮЩЕГО ПОЛЬЗОВАТЕЛЯ ==========
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT last_activity FROM users WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+        if result:
+            last_activity = result[0] or 0
+            days_since_last = (current_time - last_activity) // (24 * 60 * 60)
+            welcome_text = "👋 С возвращением!" if days_since_last >= 3 else "👋 Добро пожаловать!"
+            cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (current_time, user_id))
+            conn.commit()
+            bot.reply_to(message, welcome_text)
+        cur.close()
+        conn.close()
+    
     bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
 
 # ==================== ЛИЧНЫЙ КАБИНЕТ ====================
@@ -1768,6 +1872,7 @@ def admin_panel(message):
 def admin_callback(call):
     user_id = call.from_user.id
     
+    # Закрытие — доступно всем, кто открыл
     if call.data == 'admin_close':
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -1776,6 +1881,7 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         return
     
+    # Все остальные действия — только создатель
     if user_id != ADMIN_ID:
         bot.answer_callback_query(call.id, "❌ Только создатель бота.")
         return
@@ -1816,8 +1922,26 @@ def admin_callback(call):
     
     if data == 'loadkeys':
         bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "📥 Загрузка ключей...")
-        cmd_loadkeys(call.message)
+        user_id = call.from_user.id
+        channels = get_user_channels(user_id)
+        
+        if not channels:
+            bot.send_message(call.message.chat.id, "❌ У вас нет доступа ни к одному каналу.")
+            return
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for ch in channels:
+            ch_id, channel_id, channel_name, topic_id, enabled, interval_sec, last_post, is_default = ch
+            label = f"📢 {channel_name}"
+            if topic_id and topic_id != 0:
+                label += f" (ветка {topic_id})"
+            kb.add(types.InlineKeyboardButton(label, callback_data=f"load_channel_{channel_id}_{topic_id}"))
+        
+        kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="load_cancel"))
+        
+        channel_selection[user_id] = {'keys': [], 'message_id': None, 'channel_id': None, 'topic_id': None}
+        
+        bot.send_message(call.message.chat.id, "📥 *Выберите канал для загрузки ключей*", parse_mode="Markdown", reply_markup=kb)
         return
     
     if data == 'autopost':
@@ -1844,6 +1968,7 @@ def admin_callback(call):
         config['enabled'] = not config['enabled']
         save_autopost_config(config)
         bot.answer_callback_query(call.id, f"Автопостинг {'включен' if config['enabled'] else 'выключен'}")
+        # Обновляем
         admin_callback(call)
         return
     
@@ -1873,14 +1998,37 @@ def admin_callback(call):
         return
     
     if data == 'back':
-        admin_panel(call.message)
-        bot.delete_message(call.message.chat.id, call.message.message_id)
+        # Создаем новое сообщение с админ-панелью
+        bot.send_message(call.message.chat.id, "👑 *АДМИН-ПАНЕЛЬ*\n\nВыберите действие:", parse_mode="Markdown", reply_markup=admin_panel_keyboard())
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
         bot.answer_callback_query(call.id)
         return
 
 def admin_back_button():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back"))
+    return kb
+
+def admin_panel_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📢 Каналы", callback_data="admin_channels"),
+        types.InlineKeyboardButton("👥 Доступ", callback_data="admin_access")
+    )
+    kb.add(
+        types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="admin_loadkeys"),
+        types.InlineKeyboardButton("🚀 Автопостинг", callback_data="admin_autopost")
+    )
+    kb.add(
+        types.InlineKeyboardButton("📢 Объявление", callback_data="admin_announce"),
+        types.InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")
+    )
+    kb.add(
+        types.InlineKeyboardButton("❌ Закрыть", callback_data="admin_close")
+    )
     return kb
 
 # ==================== МЕНЮ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ (/user) ====================
@@ -2260,6 +2408,13 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
     keys = get_keys_from_db()
     if not keys:
         print(f"[autopost] Нет ключей")
+        try:
+            if topic_id and topic_id != 0:
+                bot.send_message(channel_id, "❌ Нет ключей для постинга", message_thread_id=topic_id)
+            else:
+                bot.send_message(channel_id, "❌ Нет ключей для постинга")
+        except:
+            pass
         return
     
     if not channel_id:
@@ -2267,6 +2422,7 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
         channel_id = config['channel_id']
         topic_id = config['topic_id']
     
+    # Проверяем ключи
     working = []
     not_working = []
     
@@ -2277,20 +2433,13 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
         else:
             not_working.append({'key': key})
     
+    # Сортируем по пингу (лучшие сверху)
     working.sort(key=lambda x: x['latency'] if x['latency'] else 9999)
     
+    # Отправляем ключи в красивом формате
     sent_keys = []
     for i, key_data in enumerate(working[:10], 1):
-        key = key_data['key']
-        latency = key_data['latency']
-        
-        if '| @ciorsa' not in key:
-            if '#' in key:
-                key = key.replace('#', '# | @ciorsa ')
-            else:
-                key = f"{key} # | @ciorsa"
-        
-        formatted = f"🚀 #{i} | {key}\n⏱ Пинг: {latency}ms"
+        formatted = format_key_for_post(key_data['key'], key_data['latency'], i)
         
         try:
             if topic_id and topic_id != 0:
@@ -2298,16 +2447,18 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
             else:
                 bot.send_message(channel_id, formatted, parse_mode="Markdown")
             sent_keys.append(key_data['key'])
-            time.sleep(0.3)
+            time.sleep(0.5)
         except Exception as e:
-            print(f"[autopost] Ошибка: {e}")
+            print(f"[autopost] Ошибка отправки: {e}")
     
+    # Удаляем выданные ключи
     if sent_keys:
         remove_used_keys(sent_keys)
         increment_setting('total_keys_issued', len(sent_keys))
     
+    # Статистика
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    stats_msg = f"""📊 *Автопостинг*
+    stats_msg = f"""📊 *АВТОПОСТИНГ*
 
 🕐 {current_time}
 ✅ Работает: {len(working)}
@@ -2324,6 +2475,147 @@ def auto_post_keys_to_channel(channel_id=None, topic_id=0):
             bot.send_message(channel_id, stats_msg, parse_mode="Markdown")
     except:
         pass
+
+def format_key_for_post(key, latency, index):
+    """Форматирует ключ для постинга в красивом виде"""
+    
+    # Извлекаем протокол
+    protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
+    protocol = protocol_match.group(1).upper() if protocol_match else "UNKNOWN"
+    
+    # Извлекаем название (после #)
+    name_match = re.search(r'#([^#\s]+)', key)
+    if name_match:
+        name = urllib.parse.unquote(name_match.group(1))
+        # Удаляем лишние метки
+        name = re.sub(r'\|.*$', '', name)
+        name = re.sub(r'@\w+', '', name)
+        name = name.strip()
+    else:
+        name = "VPN Server"
+    
+    # Извлекаем IP/домен
+    ip_match = re.search(r'@([^:]+):(\d+)', key)
+    ip = ip_match.group(1) if ip_match else "Unknown"
+    port = ip_match.group(2) if ip_match else "0"
+    
+    # Извлекаем город/страну из названия
+    country = "Unknown"
+    city = "Unknown"
+    
+    # Пытаемся найти страну в названии
+    countries = {
+        'united states': '🇺🇸', 'usa': '🇺🇸', 'us': '🇺🇸',
+        'united kingdom': '🇬🇧', 'uk': '🇬🇧',
+        'germany': '🇩🇪', 'deutschland': '🇩🇪', 'de': '🇩🇪',
+        'france': '🇫🇷', 'fr': '🇫🇷',
+        'russia': '🇷🇺', 'ru': '🇷🇺',
+        'china': '🇨🇳', 'cn': '🇨🇳',
+        'japan': '🇯🇵', 'jp': '🇯🇵',
+        'singapore': '🇸🇬', 'sg': '🇸🇬',
+        'netherlands': '🇳🇱', 'nl': '🇳🇱',
+        'canada': '🇨🇦', 'ca': '🇨🇦',
+        'australia': '🇦🇺', 'au': '🇦🇺',
+        'india': '🇮🇳', 'in': '🇮🇳',
+        'brazil': '🇧🇷', 'br': '🇧🇷',
+        'turkey': '🇹🇷', 'tr': '🇹🇷',
+        'italy': '🇮🇹', 'it': '🇮🇹',
+        'spain': '🇪🇸', 'es': '🇪🇸',
+        'poland': '🇵🇱', 'pl': '🇵🇱',
+        'ukraine': '🇺🇦', 'ua': '🇺🇦',
+        'israel': '🇮🇱', 'il': '🇮🇱',
+        'uae': '🇦🇪', 'ae': '🇦🇪',
+        'saudi arabia': '🇸🇦', 'sa': '🇸🇦',
+        'las vegas': '🇺🇸',
+    }
+    
+    name_lower = name.lower()
+    for country_name, flag in countries.items():
+        if country_name in name_lower:
+            country = country_name.title()
+            # Пытаемся найти город
+            city_match = re.search(r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)', name)
+            if city_match and city_match.group(1).lower() != country_name:
+                city = city_match.group(1)
+            break
+    
+    # Флаг
+    flag = get_country_flag(country)
+    
+    # Скорость (оценка по пингу)
+    if latency and latency < 50:
+        speed = "100+ Mbps"
+    elif latency and latency < 100:
+        speed = "50-100 Mbps"
+    elif latency and latency < 200:
+        speed = "20-50 Mbps"
+    elif latency and latency < 500:
+        speed = "5-20 Mbps"
+    else:
+        speed = "1-5 Mbps"
+    
+    # Иконка протокола
+    protocol_icons = {
+        'VLESS': '🔹',
+        'VMESS': '🔸',
+        'TROJAN': '🟣',
+        'SS': '🟢',
+        'SSR': '🟡',
+        'HYSTERIA': '🟠',
+        'TUIC': '🔵',
+        'WIREGUARD': '🟩',
+    }
+    proto_icon = protocol_icons.get(protocol.upper(), '🔹')
+    
+    # Формируем красивое сообщение
+    formatted = f"""🚀 #{index} | {flag} {country}
+
+┌ 🏷 Название: {flag} {country} | @ciorsa
+├ 🔗 Протокол: {proto_icon} {protocol.upper()}
+├ 📡 Пинг: {latency} ms
+├ ⚡ Скорость: {speed}
+├ 🌍 Город: {city}
+└ 🏢 Провайдер: {ip}
+
+🔑 Ключ для подключения:
+`{key}`
+
+⏱ Проверено: {datetime.now().strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot
+🔗 @ciorsa"""
+    
+    return formatted
+
+
+def get_country_flag(country):
+    """Возвращает флаг для страны"""
+    flags = {
+        'united states': '🇺🇸', 'usa': '🇺🇸',
+        'united kingdom': '🇬🇧', 'uk': '🇬🇧',
+        'germany': '🇩🇪', 'deutschland': '🇩🇪',
+        'france': '🇫🇷',
+        'russia': '🇷🇺',
+        'china': '🇨🇳',
+        'japan': '🇯🇵',
+        'singapore': '🇸🇬',
+        'netherlands': '🇳🇱',
+        'canada': '🇨🇦',
+        'australia': '🇦🇺',
+        'india': '🇮🇳',
+        'brazil': '🇧🇷',
+        'turkey': '🇹🇷',
+        'italy': '🇮🇹',
+        'spain': '🇪🇸',
+        'poland': '🇵🇱',
+        'ukraine': '🇺🇦',
+        'israel': '🇮🇱',
+        'uae': '🇦🇪',
+        'las vegas': '🇺🇸',
+    }
+    country_lower = country.lower().strip()
+    for key, flag in flags.items():
+        if key in country_lower:
+            return flag
+    return '🌍'
 
 def ping_key_advanced(key):
     match = re.search(r'@([\d\.]+):(\d+)', key)
@@ -3603,3 +3895,4 @@ if __name__ == '__main__':
     print(f"[main] 🚀 Запуск веб-сервера на порту 10000")
     from waitress import serve
     serve(app, host='0.0.0.0', port=10000, threads=4, connection_limit=100)
+        
