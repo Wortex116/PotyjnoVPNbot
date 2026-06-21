@@ -961,6 +961,7 @@ def cabinet(message):
     if message.chat.type != 'private':
         return
     user_id = message.from_user.id
+    current_time = int(time.time())
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
@@ -974,28 +975,48 @@ def cabinet(message):
         bot.reply_to(message, "❌ Используйте /start")
         return
     subscription_end = result[0]
-    current_time = int(time.time())
+    token = result[1]
+
     if subscription_end and subscription_end > current_time:
+        status = "✅ Активна"
         days_left = (subscription_end - current_time) // (24 * 60 * 60)
         hours_left = ((subscription_end - current_time) // 3600) % 24
+        time_left = f"{days_left} дн {hours_left} ч"
         expire_date = datetime.fromtimestamp(subscription_end).strftime("%d.%m.%Y в %H:%M")
         link = get_subscription_link(user_id)
-        status = "✅ Активна"
+        yandex_link = f"https://translate.yandex.ru/translate?url={link}"
     else:
-        days_left = 0
-        hours_left = 0
+        status = "❌ Не активна"
+        time_left = "Закончилась"
         expire_date = "Закончилась"
         link = "❌ Нет активной подписки"
-        status = "❌ Не активна"
-    text = (
-        f"👤 Личный кабинет\n\n"
-        f"🆔 ID: {user_id}\n"
-        f"📅 Подписка до: {expire_date}\n"
-        f"⏳ Осталось: {days_left} дн {hours_left} ч\n"
-        f"📊 Статус: {status}\n"
-        f"🔗 Ссылка: {link}"
+        yandex_link = "❌ Нет активной подписки"
+
+    text = f"""👤 *Личный кабинет*
+
+🆔 ID: `{user_id}`
+
+📅 Подписка до: `{expire_date}`
+⏳ Осталось: `{time_left}`
+📊 Статус: {status}
+
+┌ 🔗 *Ссылка для импорта:*
+│ `{link}`
+│
+├ 🔄 *Для белых списков:*
+│ `{yandex_link}`
+│
+└ ℹ️ *Ссылка автообновляется при белых списках*
+
+💬 Поддержка: {SUPPORT}"""
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
+        types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
     )
-    bot.reply_to(message, text)
+
+    bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
 def my_subscription(message):
@@ -1003,11 +1024,12 @@ def my_subscription(message):
     if message.chat.type != 'private':
         return
     user_id = message.from_user.id
+    current_time = int(time.time())
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
     if not is_subscribed(user_id):
-        bot.reply_to(message, "⚠️ Подпишитесь на канал.", reply_markup=subscribe_button())
+        bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
         return
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1015,11 +1037,84 @@ def my_subscription(message):
     result = cur.fetchone()
     cur.close()
     conn.close()
-    if not result or not result[0] or result[0] < int(time.time()):
-        bot.reply_to(message, f"❌ Подписка неактивна. Обратитесь: {SUPPORT}")
+    if not result:
+        bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
         return
+    subscription_end = result[0]
+    if subscription_end and subscription_end > current_time:
+        link = get_subscription_link(user_id)
+        yandex_link = f"https://translate.yandex.ru/translate?url={link}"
+
+        text = f"""📡 *Моя подписка*
+
+┌ 🔗 *Обычная ссылка:*
+│ `{link}`
+│
+├ 🔄 *Для белых списков:*
+│ `{yandex_link}`
+│
+└ ℹ️ *Ссылка автообновляется при белых списках*
+   *Используйте её для импорта в клиент*
+
+📱 *Поддерживаемые клиенты:*
+• V2Ray / V2RayNG
+• Hiddify / Nekobox
+• FlClash / Mihomo
+• Clash Meta / Sing-Box
+
+💬 Поддержка: {SUPPORT}"""
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
+            types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
+        )
+
+        bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        bot.reply_to(
+            message,
+            f"❌ Ваша подписка неактивна или истекла.\n\nДля продления обратитесь к администратору:\n{SUPPORT}"
+        )
+
+# ==================== КОЛБЭКИ ДЛЯ КОПИРОВАНИЯ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_link_'))
+def callback_copy_link(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+
+    if user_id != target_id:
+        bot.answer_callback_query(call.id, "❌ Это не ваша ссылка.")
+        return
+
     link = get_subscription_link(user_id)
-    bot.reply_to(message, f"🔗 Ссылка для импорта:\n\n{link}")
+
+    bot.send_message(
+        user_id,
+        f"📋 *Обычная ссылка:*\n\n`{link}`\n\nНажмите на сообщение и скопируйте текст.",
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, "✅ Ссылка отправлена!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_yandex_'))
+def callback_copy_yandex(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+
+    if user_id != target_id:
+        bot.answer_callback_query(call.id, "❌ Это не ваша ссылка.")
+        return
+
+    link = get_subscription_link(user_id)
+    yandex_link = f"https://translate.yandex.ru/translate?url={link}"
+
+    bot.send_message(
+        user_id,
+        f"🔄 *Ссылка для белых списков:*\n\n`{yandex_link}`\n\nНажмите на сообщение и скопируйте текст.\n\nℹ️ Ссылка автообновляется при белых списках.",
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, "✅ Ссылка для белых списков отправлена!")
 
 @bot.message_handler(func=lambda m: m.text == "👥 Рефералы")
 def referrals(message):
@@ -1118,7 +1213,7 @@ def _parse_subscription_any(raw, steps=None):
     if steps is None:
         steps = []
     text = raw.strip()
-    
+
     # BELKA.NETWORK
     if 'belka.network' in text:
         steps.append(f"🔗 Обнаружена ссылка Belka VPN")
@@ -1176,7 +1271,7 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка: {e}")
             return [], steps
-    
+
     # CRYPT5
     crypt5_match = re.match(r'^(?:happ|incy)://crypt5/+(.+)$', text, re.IGNORECASE)
     if crypt5_match:
@@ -1208,7 +1303,7 @@ def _parse_subscription_any(raw, steps=None):
             return [], steps
         steps.append("❌ Не удалось расшифровать crypt5")
         return [], steps
-    
+
     # СХЕМЫ ПРИЛОЖЕНИЙ
     app_scheme_match = re.match(r'^(?:' + APP_SCHEMES + r')://(?:add|sub|crypt\d*|import|install|update|get|fetch)/+(.+)$', text, re.IGNORECASE)
     if app_scheme_match:
@@ -1240,7 +1335,7 @@ def _parse_subscription_any(raw, steps=None):
         if keys:
             return _dedup(keys), steps
         return [], steps
-    
+
     # HTTP URL
     if re.match(r'^https?://', text, re.IGNORECASE):
         steps.append(f"⬇️ Загружаю URL...")
@@ -1286,7 +1381,7 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка: {e}")
             return [], steps
-    
+
     # ОБЫЧНЫЙ ТЕКСТ
     keys = load_keys_from_text(text)
     if not keys:
@@ -1652,7 +1747,7 @@ def callback_user_detail(call):
         return
     user_id = call.from_user.id
     target_id = int(call.data.split('_')[1])
-    
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = %s", (target_id,))
@@ -1662,7 +1757,7 @@ def callback_user_detail(call):
     if not result:
         bot.answer_callback_query(call.id, "❌ Не найден")
         return
-    
+
     subscription_end, blk = result
     current_time = int(time.time())
     if blk: status = "🚫 Заблокирован"
@@ -1670,7 +1765,7 @@ def callback_user_detail(call):
         days_left = (subscription_end - current_time) // (24 * 60 * 60)
         status = f"🟢 Активен ({days_left} дн)"
     else: status = "🔴 Неактивен"
-    
+
     name = get_user_display_name(target_id)
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -1682,7 +1777,7 @@ def callback_user_detail(call):
     else:
         kb.add(types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{target_id}"))
     kb.row(types.InlineKeyboardButton("🔙 Назад", callback_data="back_to_list"), types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage"))
-    
+
     text = f"👤 *{name}*\n🆔 ID: `{target_id}`\n📊 Статус: {status}"
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
     bot.answer_callback_query(call.id)
@@ -1766,7 +1861,7 @@ def callback_autopost(call):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
     data = call.data
-    
+
     if data == "autopost_load_keys":
         bot.answer_callback_query(call.id, "📥 Отправьте ключи")
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -1774,7 +1869,7 @@ def callback_autopost(call):
         msg = bot.send_message(user_id, "📥 Отправляйте ключи.\nКогда закончите - нажмите Завершить.", reply_markup=kb)
         autopost_loading[user_id] = {'keys': [], 'message_id': msg.message_id}
         return
-    
+
     if data == "autopost_load_finish":
         if user_id not in autopost_loading:
             bot.answer_callback_query(call.id, "❌ Нет загрузки")
@@ -1788,7 +1883,7 @@ def callback_autopost(call):
         bot.answer_callback_query(call.id, f"✅ Сохранено {len(keys)}")
         callback_autopost(call)
         return
-    
+
     if data == "autopost_start":
         keys = get_keys_from_db()
         if not keys:
@@ -1801,7 +1896,7 @@ def callback_autopost(call):
         auto_post_keys_to_channel()
         callback_autopost(call)
         return
-    
+
     if data == "autopost_channel_settings":
         config = get_autopost_config()
         text = f"⚙️ *Канал*\n\n📢 Текущий: {config['channel_id']}\n📝 Ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}"
@@ -1809,13 +1904,13 @@ def callback_autopost(call):
         kb.add(types.InlineKeyboardButton("📢 Сменить", callback_data="autopost_change_channel"), types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back"))
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
         return
-    
+
     if data == "autopost_change_channel":
         bot.answer_callback_query(call.id, "🔄 Отправьте новый канал")
         bot.send_message(user_id, "📢 Отправьте ссылку или ID канала.\nПример: `-1001234567890` или `@channel`", parse_mode="Markdown")
         search_cache[user_id] = {'action': 'autopost_set_channel'}
         return
-    
+
     if data == "autopost_interval_settings":
         config = get_autopost_config()
         text = f"⏱ *Интервал*\n\n⏱ Текущий: {config['interval'] // 60} мин"
@@ -1823,13 +1918,13 @@ def callback_autopost(call):
         kb.add(types.InlineKeyboardButton("⏱ Изменить", callback_data="autopost_set_interval"), types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back"))
         bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
         return
-    
+
     if data == "autopost_set_interval":
         bot.answer_callback_query(call.id, "⏱ Введите минуты")
         bot.send_message(user_id, "⏱ Введите интервал в минутах (5-1440):", parse_mode="Markdown")
         search_cache[user_id] = {'action': 'autopost_set_interval'}
         return
-    
+
     if data == "autopost_back":
         config = get_autopost_config()
         status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
@@ -1940,7 +2035,105 @@ def auto_post_keys_to_channel():
     if not working:
         working = keys[:1]
     key = working[0]
-    formatted = f"🚀 *VPN Ключ*\n\n`{key}`\n\n🔗 @ciorsa"
+    
+    # Определяем страну и протокол
+    country = "🌍"
+    protocol = "VLESS"
+    ip = "Unknown"
+    
+    # Парсим название
+    name_match = re.search(r'#([^#\s]+)', key)
+    if name_match:
+        name_raw = name_match.group(1)
+        name = urllib.parse.unquote(name_raw)
+        name = re.sub(r'\|.*$', '', name)
+        name = re.sub(r'@\w+', '', name)
+        name = name.strip()
+        
+        # Определяем страну
+        countries = {
+            '🇺🇸': ['us', 'usa', 'united states', 'america', 'new york', 'los angeles', 'miami', 'chicago'],
+            '🇬🇧': ['uk', 'united kingdom', 'britain', 'london', 'manchester'],
+            '🇩🇪': ['de', 'germany', 'deutschland', 'berlin', 'frankfurt', 'munich'],
+            '🇫🇷': ['fr', 'france', 'paris', 'lyon', 'marseille'],
+            '🇷🇺': ['ru', 'russia', 'moscow', 'st petersburg', 'novosibirsk'],
+            '🇨🇳': ['cn', 'china', 'beijing', 'shanghai', 'guangzhou'],
+            '🇯🇵': ['jp', 'japan', 'tokyo', 'osaka', 'nagoya'],
+            '🇸🇬': ['sg', 'singapore'],
+            '🇳🇱': ['nl', 'netherlands', 'amsterdam', 'rotterdam'],
+            '🇨🇦': ['ca', 'canada', 'toronto', 'vancouver', 'montreal'],
+            '🇦🇺': ['au', 'australia', 'sydney', 'melbourne', 'brisbane'],
+            '🇮🇳': ['in', 'india', 'mumbai', 'delhi', 'bangalore'],
+            '🇧🇷': ['br', 'brazil', 'sao paulo', 'rio de janeiro'],
+            '🇹🇷': ['tr', 'turkey', 'istanbul', 'ankara', 'izmir'],
+            '🇮🇹': ['it', 'italy', 'rome', 'milan', 'naples'],
+            '🇪🇸': ['es', 'spain', 'madrid', 'barcelona', 'valencia'],
+            '🇵🇱': ['pl', 'poland', 'warsaw', 'krakow', 'wroclaw'],
+            '🇺🇦': ['ua', 'ukraine', 'kyiv', 'kharkiv', 'odessa'],
+            '🇮🇱': ['il', 'israel', 'tel aviv', 'jerusalem'],
+            '🇦🇪': ['ae', 'uae', 'dubai', 'abu dhabi'],
+        }
+        name_lower = name.lower()
+        for flag, keywords in countries.items():
+            for keyword in keywords:
+                if keyword in name_lower:
+                    country = flag
+                    break
+            if country != "🌍":
+                break
+    
+    # Парсим IP
+    ip_match = re.search(r'@([^:]+):(\d+)', key)
+    if ip_match:
+        ip = ip_match.group(1)
+    
+    # Парсим протокол
+    protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
+    if protocol_match:
+        protocol = protocol_match.group(1).upper()
+    
+    # Определяем скорость по пингу
+    speed = "100+ Mbps"
+    if latency and latency < 50:
+        speed = "100+ Mbps"
+    elif latency and latency < 100:
+        speed = "50-100 Mbps"
+    elif latency and latency < 200:
+        speed = "20-50 Mbps"
+    elif latency and latency < 500:
+        speed = "5-20 Mbps"
+    else:
+        speed = "1-5 Mbps"
+    
+    protocol_icons = {
+        'VLESS': '🔹',
+        'VMESS': '🔸',
+        'TROJAN': '🟣',
+        'SS': '🟢',
+        'SSR': '🟡',
+        'HYSTERIA': '🟠',
+        'TUIC': '🔵',
+        'WIREGUARD': '🟩',
+    }
+    proto_icon = protocol_icons.get(protocol, '🔹')
+    
+    moscow_time = datetime.now() + timedelta(hours=3)
+    
+    formatted = f"""🚀 #1 | {country} {country}
+
+┌ 🏷 Название: {country} {country} | @ciorsa
+├ 🔗 Протокол: {proto_icon} {protocol}
+├ 📡 Пинг: {latency} ms
+├ ⚡ Скорость: {speed}
+├ 🌍 Город: {country}
+└ 🏢 Провайдер: {ip}
+
+🔑 Ключ для подключения:
+`{key}`
+
+⏱ Проверено: {moscow_time.strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot
+🔗 @ciorsa"""
+    
     try:
         if topic_id:
             bot.send_message(channel_id, formatted, parse_mode="Markdown", message_thread_id=topic_id)
@@ -2091,7 +2284,7 @@ def cmd_priority_handler(message):
         del autopost_loading[user_id]
     if user_id in announce_data:
         del announce_data[user_id]
-    
+
     if command == '/admin':
         admin_panel(message)
     elif command == '/check':
@@ -2365,6 +2558,12 @@ def handle_private_messages(message):
     if text.startswith('/'):
         return
 
+    # ПРИОРИТЕТ 1: РАССЫЛКА
+    if user_id in announce_data:
+        admin_announce_text(message)
+        return
+
+    # ПРИОРИТЕТ 2: ЗАГРУЗКА КЛЮЧЕЙ (АДМИН)
     if user_id in admin_keys_loading:
         raw = message.text or message.caption or ''
         keys = load_keys_from_text(raw) if raw else []
@@ -2383,6 +2582,12 @@ def handle_private_messages(message):
             bot.reply_to(message, "❌ Не найдено ключей")
         return
 
+    # ПРИОРИТЕТ 3: ЗАГРУЗКА КЛЮЧЕЙ (АВТОПОСТИНГ)
+    if user_id in autopost_loading:
+        handle_autopost_load_keys(message)
+        return
+
+    # ПРИОРИТЕТ 4: РАСШИФРОВКА
     if user_id in decrypt_results and decrypt_results[user_id].get('waiting'):
         if message.document:
             try:
@@ -2396,6 +2601,7 @@ def handle_private_messages(message):
             _do_decrypt(message, user_id, text=text)
         return
 
+    # РЕЖИМ ПРОВЕРКИ КЛЮЧЕЙ
     if user_id in check_results and check_results[user_id].get('waiting'):
         if message.document:
             try:
@@ -2425,6 +2631,7 @@ def handle_private_messages(message):
             t.start()
         return
 
+    # РЕЖИМ ПРОВЕРКИ ПРОКСИ
     if user_id in proxy_check_results and proxy_check_results[user_id].get('waiting'):
         if message.document:
             try:
@@ -2440,14 +2647,7 @@ def handle_private_messages(message):
             _process_proxies(message, raw_text, user_id)
         return
 
-    if user_id in autopost_loading:
-        handle_autopost_load_keys(message)
-        return
-
-    if user_id in announce_data:
-        admin_announce_text(message)
-        return
-
+    # НАСТРОЙКИ АВТОПОСТИНГА
     if user_id in search_cache:
         action = search_cache.get(user_id, {}).get('action', '')
         if action == 'autopost_set_channel':
@@ -2668,3 +2868,4 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
+    
