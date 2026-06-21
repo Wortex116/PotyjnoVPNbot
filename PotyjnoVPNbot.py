@@ -1916,11 +1916,6 @@ def admin_menu():
 
 # ==================== ADMINS COMMANDS ====================
 
-def admin_back_button():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back"))
-    return kb
-
 @bot.message_handler(commands=['admin'])
 def admin_panel(message):
     if message.chat.type != 'private':
@@ -1938,32 +1933,70 @@ def admin_callback(call):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
 
-    if call.data == "admin_back":
-        bot.edit_message_text("🏛️ Админ панель:", call.message.chat.id, call.message.message_id, reply_markup=admin_menu())
+    data = call.data
+
+    # ====== ГЛАВНОЕ МЕНЮ ======
+    if data == "admin_back":
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        bot.send_message(user_id, "🏠 Главное меню", reply_markup=main_menu())
         bot.answer_callback_query(call.id)
         return
 
-    # ====== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (MANAGE) ======
-    if call.data == "admin_manage_users":
+    # ====== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ======
+    if data == "admin_manage_users":
         bot.answer_callback_query(call.id)
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
         # Создаем фейковое сообщение для cmd_manage
         fake_msg = types.Message(
-            message_id=call.message.message_id,
+            message_id=call.message.message_id + 1,
             date=int(time.time()),
             chat=call.message.chat,
             from_user=call.from_user,
             text="/manage"
         )
-        # Запускаем manage
         cmd_manage(fake_msg)
         return
 
-    if call.data == "admin_manage_admins":
+    # ====== РАССЫЛКА ======
+    if data == "admin_announce":
         bot.answer_callback_query(call.id)
-        bot.send_message(user_id, "👥 *Управление админами*\n\nИспользуйте команды:\n`/add_admin <ID>` — добавить админа\n`/remove_admin <ID>` — удалить админа\n`/admins` — список админов", parse_mode="Markdown")
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📨 В ЛС бота", callback_data="announce_dm"),
+            types.InlineKeyboardButton("📢 В каналы/чаты", callback_data="announce_channels"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back")
+        )
+        bot.edit_message_text(
+            "📢 *Рассылка*\n\nВыберите куда отправить объявление:",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
 
-    if call.data == "admin_stats":
+    # ====== УПРАВЛЕНИЕ АДМИНАМИ ======
+    if data == "admin_manage_admins":
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            user_id,
+            "👥 *Управление админами*\n\n"
+            "Используйте команды:\n"
+            "`/add_admin <ID>` — добавить админа\n"
+            "`/remove_admin <ID>` — удалить админа\n"
+            "`/admins` — список админов",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ====== СТАТИСТИКА ======
+    if data == "admin_stats":
         stats = get_bot_stats()
         total_users = 0
         conn = get_db_connection()
@@ -1982,36 +2015,357 @@ def admin_callback(call):
             f"🔓 Расшифровано подписок: {stats['total_decryptions']}\n"
             f"🗑️ Выдано ключей: {stats['total_keys_issued']}"
         )
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=admin_menu())
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=admin_menu()
+        )
         bot.answer_callback_query(call.id)
         return
 
-    if call.data == "admin_keys":
+    # ====== УПРАВЛЕНИЕ КЛЮЧАМИ ======
+    if data == "admin_keys":
         bot.answer_callback_query(call.id)
-        bot.send_message(user_id, "🔑 *Управление ключами*\n\nОтправьте файл или текст с ключами (vless://, vmess:// и др.)\nИли просто отправьте ссылку на подписку для загрузки.", parse_mode="Markdown")
+        bot.send_message(
+            user_id,
+            "🔑 *Управление ключами*\n\n"
+            "Отправьте файл или текст с ключами (vless://, vmess:// и др.)\n"
+            "Или просто отправьте ссылку на подписку для загрузки.",
+            parse_mode="Markdown"
+        )
         loading_sessions[user_id] = {'waiting': True}
         return
 
-    if call.data == "admin_block":
+    # ====== БЛОКИРОВКА ======
+    if data == "admin_block":
         bot.answer_callback_query(call.id)
-        bot.send_message(user_id, "🚫 *Блокировка пользователя*\n\nОтправьте ID пользователя для блокировки.\n\nПример: `123456789`", parse_mode="Markdown")
+        bot.send_message(
+            user_id,
+            "🚫 *Блокировка пользователя*\n\n"
+            "Отправьте ID пользователя для блокировки.\n\n"
+            "Пример: `123456789`",
+            parse_mode="Markdown"
+        )
         return
 
-    if call.data == "admin_announce":
+    # ====== АВТОПОСТИНГ ======
+    if data == "admin_autopost":
         bot.answer_callback_query(call.id)
-        bot.send_message(user_id, "📢 *Рассылка*\n\nОтправьте текст сообщения для рассылки.\n\nБот отправит его всем зарегистрированным пользователям.")
-        announce_data[user_id] = {'waiting': True}
+        bot.send_message(
+            user_id,
+            "📡 *Автопостинг*\n\n"
+            "Используйте команды:\n"
+            "`/autopost` — управление каналами\n"
+            "`/autopost_enable` — включить\n"
+            "`/autopost_disable` — выключить\n"
+            "`/autopost_interval 1800` — интервал",
+            parse_mode="Markdown"
+        )
         return
 
-    if call.data == "admin_autopost":
-        bot.answer_callback_query(call.id)
-        bot.send_message(user_id, "📡 *Автопостинг*\n\nИспользуйте команды:\n`/autopost` — управление каналами\n`/autopost_enable` — включить\n`/autopost_disable` — выключить\n`/autopost_interval 1800` — интервал", parse_mode="Markdown")
+# ==================== ОБРАБОТЧИКИ РАССЫЛКИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_dm")
+def callback_announce_dm(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
 
-    if call.data == "admin_back":
-        bot.edit_message_text("🏛️ Админ панель:", call.message.chat.id, call.message.message_id, reply_markup=admin_menu())
-        bot.answer_callback_query(call.id)
+    bot.answer_callback_query(call.id, "📝 Отправьте текст или медиа")
+    bot.send_message(
+        user_id,
+        "📨 *Рассылка в ЛС*\n\n"
+        "Отправьте текст, фото или видео для рассылки всем пользователям.",
+        parse_mode="Markdown"
+    )
+    announce_data[user_id] = {'type': 'dm', 'waiting': True}
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_channels")
+def callback_announce_channels(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
+
+    bot.answer_callback_query(call.id)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT channel_id, channel_name, topic_id FROM autopost_channels WHERE enabled = TRUE")
+    channels = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not channels:
+        bot.send_message(user_id, "❌ Нет активных каналов.")
+        return
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch_id, ch_name, topic_id in channels:
+        label = f"📢 {ch_name}"
+        if topic_id and topic_id != 0:
+            label += f" (ветка {topic_id})"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"announce_to_channel_{ch_id}"))
+
+    kb.add(types.InlineKeyboardButton("📢 Во все каналы", callback_data="announce_all_channels"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_announce"))
+
+    bot.edit_message_text(
+        "📢 *Выберите канал для объявления*",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('announce_to_channel_'))
+def callback_announce_to_channel(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    channel_id = int(call.data.split('_')[3])
+
+    bot.answer_callback_query(call.id, "📝 Отправьте текст или медиа")
+    bot.send_message(
+        user_id,
+        f"📢 *Объявление в канал*\n\n"
+        f"Отправьте текст, фото или видео для публикации.\n"
+        f"ID канала: `{channel_id}`",
+        parse_mode="Markdown"
+    )
+    announce_data[user_id] = {'type': 'channel', 'channel_id': channel_id, 'waiting': True}
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_all_channels")
+def callback_announce_all_channels(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    bot.answer_callback_query(call.id, "📝 Отправьте текст или медиа")
+    bot.send_message(
+        user_id,
+        "📢 *Объявление во все каналы*\n\n"
+        "Отправьте текст, фото или видео для публикации во все активные каналы.",
+        parse_mode="Markdown"
+    )
+    announce_data[user_id] = {'type': 'all_channels', 'waiting': True}
+
+# ==================== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ РАССЫЛКИ ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data)
+def admin_announce_text(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    if user_id not in announce_data:
+        return
+
+    data = announce_data[user_id]
+    del announce_data[user_id]
+
+    announce_type = data.get('type', 'dm')
+    text = message.text
+    caption = message.caption or ''
+
+    if announce_type == 'dm':
+        if not text and not message.photo and not message.video and not message.document:
+            bot.reply_to(message, "❌ Отправьте текст или медиа.")
+            return
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users")
+        users = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        sent = 0
+        failed = 0
+        for (uid,) in users:
+            try:
+                if message.photo:
+                    bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
+                elif message.video:
+                    bot.send_video(uid, message.video.file_id, caption=caption)
+                elif message.document:
+                    bot.send_document(uid, message.document.file_id, caption=caption)
+                elif text:
+                    bot.send_message(uid, text)
+                sent += 1
+            except:
+                failed += 1
+
+        bot.reply_to(message, f"📢 Рассылка в ЛС завершена!\n✅ Отправлено: {sent}\n❌ Не доставлено: {failed}")
+        return
+
+    elif announce_type == 'channel':
+        channel_id = data.get('channel_id')
+        if not channel_id:
+            bot.reply_to(message, "❌ Канал не выбран.")
+            return
+
+        try:
+            if message.photo:
+                bot.send_photo(channel_id, message.photo[-1].file_id, caption=caption)
+            elif message.video:
+                bot.send_video(channel_id, message.video.file_id, caption=caption)
+            elif message.document:
+                bot.send_document(channel_id, message.document.file_id, caption=caption)
+            elif text:
+                bot.send_message(channel_id, text)
+            bot.reply_to(message, f"✅ Объявление отправлено в канал.")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка: {e}")
+        return
+
+    elif announce_type == 'all_channels':
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT channel_id, topic_id FROM autopost_channels WHERE enabled = TRUE")
+        channels = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not channels:
+            bot.reply_to(message, "❌ Нет активных каналов.")
+            return
+
+        sent = 0
+        failed = 0
+        for ch_id, topic_id in channels:
+            try:
+                if topic_id and topic_id != 0:
+                    if message.photo:
+                        bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption, message_thread_id=topic_id)
+                    elif message.video:
+                        bot.send_video(ch_id, message.video.file_id, caption=caption, message_thread_id=topic_id)
+                    elif message.document:
+                        bot.send_document(ch_id, message.document.file_id, caption=caption, message_thread_id=topic_id)
+                    elif text:
+                        bot.send_message(ch_id, text, message_thread_id=topic_id)
+                else:
+                    if message.photo:
+                        bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption)
+                    elif message.video:
+                        bot.send_video(ch_id, message.video.file_id, caption=caption)
+                    elif message.document:
+                        bot.send_document(ch_id, message.document.file_id, caption=caption)
+                    elif text:
+                        bot.send_message(ch_id, text)
+                sent += 1
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"[announce] Ошибка в канал {ch_id}: {e}")
+                failed += 1
+
+        bot.reply_to(message, f"📢 Рассылка в каналы завершена!\n✅ Отправлено в {sent} каналов\n❌ Ошибок: {failed}")
+        return
+
+# ==================== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ АДМИНОВ ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in loading_sessions)
+def admin_load_keys(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    if user_id not in loading_sessions:
+        return
+    del loading_sessions[user_id]
+    raw_text = message.text or message.caption or ''
+    if message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(file.file_path)
+            text = file_bytes.decode('utf-8', errors='ignore')
+            keys = load_keys_from_text(text)
+            _finish_update_keys(message, keys, "файл")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+        return
+    if raw_text.strip().startswith('http'):
+        keys = load_keys_from_url(raw_text.strip())
+        _finish_update_keys(message, keys, f"URL: {raw_text[:50]}...")
+        return
+    if raw_text.strip():
+        keys = load_keys_from_text(raw_text)
+        _finish_update_keys(message, keys, "текст")
+        return
+    bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
+
+@bot.message_handler(commands=['add_admin'])
+def add_admin(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Использование: /add_admin <ID>")
+            return
+        new_admin_id = int(parts[1])
+        if new_admin_id == ADMIN_ID:
+            bot.reply_to(message, "❌ Это создатель.")
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO admins (user_id, added_by, added_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+            (new_admin_id, user_id, int(time.time()))
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        bot.reply_to(message, f"✅ Админ {new_admin_id} добавлен.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['remove_admin'])
+def remove_admin(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Использование: /remove_admin <ID>")
+            return
+        remove_id = int(parts[1])
+        if remove_id == ADMIN_ID:
+            bot.reply_to(message, "❌ Нельзя удалить создателя.")
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admins WHERE user_id = %s", (remove_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        bot.reply_to(message, f"✅ Админ {remove_id} удален.")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['admins'])
+def list_admins(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    text = "👥 *Список админов:*\n\n"
+    text += f"👑 Создатель: {ADMIN_ID}\n"
+    for uid, added_by, added_at in rows:
+        date = datetime.fromtimestamp(added_at).strftime("%d.%m.%Y")
+        text += f"└ {uid} (добавлен {date})\n"
+    bot.reply_to(message, text, parse_mode="Markdown")
 
 # ==================== MANAGE ====================
 
@@ -2104,17 +2458,14 @@ def callback_manage_filters(call):
         bot.answer_callback_query(call.id)
         return
 
-    # ====== ВОЗВРАТ В АДМИН-ПАНЕЛЬ ======
     if data == 'admin_back':
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
         except:
             pass
-        # Открываем админ-панель
         admin_panel(call.message)
         bot.answer_callback_query(call.id)
         return
-    # ===================================
 
     if data == 'top_refs_admin':
         conn = get_db_connection()
@@ -2377,461 +2728,6 @@ def callback_remove_admin_cb(call):
     except:
         pass
 
-# ==================== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ АДМИНОВ ====================
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in loading_sessions)
-def admin_load_keys(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    if user_id not in loading_sessions:
-        return
-    del loading_sessions[user_id]
-    raw_text = message.text or message.caption or ''
-    if message.document:
-        try:
-            file = bot.get_file(message.document.file_id)
-            file_bytes = bot.download_file(file.file_path)
-            text = file_bytes.decode('utf-8', errors='ignore')
-            keys = load_keys_from_text(text)
-            _finish_update_keys(message, keys, "файл")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
-        return
-    if raw_text.strip().startswith('http'):
-        keys = load_keys_from_url(raw_text.strip())
-        _finish_update_keys(message, keys, f"URL: {raw_text[:50]}...")
-        return
-    if raw_text.strip():
-        keys = load_keys_from_text(raw_text)
-        _finish_update_keys(message, keys, "текст")
-        return
-    bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data)
-def admin_announce_text(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    if user_id not in announce_data:
-        return
-    del announce_data[user_id]
-    text = message.text
-    if not text:
-        bot.reply_to(message, "❌ Отправьте текст.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users")
-    users = cur.fetchall()
-    cur.close()
-    conn.close()
-    sent = 0
-    failed = 0
-    for (uid,) in users:
-        try:
-            bot.send_message(uid, text)
-            sent += 1
-        except:
-            failed += 1
-    bot.reply_to(message, f"📢 Рассылка завершена!\n✅ Отправлено: {sent}\n❌ Не доставлено: {failed}")
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data, content_types=['photo', 'video', 'document', 'audio', 'voice'])
-def admin_announce_media(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    if user_id not in announce_data:
-        return
-    del announce_data[user_id]
-    caption = message.caption or ''
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id FROM users")
-    users = cur.fetchall()
-    cur.close()
-    conn.close()
-    sent = 0
-    failed = 0
-    for (uid,) in users:
-        try:
-            if message.photo:
-                bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
-            elif message.video:
-                bot.send_video(uid, message.video.file_id, caption=caption)
-            elif message.document:
-                bot.send_document(uid, message.document.file_id, caption=caption)
-            elif message.audio:
-                bot.send_audio(uid, message.audio.file_id, caption=caption)
-            elif message.voice:
-                bot.send_voice(uid, message.voice.file_id, caption=caption)
-            sent += 1
-        except:
-            failed += 1
-    bot.reply_to(message, f"📢 Рассылка завершена!\n✅ Отправлено: {sent}\n❌ Не доставлено: {failed}")
-
-@bot.message_handler(commands=['add_admin'])
-def add_admin(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /add_admin <ID>")
-            return
-        new_admin_id = int(parts[1])
-        if new_admin_id == ADMIN_ID:
-            bot.reply_to(message, "❌ Это создатель.")
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO admins (user_id, added_by, added_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
-            (new_admin_id, user_id, int(time.time()))
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
-        bot.reply_to(message, f"✅ Админ {new_admin_id} добавлен.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['remove_admin'])
-def remove_admin(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /remove_admin <ID>")
-            return
-        remove_id = int(parts[1])
-        if remove_id == ADMIN_ID:
-            bot.reply_to(message, "❌ Нельзя удалить создателя.")
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM admins WHERE user_id = %s", (remove_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        bot.reply_to(message, f"✅ Админ {remove_id} удален.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['admins'])
-def list_admins(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-    text = "👥 *Список админов:*\n\n"
-    text += f"👑 Создатель: {ADMIN_ID}\n"
-    for uid, added_by, added_at in rows:
-        date = datetime.fromtimestamp(added_at).strftime("%d.%m.%Y")
-        text += f"└ {uid} (добавлен {date})\n"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['set_referral'])
-def set_referral(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /set_referral 0 или 1")
-            return
-        val = parts[1]
-        if val not in ('0', '1'):
-            bot.reply_to(message, "Введите 0 или 1")
-            return
-        set_setting('referral_enabled', val)
-        status = "включена" if val == '1' else "отключена"
-        bot.reply_to(message, f"✅ Реферальная система {status}.")
-    except:
-        bot.reply_to(message, "❌ Ошибка.")
-
-@bot.message_handler(commands=['set_autopost'])
-def set_autopost(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /set_autopost 0 или 1")
-            return
-        val = parts[1]
-        if val not in ('0', '1'):
-            bot.reply_to(message, "Введите 0 или 1")
-            return
-        set_setting('autopost_enabled', val)
-        status = "включен" if val == '1' else "отключен"
-        bot.reply_to(message, f"✅ Автопостинг {status}.")
-    except:
-        bot.reply_to(message, "❌ Ошибка.")
-
-@bot.message_handler(commands=['set_interval'])
-def set_interval(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /set_interval <секунды>")
-            return
-        interval = int(parts[1])
-        if interval < 60:
-            bot.reply_to(message, "❌ Минимум 60 секунд.")
-            return
-        set_setting('autopost_interval', str(interval))
-        bot.reply_to(message, f"✅ Интервал автопостинга установлен на {interval} секунд.")
-    except:
-        bot.reply_to(message, "❌ Ошибка.")
-
-@bot.message_handler(commands=['autopost'])
-def autopost_management(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) == 1:
-            bot.reply_to(
-                message,
-                "📡 *Управление автопостингом*\n\n"
-                "Команды:\n"
-                "`/autopost` — список каналов\n"
-                "`/autopost_add <channel_id> <topic_id>` — добавить канал\n"
-                "`/autopost_remove <channel_id>` — удалить канал\n"
-                "`/autopost_enable <channel_id>` — включить канал\n"
-                "`/autopost_disable <channel_id>` — отключить канал\n"
-                "`/autopost_interval <секунды>` — интервал\n"
-                "`/autopost_access <user_id> <channel_id>` — дать доступ\n"
-                "`/autopost_revoke <user_id> <channel_id>` — забрать доступ\n\n"
-                "Каналы по умолчанию: `-1003668283208`",
-                parse_mode="Markdown"
-            )
-            return
-
-        if parts[1] == "add":
-            if len(parts) < 3:
-                bot.reply_to(message, "Использование: /autopost_add <channel_id> <topic_id>")
-                return
-            channel_id = int(parts[2])
-            topic_id = int(parts[3]) if len(parts) > 3 else 0
-            try:
-                chat = bot.get_chat(channel_id)
-                name = chat.title or str(channel_id)
-            except:
-                name = str(channel_id)
-            add_channel(channel_id, name, topic_id, user_id)
-            bot.reply_to(message, f"✅ Канал {name} добавлен.")
-
-        elif parts[1] == "remove":
-            if len(parts) < 3:
-                bot.reply_to(message, "Использование: /autopost_remove <channel_id>")
-                return
-            channel_id = int(parts[2])
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("DELETE FROM autopost_channels WHERE channel_id = %s", (channel_id,))
-            conn.commit()
-            cur.close()
-            conn.close()
-            bot.reply_to(message, f"✅ Канал {channel_id} удален.")
-
-        elif parts[1] == "enable":
-            if len(parts) < 3:
-                bot.reply_to(message, "Использование: /autopost_enable <channel_id>")
-                return
-            channel_id = int(parts[2])
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("UPDATE autopost_channels SET enabled = TRUE WHERE channel_id = %s", (channel_id,))
-            conn.commit()
-            cur.close()
-            conn.close()
-            bot.reply_to(message, f"✅ Канал {channel_id} включен.")
-
-        elif parts[1] == "disable":
-            if len(parts) < 3:
-                bot.reply_to(message, "Использование: /autopost_disable <channel_id>")
-                return
-            channel_id = int(parts[2])
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("UPDATE autopost_channels SET enabled = FALSE WHERE channel_id = %s", (channel_id,))
-            conn.commit()
-            cur.close()
-            conn.close()
-            bot.reply_to(message, f"✅ Канал {channel_id} отключен.")
-
-        elif parts[1] == "interval":
-            if len(parts) < 3:
-                bot.reply_to(message, "Использование: /autopost_interval <секунды>")
-                return
-            interval = int(parts[2])
-            set_setting('autopost_interval', str(interval))
-            bot.reply_to(message, f"✅ Интервал установлен на {interval} секунд.")
-
-        elif parts[1] == "access":
-            if len(parts) < 4:
-                bot.reply_to(message, "Использование: /autopost_access <user_id> <channel_id>")
-                return
-            target_user = int(parts[2])
-            channel_id = int(parts[3])
-            grant_channel_access(target_user, channel_id, can_manage=True, can_announce=True, granted_by=user_id)
-            bot.reply_to(message, f"✅ Доступ для {target_user} к каналу {channel_id} предоставлен.")
-
-        elif parts[1] == "revoke":
-            if len(parts) < 4:
-                bot.reply_to(message, "Использование: /autopost_revoke <user_id> <channel_id>")
-                return
-            target_user = int(parts[2])
-            channel_id = int(parts[3])
-            remove_channel_access(target_user, channel_id)
-            bot.reply_to(message, f"✅ Доступ для {target_user} к каналу {channel_id} отозван.")
-
-        else:
-            bot.reply_to(message, "❌ Неизвестная команда. Используйте /autopost для справки.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['block'])
-def block_user(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /block <ID>")
-            return
-        target = int(parts[1])
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET is_blocked = 1 WHERE user_id = %s", (target,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        bot.reply_to(message, f"✅ Пользователь {target} заблокирован.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['unblock'])
-def unblock_user(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /unblock <ID>")
-            return
-        target = int(parts[1])
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET is_blocked = 0 WHERE user_id = %s", (target,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        bot.reply_to(message, f"✅ Пользователь {target} разблокирован.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['add_days'])
-def add_days(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 3:
-            bot.reply_to(message, "Использование: /add_days <ID> <дни>")
-            return
-        target = int(parts[1])
-        days = int(parts[2])
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target,))
-        result = cur.fetchone()
-        if not result:
-            bot.reply_to(message, "❌ Пользователь не найден.")
-            cur.close()
-            conn.close()
-            return
-        current_end = result[0] or int(time.time())
-        new_end = current_end + days * 24 * 60 * 60
-        cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, target))
-        conn.commit()
-        cur.close()
-        conn.close()
-        bot.reply_to(message, f"✅ Пользователю {target} добавлено {days} дней.")
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['user'])
-def user_info(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        return
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "Использование: /user <ID>")
-            return
-        target = int(parts[1])
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT subscription_end, is_blocked, token, last_activity FROM users WHERE user_id = %s", (target,))
-        result = cur.fetchone()
-        if not result:
-            bot.reply_to(message, "❌ Пользователь не найден.")
-            cur.close()
-            conn.close()
-            return
-        sub_end, blocked, token, last_act = result
-        sub_status = "Активна" if sub_end > int(time.time()) else "Не активна"
-        sub_date = datetime.fromtimestamp(sub_end).strftime("%d.%m.%Y %H:%M") if sub_end else "Нет"
-        last_act_date = datetime.fromtimestamp(last_act).strftime("%d.%m.%Y %H:%M") if last_act else "Никогда"
-        text = (
-            f"👤 *Информация о пользователе {target}*\n\n"
-            f"📅 Подписка до: {sub_date}\n"
-            f"📊 Статус: {sub_status}\n"
-            f"🔗 Токен: {token or 'Нет'}\n"
-            f"🚫 Блок: {'Да' if blocked else 'Нет'}\n"
-            f"🕐 Последняя активность: {last_act_date}"
-        )
-        bot.reply_to(message, text, parse_mode="Markdown")
-        cur.close()
-        conn.close()
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-@bot.message_handler(commands=['update_keys'])
-def cmd_update_keys(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        bot.reply_to(message, "❌ Только для администраторов.")
-        return
-    
-    bot.reply_to(
-        message,
-        "🔑 *Управление ключами*\n\n"
-        "Отправьте файл или текст с ключами (vless://, vmess:// и др.)\n"
-        "Или просто отправьте ссылку на подписку для загрузки.",
-        parse_mode="Markdown"
-    )
-    loading_sessions[user_id] = {'waiting': True}
 # ==================== ОБРАБОТЧИК ОСТАЛЬНЫХ СООБЩЕНИЙ ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private')
@@ -2970,4 +2866,4 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-            
+        
