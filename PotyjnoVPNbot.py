@@ -2303,6 +2303,9 @@ def admin_callback(call):
 
 # ==================== ЗАГРУЗКА КЛЮЧЕЙ (ADMIN KEYS SET) ====================
 
+# Хранилище для сессий загрузки ключей в админке
+admin_keys_loading = {}  # user_id -> {'keys': [], 'message_id': None, 'source': 'admin_keys_set'}
+
 @bot.callback_query_handler(func=lambda call: call.data == "admin_keys_set")
 def callback_admin_keys_set(call):
     user_id = call.from_user.id
@@ -2311,58 +2314,48 @@ def callback_admin_keys_set(call):
         return
     
     bot.answer_callback_query(call.id, "📥 Отправьте ключи")
-    bot.send_message(
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Завершить загрузку", callback_data="admin_keys_finish"),
+        types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_cancel")
+    )
+    
+    msg = bot.send_message(
         user_id,
         "📥 *Загрузка ключей*\n\n"
-        "Отправьте ключи одним из способов:\n"
+        "Отправляйте ключи по одному сообщению.\n"
+        "Поддерживаются:\n"
         "• Текст с ключами (vless://, vmess:// и др.)\n"
         "• .txt файл с ключами\n"
-        "• Прокси-ссылку\n\n"
-        "После загрузки ключи будут сохранены.",
-        parse_mode="Markdown"
+        "• Прокси-ссылку (https://happ.dska.su/...)\n\n"
+        "Когда закончите, нажмите *✅ Завершить загрузку*",
+        parse_mode="Markdown",
+        reply_markup=kb
     )
-    loading_sessions[user_id] = {'waiting': True, 'source': 'admin_keys_set'}
+    
+    admin_keys_loading[user_id] = {
+        'keys': [],
+        'message_id': msg.message_id,
+        'source': 'admin_keys_set'
+    }
     return
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in loading_sessions)
-def admin_load_keys_autopost(message):
-    user_id = message.from_user.id
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_finish")
+def callback_admin_keys_finish(call):
+    user_id = call.from_user.id
     if not is_admin(user_id):
-        return
-    if user_id not in loading_sessions:
-        return
-    
-    source = loading_sessions[user_id].get('source', 'admin_keys')
-    del loading_sessions[user_id]
-    
-    raw_text = message.text or message.caption or ''
-    
-    if message.document:
-        try:
-            file = bot.get_file(message.document.file_id)
-            file_bytes = bot.download_file(file.file_path)
-            text = file_bytes.decode('utf-8', errors='ignore')
-            keys = load_keys_from_text(text)
-            _finish_admin_keys_load(message, keys, "файл")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
     
-    if raw_text.strip().startswith('http'):
-        keys = load_keys_from_url(raw_text.strip())
-        _finish_admin_keys_load(message, keys, f"URL: {raw_text[:50]}...")
+    if user_id not in admin_keys_loading:
+        bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
         return
     
-    if raw_text.strip():
-        keys = load_keys_from_text(raw_text)
-        _finish_admin_keys_load(message, keys, "текст")
-        return
+    keys = admin_keys_loading[user_id]['keys']
     
-    bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
-
-def _finish_admin_keys_load(message, keys, source_label):
     if not keys:
-        bot.reply_to(message, "❌ Не найдено ни одного VPN ключа.")
+        bot.answer_callback_query(call.id, "❌ Нет загруженных ключей")
         return
     
     save_keys_to_db(keys)
@@ -2375,25 +2368,882 @@ def _finish_admin_keys_load(message, keys, source_label):
             proto_stats[p] = proto_stats.get(p, 0) + 1
     stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
     
-    bot.reply_to(
-        message,
+    bot.edit_message_text(
         f"✅ *Ключи загружены!*\n\n"
         f"📊 Загружено ключей: {len(keys)}\n"
         f"📋 По протоколам:\n{stats}\n"
         f"📦 Всего в базе: {len(get_keys_from_db())}",
+        call.message.chat.id,
+        call.message.message_id,
         parse_mode="Markdown"
     )
     
+    del admin_keys_loading[user_id]
+    bot.answer_callback_query(call.id, "✅ Ключи сохранены")
+    
     # Возврат в админ-панель
     fake_msg = types.Message(
-        message_id=message.message_id,
+        message_id=call.message.message_id,
         date=int(time.time()),
-        chat=message.chat,
-        from_user=message.from_user,
+        chat=call.message.chat,
+        from_user=call.from_user,
         text="/admin"
     )
     admin_panel(fake_msg)
     return
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_cancel")
+def callback_admin_keys_cancel(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    if user_id in admin_keys_loading:
+        del admin_keys_loading[user_id]
+    
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except:
+        pass
+    
+    bot.answer_callback_query(call.id, "❌ Отменено")
+    
+    # Возврат в админ-панель
+    fake_msg = types.Message(
+        message_id=call.message.message_id,
+        date=int(time.time()),
+        chat=call.message.chat,
+        from_user=call.from_user,
+        text="/admin"
+    )
+    admin_panel(fake_msg)
+    return
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in admin_keys_loading)
+def admin_load_keys_inline(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    if user_id not in admin_keys_loading:
+        return
+    
+    raw_text = message.text or message.caption or ''
+    new_keys = []
+    
+    if message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(file.file_path)
+            text = file_bytes.decode('utf-8', errors='ignore')
+            new_keys = load_keys_from_text(text)
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+            return
+    elif raw_text.strip().startswith('http'):
+        new_keys = load_keys_from_url(raw_text.strip())
+    elif raw_text.strip():
+        new_keys = load_keys_from_text(raw_text)
+    else:
+        bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
+        return
+    
+    if new_keys:
+        admin_keys_loading[user_id]['keys'].extend(new_keys)
+        admin_keys_loading[user_id]['keys'] = _dedup(admin_keys_loading[user_id]['keys'])
+        bot.reply_to(
+            message,
+            f"✅ Загружено {len(new_keys)} ключей.\n"
+            f"📊 Всего в списке: {len(admin_keys_loading[user_id]['keys'])} ключей\n\n"
+            "Продолжайте загрузку или нажмите *Завершить загрузку*"
+        )
+    else:
+        bot.reply_to(message, "❌ Не найдено ключей. Проверьте формат.")
+
+# ==================== АВТОПОСТИНГ (ОБРАБОТЧИКИ) ====================
+
+# Хранилище для сессий загрузки ключей в автопостинге
+autopost_loading = {}  # user_id -> {'keys': [], 'message_id': None}
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('autopost_'))
+def callback_autopost_handlers(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    data = call.data
+
+    # ====== НАЗАД В МЕНЮ АВТОПОСТИНГА ======
+    if data == "autopost_back":
+        bot.answer_callback_query(call.id)
+        callback_admin_autopost(call)
+        return
+
+    # ====== ЗАГРУЗКА КЛЮЧЕЙ ======
+    if data == "autopost_load_keys":
+        bot.answer_callback_query(call.id, "📥 Отправьте ключи")
+        
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("✅ Завершить загрузку", callback_data="autopost_load_finish"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_load_back")
+        )
+        
+        msg = bot.send_message(
+            user_id,
+            "📥 *Загрузка ключей для автопостинга*\n\n"
+            "Отправляйте ключи по одному сообщению.\n"
+            "Поддерживаются:\n"
+            "• Текст с ключами (vless://, vmess:// и др.)\n"
+            "• .txt файл с ключами\n"
+            "• Прокси-ссылку (https://happ.dska.su/...)\n\n"
+            "Когда закончите, нажмите *✅ Завершить загрузку*",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        
+        autopost_loading[user_id] = {
+            'keys': [],
+            'message_id': msg.message_id
+        }
+        return
+
+    # ====== ЗАВЕРШИТЬ ЗАГРУЗКУ ======
+    if data == "autopost_load_finish":
+        bot.answer_callback_query(call.id)
+        
+        if user_id not in autopost_loading:
+            bot.send_message(user_id, "❌ Нет активной загрузки")
+            return
+        
+        keys = autopost_loading[user_id]['keys']
+        
+        if not keys:
+            bot.answer_callback_query(call.id, "❌ Нет загруженных ключей")
+            return
+        
+        save_keys_to_db(keys)
+        
+        proto_stats = {}
+        for k in keys:
+            m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+            if m:
+                p = m.group(1).lower()
+                proto_stats[p] = proto_stats.get(p, 0) + 1
+        stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+        
+        try:
+            bot.edit_message_text(
+                f"✅ *Ключи загружены!*\n\n"
+                f"📊 Загружено ключей: {len(keys)}\n"
+                f"📋 По протоколам:\n{stats}\n"
+                f"📦 Всего в базе: {len(get_keys_from_db())}\n\n"
+                "Теперь вы можете запустить автопостинг.",
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="Markdown"
+            )
+        except:
+            bot.send_message(
+                user_id,
+                f"✅ *Ключи загружены!*\n\n"
+                f"📊 Загружено ключей: {len(keys)}\n"
+                f"📋 По протоколам:\n{stats}\n"
+                f"📦 Всего в базе: {len(get_keys_from_db())}",
+                parse_mode="Markdown"
+            )
+        
+        del autopost_loading[user_id]
+        bot.answer_callback_query(call.id, "✅ Ключи сохранены")
+        return
+
+    # ====== НАЗАД ИЗ ЗАГРУЗКИ ======
+    if data == "autopost_load_back":
+        bot.answer_callback_query(call.id)
+        
+        if user_id in autopost_loading:
+            try:
+                bot.delete_message(call.message.chat.id, autopost_loading[user_id]['message_id'])
+            except:
+                pass
+            del autopost_loading[user_id]
+        
+        callback_admin_autopost(call)
+        return
+
+    # ====== НАСТРОЙКИ КАНАЛА ======
+    if data == "autopost_channel_settings":
+        bot.answer_callback_query(call.id)
+        config = get_autopost_config()
+        
+        text = (
+            "⚙️ *Настройки канала*\n\n"
+            f"📢 Текущий канал: {config['channel_id']}\n"
+            f"📝 Текущая ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("📢 Сменить канал", callback_data="autopost_change_channel"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # ====== СМЕНА КАНАЛА ======
+    if data == "autopost_change_channel":
+        bot.answer_callback_query(call.id)
+        
+        text = (
+            "📢 *Смена канала*\n\n"
+            "Текущий канал можно сбросить и выбрать новый.\n\n"
+            "После сброса отправьте мне ссылку на канал или чат.\n"
+            "Пример: `https://t.me/ciorsa` или `-1001234567890`"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🔄 Сбросить канал", callback_data="autopost_reset_channel"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_channel_settings")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # ====== СБРОС КАНАЛА ======
+    if data == "autopost_reset_channel":
+        bot.answer_callback_query(call.id, "🔄 Канал сброшен. Отправьте новый канал.")
+        bot.send_message(
+            user_id,
+            "📢 *Сброс канала*\n\n"
+            "Канал сброшен.\n"
+            "Отправьте ссылку на канал или ID чата.\n\n"
+            "Пример: `https://t.me/ciorsa` или `-1001234567890`"
+        )
+        search_cache[user_id] = {'action': 'autopost_set_channel'}
+        return
+
+    # ====== НАСТРОЙКИ ИНТЕРВАЛА ======
+    if data == "autopost_interval_settings":
+        bot.answer_callback_query(call.id)
+        config = get_autopost_config()
+        
+        text = (
+            "⏱ *Настройки интервала*\n\n"
+            f"⏱ Текущий интервал: {config['interval'] // 60} минут\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("⏱ Изменить интервал", callback_data="autopost_set_interval"),
+            types.InlineKeyboardButton("🔄 Сбросить интервал", callback_data="autopost_reset_interval"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # ====== УСТАНОВКА ИНТЕРВАЛА ======
+    if data == "autopost_set_interval":
+        bot.answer_callback_query(call.id, "⏱ Введите интервал в минутах")
+        bot.send_message(
+            user_id,
+            "⏱ *Установка интервала*\n\n"
+            "Введите интервал автопостинга в минутах.\n"
+            "Минимальное значение: 5 минут\n"
+            "Максимальное значение: 1440 минут (24 часа)\n\n"
+            "Пример: `30`",
+            parse_mode="Markdown"
+        )
+        search_cache[user_id] = {'action': 'autopost_set_interval'}
+        return
+
+    # ====== СБРОС ИНТЕРВАЛА ======
+    if data == "autopost_reset_interval":
+        bot.answer_callback_query(call.id, "🔄 Интервал сброшен на 30 минут")
+        config = get_autopost_config()
+        config['interval'] = 1800
+        save_autopost_config(config)
+        callback_autopost_handlers(call)
+        return
+
+    # ====== ИСТОРИЯ ======
+    if data == "autopost_history_menu":
+        bot.answer_callback_query(call.id)
+        
+        text = "📊 *История автопостинга*\n\nВыберите раздел:"
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📊 Активные постинги", callback_data="autopost_active_history"),
+            types.InlineKeyboardButton("📁 Завершенные", callback_data="autopost_completed_history")
+        )
+        kb.add(
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # ====== АКТИВНЫЕ ПОСТИНГИ ======
+    if data == "autopost_active_history":
+        bot.answer_callback_query(call.id)
+        
+        config = get_autopost_config()
+        keys = get_keys_from_db()
+        
+        text = (
+            "📊 *Активные постинги*\n\n"
+            f"📢 Канал: {config['channel_id']}\n"
+            f"⏱ Интервал: {config['interval'] // 60} мин\n"
+            f"📦 Всего ключей: {len(keys)}\n"
+            f"🗑️ Выдано: {int(get_setting('total_keys_issued', '0'))}\n"
+            f"📦 Осталось: {len(keys) - int(get_setting('total_keys_issued', '0'))}\n"
+            f"📊 Статус: {'✅ Активен' if config['enabled'] else '❌ Остановлен'}\n\n"
+            "Выберите действие:"
+        )
+        
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(
+            types.InlineKeyboardButton("🔄 Сбросить автопостинг", callback_data="autopost_reset_active"),
+            types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_history_menu")
+        )
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # ====== СБРОС АКТИВНОГО ======
+    if data == "autopost_reset_active":
+        bot.answer_callback_query(call.id, "🔄 Автопостинг сброшен")
+        config = get_autopost_config()
+        config['enabled'] = False
+        save_autopost_config(config)
+        callback_autopost_handlers(call)
+        return
+
+    # ====== ЗАВЕРШЕННЫЕ ПОСТИНГИ ======
+    if data == "autopost_completed_history":
+        bot.answer_callback_query(call.id)
+        
+        history = autopost_history.get('completed', [])
+        
+        if not history:
+            text = "📁 *Завершенные постинги*\n\nНет завершенных постингов."
+        else:
+            text = "📁 *Завершенные постинги*\n\n"
+            for i, item in enumerate(history[-10:], 1):
+                text += f"{i}. Канал: {item.get('channel_id', 'Unknown')}\n"
+                text += f"   📦 Выдано: {item.get('issued', 0)}\n"
+                text += f"   📅 {item.get('date', 'Unknown')}\n\n"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_history_menu"))
+        
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # ====== ОЧИСТКА ВСЕХ ======
+    if data == "autopost_clear_all":
+        bot.answer_callback_query(call.id)
+        save_keys_to_db([])
+        set_setting('total_keys_issued', '0')
+        bot.send_message(user_id, "🗑️ Все ключи удалены")
+        return
+
+    # ====== ОЧИСТКА НЕРАБОЧИХ ======
+    if data == "autopost_clear_dead":
+        bot.answer_callback_query(call.id, "⏳ Проверяю ключи...")
+        
+        keys = get_keys_from_db()
+        if not keys:
+            bot.send_message(user_id, "❌ Нет ключей для проверки")
+            return
+        
+        alive_keys = []
+        dead_keys = []
+        
+        for key in keys:
+            status, _ = ping_key_advanced(key)
+            if status:
+                alive_keys.append(key)
+            else:
+                dead_keys.append(key)
+        
+        save_keys_to_db(alive_keys)
+        
+        current_issued = int(get_setting('total_keys_issued', '0'))
+        set_setting('total_keys_issued', str(current_issued - len(dead_keys) if current_issued >= len(dead_keys) else 0))
+        
+        text = f"🧹 *Очистка нерабочих ключей завершена!*\n\n"
+        text += f"✅ Оставлено живых: {len(alive_keys)}\n"
+        text += f"🗑️ Удалено нерабочих: {len(dead_keys)}\n"
+        text += f"📦 Всего в базе: {len(alive_keys)}"
+        
+        bot.send_message(user_id, text, parse_mode="Markdown")
+        return
+
+    # ====== ЗАПУСК АВТОПОСТИНГА ======
+    if data == "autopost_start":
+        keys = get_keys_from_db()
+        if not keys:
+            bot.answer_callback_query(call.id, "❌ Нет ключей для постинга")
+            return
+        
+        config = get_autopost_config()
+        config['enabled'] = True
+        save_autopost_config(config)
+        
+        bot.answer_callback_query(call.id, "🚀 Автопостинг запущен!")
+        bot.send_message(
+            user_id,
+            f"🚀 *Автопостинг запущен!*\n\n"
+            f"📢 Канал: {config['channel_id']}\n"
+            f"⏱ Интервал: {config['interval'] // 60} мин\n"
+            f"📦 Ключей: {len(keys)}\n\n"
+            "Автопостинг будет выполняться автоматически.",
+            parse_mode="Markdown"
+        )
+        
+        auto_post_keys_to_channel()
+        return
+
+# ==================== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ АВТОПОСТИНГА ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in autopost_loading)
+def handle_autopost_load_keys(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    if user_id not in autopost_loading:
+        return
+    
+    raw_text = message.text or message.caption or ''
+    new_keys = []
+    
+    if message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            file_bytes = bot.download_file(file.file_path)
+            text = file_bytes.decode('utf-8', errors='ignore')
+            new_keys = load_keys_from_text(text)
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+            return
+    elif raw_text.strip().startswith('http'):
+        new_keys = load_keys_from_url(raw_text.strip())
+    elif raw_text.strip():
+        new_keys = load_keys_from_text(raw_text)
+    else:
+        bot.reply_to(message, "❌ Отправьте текст, ссылку или файл с ключами.")
+        return
+    
+    if new_keys:
+        autopost_loading[user_id]['keys'].extend(new_keys)
+        autopost_loading[user_id]['keys'] = _dedup(autopost_loading[user_id]['keys'])
+        bot.reply_to(
+            message,
+            f"✅ Загружено {len(new_keys)} ключей.\n"
+            f"📊 Всего в списке: {len(autopost_loading[user_id]['keys'])} ключей\n\n"
+            "Продолжайте загрузку или нажмите *Завершить загрузку*"
+        )
+    else:
+        bot.reply_to(message, "❌ Не найдено ключей. Проверьте формат.")
+
+# ==================== АВТОПОСТИНГ (ОСНОВНАЯ ФУНКЦИЯ) ====================
+
+def ping_key_advanced(key):
+    match = re.search(r'@([\d\.]+):(\d+)', key)
+    if not match:
+        return False, None
+    ip = match.group(1)
+    port = int(match.group(2))
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        start = time.time()
+        result = sock.connect_ex((ip, port))
+        latency = int((time.time() - start) * 1000)
+        sock.close()
+        if result == 0:
+            return True, latency
+        return False, latency
+    except:
+        return False, None
+
+def auto_post_keys_to_channel():
+    config = get_autopost_config()
+    if not config['enabled']:
+        return
+    
+    keys = get_keys_from_db()
+    if not keys:
+        bot.send_message(ADMIN_ID, "❌ Нет ключей для автопостинга")
+        return
+    
+    channel_id = config['channel_id']
+    topic_id = config['topic_id']
+    
+    working = []
+    not_working = []
+    
+    for key in keys:
+        status, latency = ping_key_advanced(key)
+        if status:
+            working.append({'key': key, 'latency': latency})
+        else:
+            not_working.append({'key': key})
+    
+    working.sort(key=lambda x: x['latency'] if x['latency'] else 9999)
+    
+    sent_keys = []
+    for i, key_data in enumerate(working[:10], 1):
+        formatted = format_key_for_post(key_data['key'], key_data['latency'], i)
+        
+        try:
+            if topic_id and topic_id != 0:
+                bot.send_message(channel_id, formatted, parse_mode="Markdown", message_thread_id=topic_id)
+            else:
+                bot.send_message(channel_id, formatted, parse_mode="Markdown")
+            sent_keys.append(key_data['key'])
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"[autopost] Ошибка: {e}")
+    
+    if sent_keys:
+        remove_used_keys(sent_keys)
+        increment_setting('total_keys_issued', len(sent_keys))
+    
+    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
+    stats_msg = f"""📊 *АВТОПОСТИНГ*
+
+🕐 {current_time}
+✅ Работает: {len(working)}
+❌ Не работает: {len(not_working)}
+🗑️ Выдано: {len(sent_keys)}
+📦 Осталось: {len(get_keys_from_db())}
+
+📢 Канал: {channel_id}
+📝 Ветка: {topic_id if topic_id else 'Нет'}
+
+🔗 @ciorsa"""
+    
+    try:
+        bot.send_message(ADMIN_ID, stats_msg, parse_mode="Markdown")
+    except Exception as e:
+        print(f"[autopost] Ошибка отправки статистики: {e}")
+
+# ==================== ОБРАБОТЧИКИ НАСТРОЕК АВТОПОСТИНГА ====================
+
+@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel')
+def handle_autopost_set_channel(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    
+    text = message.text.strip()
+    del search_cache[user_id]
+    
+    channel_id = None
+    topic_id = 0
+    
+    if 't.me/' in text:
+        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
+        if match:
+            username = match.group(1)
+            try:
+                chat = bot.get_chat(f"@{username}")
+                channel_id = chat.id
+            except:
+                pass
+    
+    if not channel_id:
+        try:
+            channel_id = int(text)
+        except:
+            pass
+    
+    if 'thread_id=' in text:
+        match = re.search(r'thread_id=(\d+)', text)
+        if match:
+            topic_id = int(match.group(1))
+    
+    if not channel_id:
+        bot.reply_to(message, "❌ Не удалось распознать канал. Отправьте ссылку или ID.")
+        return
+    
+    config = get_autopost_config()
+    config['channel_id'] = channel_id
+    config['topic_id'] = topic_id
+    save_autopost_config(config)
+    
+    bot.reply_to(message, f"✅ Канал установлен!\n📢 ID: {channel_id}\n📝 Ветка: {topic_id if topic_id else 'Нет'}")
+
+@bot.message_handler(func=lambda m: m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval')
+def handle_autopost_set_interval(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    
+    try:
+        minutes = int(message.text.strip())
+        if minutes < 5:
+            bot.reply_to(message, "❌ Минимальное значение: 5 минут")
+            return
+        if minutes > 1440:
+            bot.reply_to(message, "❌ Максимальное значение: 1440 минут (24 часа)")
+            return
+    except:
+        bot.reply_to(message, "❌ Введите число (минуты).")
+        return
+    
+    del search_cache[user_id]
+    
+    config = get_autopost_config()
+    config['interval'] = minutes * 60
+    save_autopost_config(config)
+    
+    bot.reply_to(message, f"✅ Интервал установлен: {minutes} минут")
+
+# ==================== ОБРАБОТЧИКИ РАССЫЛКИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_dm")
+def callback_announce_dm(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    bot.answer_callback_query(call.id, "📝 Отправьте текст или медиа")
+    bot.send_message(
+        user_id,
+        "📨 *Рассылка в ЛС*\n\n"
+        "Отправьте текст, фото или видео для рассылки всем пользователям.",
+        parse_mode="Markdown"
+    )
+    announce_data[user_id] = {'type': 'dm', 'waiting': True}
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_channels")
+def callback_announce_channels(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    bot.answer_callback_query(call.id)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT channel_id, channel_name, topic_id FROM autopost_channels WHERE enabled = TRUE")
+    channels = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    if not channels:
+        bot.send_message(user_id, "❌ Нет активных каналов.")
+        return
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch_id, ch_name, topic_id in channels:
+        label = f"📢 {ch_name}"
+        if topic_id and topic_id != 0:
+            label += f" (ветка {topic_id})"
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"announce_to_channel_{ch_id}"))
+
+    kb.add(types.InlineKeyboardButton("📢 Во все каналы", callback_data="announce_all_channels"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel"))
+
+    bot.edit_message_text(
+        "📢 *Выберите канал для объявления*",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('announce_to_channel_'))
+def callback_announce_to_channel(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    channel_id = int(call.data.split('_')[3])
+
+    bot.answer_callback_query(call.id, "📝 Отправьте текст или медиа")
+    bot.send_message(
+        user_id,
+        f"📢 *Объявление в канал*\n\n"
+        f"Отправьте текст, фото или видео для публикации.\n"
+        f"ID канала: `{channel_id}`",
+        parse_mode="Markdown"
+    )
+    announce_data[user_id] = {'type': 'channel', 'channel_id': channel_id, 'waiting': True}
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_all_channels")
+def callback_announce_all_channels(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    bot.answer_callback_query(call.id, "📝 Отправьте текст или медиа")
+    bot.send_message(
+        user_id,
+        "📢 *Объявление во все каналы*\n\n"
+        "Отправьте текст, фото или видео для публикации во все активные каналы.",
+        parse_mode="Markdown"
+    )
+    announce_data[user_id] = {'type': 'all_channels', 'waiting': True}
+
+# ==================== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ РАССЫЛКИ ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data)
+def admin_announce_text(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    if user_id not in announce_data:
+        return
+
+    data = announce_data[user_id]
+    del announce_data[user_id]
+
+    announce_type = data.get('type', 'dm')
+    text = message.text
+    caption = message.caption or ''
+
+    if announce_type == 'dm':
+        if not text and not message.photo and not message.video and not message.document:
+            bot.reply_to(message, "❌ Отправьте текст или медиа.")
+            return
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users")
+        users = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        sent = 0
+        failed = 0
+        for (uid,) in users:
+            try:
+                if message.photo:
+                    bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
+                elif message.video:
+                    bot.send_video(uid, message.video.file_id, caption=caption)
+                elif message.document:
+                    bot.send_document(uid, message.document.file_id, caption=caption)
+                elif text:
+                    bot.send_message(uid, text)
+                sent += 1
+            except:
+                failed += 1
+
+        bot.reply_to(message, f"📢 Рассылка в ЛС завершена!\n✅ Отправлено: {sent}\n❌ Не доставлено: {failed}")
+        return
+
+    elif announce_type == 'channel':
+        channel_id = data.get('channel_id')
+        if not channel_id:
+            bot.reply_to(message, "❌ Канал не выбран.")
+            return
+
+        try:
+            if message.photo:
+                bot.send_photo(channel_id, message.photo[-1].file_id, caption=caption)
+            elif message.video:
+                bot.send_video(channel_id, message.video.file_id, caption=caption)
+            elif message.document:
+                bot.send_document(channel_id, message.document.file_id, caption=caption)
+            elif text:
+                bot.send_message(channel_id, text)
+            bot.reply_to(message, f"✅ Объявление отправлено в канал.")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка: {e}")
+        return
+
+    elif announce_type == 'all_channels':
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT channel_id, topic_id FROM autopost_channels WHERE enabled = TRUE")
+        channels = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        if not channels:
+            bot.reply_to(message, "❌ Нет активных каналов.")
+            return
+
+        sent = 0
+        failed = 0
+        for ch_id, topic_id in channels:
+            try:
+                if topic_id and topic_id != 0:
+                    if message.photo:
+                        bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption, message_thread_id=topic_id)
+                    elif message.video:
+                        bot.send_video(ch_id, message.video.file_id, caption=caption, message_thread_id=topic_id)
+                    elif message.document:
+                        bot.send_document(ch_id, message.document.file_id, caption=caption, message_thread_id=topic_id)
+                    elif text:
+                        bot.send_message(ch_id, text, message_thread_id=topic_id)
+                else:
+                    if message.photo:
+                        bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption)
+                    elif message.video:
+                        bot.send_video(ch_id, message.video.file_id, caption=caption)
+                    elif message.document:
+                        bot.send_document(ch_id, message.document.file_id, caption=caption)
+                    elif text:
+                        bot.send_message(ch_id, text)
+                sent += 1
+                time.sleep(0.3)
+            except Exception as e:
+                print(f"[announce] Ошибка в канал {ch_id}: {e}")
+                failed += 1
+
+        bot.reply_to(message, f"📢 Рассылка в каналы завершена!\n✅ Отправлено в {sent} каналов\n❌ Ошибок: {failed}")
+        return
 
 # ==================== MANAGE (ВСТРОЕННЫЙ В АДМИН-ПАНЕЛЬ) ====================
 
@@ -3910,4 +4760,3 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-        
