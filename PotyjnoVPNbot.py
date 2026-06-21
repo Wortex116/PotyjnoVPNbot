@@ -1120,6 +1120,77 @@ def add_subscribe_record(user_id):
     current_time = int(time.time())
     SUBSCRIBE_MONITOR['timestamps'].append(current_time)
 
+# ==================== РЕФЕРАЛЬНАЯ СИСТЕМА ====================
+
+def process_referral(referrer_id, referred_id):
+    """Обработка реферала с начислением бонусов"""
+    if referrer_id == referred_id:
+        return False, "Нельзя пригласить самого себя"
+    
+    if not is_subscribed(referred_id):
+        return False, "Реферал не подписан на канал"
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Проверяем существует ли реферер
+    cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referrer_id,))
+    if not cur.fetchone():
+        cur.close()
+        conn.close()
+        return False, "Реферер не найден"
+    
+    # Проверяем не было ли уже реферала
+    cur.execute(
+        "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
+        (referrer_id, referred_id)
+    )
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        return False, "Этот пользователь уже был приглашен"
+    
+    # Проверяем лимит рефералов
+    if not can_add_referral(referrer_id):
+        cur.close()
+        conn.close()
+        return False, "Лимит рефералов (10 в день) превышен"
+    
+    # Сохраняем реферала
+    current_time = int(time.time())
+    cur.execute(
+        "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (%s, %s, %s, 0)",
+        (referrer_id, referred_id, current_time)
+    )
+    conn.commit()
+    print(f"[referral] Сохранен реферал: {referrer_id} -> {referred_id}")
+    
+    # Начисляем бонусы если реферер подписан на канал
+    if is_subscribed(referrer_id):
+        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
+        ref_result = cur.fetchone()
+        if ref_result:
+            new_end = ref_result[0] + 3 * 24 * 60 * 60
+            cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, referrer_id))
+            cur.execute(
+                "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
+                (referrer_id, referred_id)
+            )
+            conn.commit()
+            print(f"[referral] Начислено +3 дня рефереру {referrer_id}")
+            cur.close()
+            conn.close()
+            
+            try:
+                bot.send_message(referrer_id, "🎉 Вам начислено +3 дня за нового реферала!")
+            except:
+                pass
+            return True, "Реферал добавлен, начислено +3 дня"
+    
+    cur.close()
+    conn.close()
+    return True, "Реферал сохранен, бонус будет начислен после подписки реферера"
+
 # ==================== /start ====================
 
 @bot.message_handler(commands=['start'])
@@ -1135,6 +1206,19 @@ def cmd_start(message):
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
+
+    # Парсим реферальную ссылку
+    referrer_id = None
+    if message.text and 'start=ref_' in message.text:
+        parts = message.text.split('start=ref_')
+        if len(parts) > 1:
+            try:
+                ref = int(parts[1].strip())
+                if ref != user_id:
+                    referrer_id = ref
+                    print(f"[referral] Найден реферер: {referrer_id} для пользователя {user_id}")
+            except:
+                pass
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -1152,17 +1236,6 @@ def cmd_start(message):
             return
 
         add_subscribe_record(user_id)
-
-        referrer_id = None
-        if message.text and 'start=ref_' in message.text:
-            parts = message.text.split('start=ref_')
-            if len(parts) > 1:
-                try:
-                    ref = int(parts[1].strip())
-                    if ref != user_id:
-                        referrer_id = ref
-                except:
-                    pass
 
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("✅ Я НЕ РОБОТ", callback_data=f"captcha_verify_{user_id}"))
@@ -1182,7 +1255,6 @@ def cmd_start(message):
             'referrer_id': referrer_id,
             'waiting_for_sub': False
         }
-
         return
 
     if not is_subscribed(user_id):
@@ -1250,6 +1322,7 @@ def callback_captcha_verify(call):
 # ==================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ====================
 
 def _register_user(user_id, referrer_id=None):
+    """Регистрация пользователя с реферальной системой"""
     current_time = int(time.time())
 
     conn = get_db_connection()
@@ -1271,67 +1344,17 @@ def _register_user(user_id, referrer_id=None):
     cur.close()
     conn.close()
 
+    # Обработка реферала
     if referrer_id:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referrer_id,))
-        referrer_exists = cur.fetchone()
-        cur.close()
-        conn.close()
+        print(f"[referral] Попытка регистрации реферала {user_id} от {referrer_id}")
+        success, message = process_referral(referrer_id, user_id)
+        print(f"[referral] Результат: {success} - {message}")
 
-        if referrer_exists and referrer_id != user_id:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
-                (referrer_id, user_id)
-            )
-            already_ref = cur.fetchone()
-            cur.close()
-            conn.close()
-
-            if not already_ref:
-                if can_add_referral(referrer_id):
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute(
-                        "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded) VALUES (%s, %s, %s, 0)",
-                        (referrer_id, user_id, current_time)
-                    )
-                    conn.commit()
-                    cur.close()
-                    conn.close()
-
-                    name = get_user_display_name(user_id)
-                    try:
-                        bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {name} зарегистрировался по вашей ссылке.")
-                    except:
-                        pass
-
-                    if get_setting('referral_enabled') == '1' and is_subscribed(referrer_id):
-                        conn = get_db_connection()
-                        cur = conn.cursor()
-                        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
-                        ref_result = cur.fetchone()
-                        if ref_result:
-                            new_end = ref_result[0] + 3 * 24 * 60 * 60
-                            cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (new_end, referrer_id))
-                            cur.execute(
-                                "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
-                                (referrer_id, user_id)
-                            )
-                            conn.commit()
-                            try:
-                                bot.send_message(referrer_id, "🎉 Вам начислено +3 дня за нового реферала!")
-                            except:
-                                pass
-                        cur.close()
-                        conn.close()
-                else:
-                    try:
-                        bot.send_message(referrer_id, "⚠️ Лимит рефералов (10 в день). Попробуйте завтра.")
-                    except:
-                        pass
+        if success:
+            try:
+                bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {get_user_display_name(user_id)} зарегистрировался по вашей ссылке.")
+            except:
+                pass
 
     bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
     bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
@@ -1359,6 +1382,7 @@ def callback_check_sub(call):
         except:
             pass
 
+        # Если пользователь ждал подписку после капчи
         if user_id in captcha_sessions and captcha_sessions[user_id].get('waiting_for_sub'):
             session = captcha_sessions[user_id]
             bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
@@ -1366,6 +1390,7 @@ def callback_check_sub(call):
             del captcha_sessions[user_id]
             return
 
+        # Проверяем необработанные рефералы
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute(
@@ -1376,7 +1401,7 @@ def callback_check_sub(call):
         cur.close()
         conn.close()
 
-        if pending and get_setting('referral_enabled') == '1':
+        if pending:
             referrer_id = pending[0]
             if is_subscribed(referrer_id):
                 conn = get_db_connection()
