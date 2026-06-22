@@ -121,7 +121,8 @@ DEFAULT_KEYS = [
     'vless://00000000-0000-0000-0000-000000000001@1.1.1.1:443?type=tcp&security=tls#Demo-Key-1',
 ]
 
-VPN_KEY_PATTERN = r'(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic|naive\+https?|wg|wireguard|juicity|brook|shadowtls)://[^\s\r\n<>"\'`]+'
+# Расширенный паттерн VPN ключей
+VPN_KEY_PATTERN = r'(?:vless|vmess|trojan|ss|ssr|hysteria2?|hy2|tuic|naive\+https?|wg|wireguard|juicity|brook|shadowtls|anytls|reality|xray|sing-box|clash|mihomo|nekoray|nekobox|hiddify|v2ray|v2box|xhttp|grpc|quic|kcp|splithttp|httpupgrade|meek|obfs|snell|socks5?|http|https|tls|dtls|mkcp|h2|ws|tcp)://[^\s\r\n<>"\'`]+'
 
 APP_SCHEMES = (
     r'incy|happ|v2ray|v2rayng|v2box|clash|sing-box|quantumult|surge|loon|'
@@ -601,33 +602,285 @@ def load_keys_from_url(raw_url):
 def load_keys_from_text(text):
     return _parse_keys_from_content(text)
 
+def _extract_keys_from_json(content):
+    """Извлекает VPN ключи из JSON разных форматов"""
+    keys = []
+    if not content:
+        return keys
+    
+    content = content.strip()
+    
+    # Пробуем распарсить как JSON
+    try:
+        data = json.loads(content)
+        keys.extend(_parse_json_recursive(data))
+        if keys:
+            return _dedup(keys)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    
+    # Ищем JSON-подстроки внутри текста
+    try:
+        # Ищем массивы и объекты
+        for match in re.finditer(r'(\{.*?\}|\[.*?\])', content, re.DOTALL):
+            try:
+                data = json.loads(match.group(0))
+                keys.extend(_parse_json_recursive(data))
+            except:
+                pass
+    except:
+        pass
+    
+    return _dedup(keys)
+
+def _parse_json_recursive(data, depth=0):
+    """Рекурсивно ищет VPN ключи в JSON структуре"""
+    keys = []
+    if depth > 10:
+        return keys
+    
+    if isinstance(data, str):
+        # Прямые VPN ключи
+        found = _extract_vpn_keys(data)
+        if found:
+            keys.extend(found)
+        # Base64 в строке
+        decoded = _try_b64(data)
+        if decoded:
+            keys.extend(_extract_vpn_keys(decoded))
+            keys.extend(_parse_json_recursive(decoded, depth + 1))
+        return keys
+    
+    if isinstance(data, list):
+        for item in data:
+            keys.extend(_parse_json_recursive(item, depth + 1))
+        return keys
+    
+    if isinstance(data, dict):
+        # Clash формат: {type: ss/vmess/trojan, server: ..., port: ...}
+        if 'type' in data and 'server' in data and 'port' in data:
+            clash_key = _build_key_from_clash(data)
+            if clash_key:
+                keys.append(clash_key)
+        
+        # Sing-box outbound формат
+        if 'outbounds' in data:
+            for ob in data.get('outbounds', []):
+                if isinstance(ob, dict):
+                    keys.extend(_parse_json_recursive(ob, depth + 1))
+        
+        # Все остальные значения
+        for k, v in data.items():
+            keys.extend(_parse_json_recursive(v, depth + 1))
+        
+        # vmess формат
+        if all(f in data for f in ['add', 'port', 'id']):
+            vmess_key = _build_vmess_from_json(data)
+            if vmess_key:
+                keys.append(vmess_key)
+        
+        return keys
+    
+    return keys
+
+def _build_vmess_from_json(data):
+    """Собирает vmess:// ключ из JSON объекта"""
+    try:
+        required = ['add', 'port', 'id']
+        if not all(k in data for k in required):
+            return None
+        
+        vmess_obj = {
+            "v": str(data.get("v", "2")),
+            "ps": str(data.get("ps", data.get("name", ""))),
+            "add": str(data["add"]),
+            "port": str(data["port"]),
+            "id": str(data["id"]),
+            "aid": str(data.get("aid", data.get("alterId", "0"))),
+            "scy": str(data.get("scy", data.get("security", "auto"))),
+            "net": str(data.get("net", data.get("network", "tcp"))),
+            "type": str(data.get("type", data.get("headerType", "none"))),
+            "host": str(data.get("host", data.get("sni", ""))),
+            "path": str(data.get("path", "")),
+            "tls": str(data.get("tls", "")),
+            "sni": str(data.get("sni", "")),
+            "alpn": str(data.get("alpn", "")),
+            "fp": str(data.get("fp", "")),
+        }
+        
+        encoded = base64.b64encode(
+            json.dumps(vmess_obj, ensure_ascii=False).encode()
+        ).decode()
+        
+        return f"vmess://{encoded}"
+    except:
+        return None
+
+def _build_key_from_clash(data):
+    """Собирает VPN ключ из Clash/Sing-box формата"""
+    try:
+        proxy_type = str(data.get('type', '')).lower()
+        server = str(data.get('server', data.get('address', '')))
+        port = str(data.get('port', ''))
+        name = str(data.get('name', data.get('ps', server)))
+        
+        if not server or not port:
+            return None
+        
+        # Shadowsocks
+        if proxy_type == 'ss':
+            method = data.get('cipher', data.get('method', 'aes-256-gcm'))
+            password = data.get('password', '')
+            if not password:
+                return None
+            credentials = base64.b64encode(
+                f"{method}:{password}".encode()
+            ).decode()
+            name_encoded = urllib.parse.quote(name)
+            return f"ss://{credentials}@{server}:{port}#{name_encoded}"
+        
+        # Trojan
+        if proxy_type == 'trojan':
+            password = data.get('password', '')
+            if not password:
+                return None
+            sni = data.get('sni', data.get('server-name', server))
+            params = urllib.parse.urlencode({
+                'security': 'tls',
+                'sni': sni,
+                'type': data.get('network', 'tcp'),
+            })
+            name_encoded = urllib.parse.quote(name)
+            return f"trojan://{password}@{server}:{port}?{params}#{name_encoded}"
+        
+        # VLESS
+        if proxy_type == 'vless':
+            uuid = data.get('uuid', data.get('id', ''))
+            if not uuid:
+                return None
+            flow = data.get('flow', '')
+            network = data.get('network', data.get('type', 'tcp'))
+            security = 'tls' if data.get('tls', False) else 'none'
+            sni = data.get('sni', data.get('server-name', ''))
+            params = {
+                'type': network,
+                'security': security,
+            }
+            if flow:
+                params['flow'] = flow
+            if sni:
+                params['sni'] = sni
+            path = data.get('ws-opts', {}).get('path', data.get('path', ''))
+            if path:
+                params['path'] = path
+            host = data.get('ws-opts', {}).get('headers', {}).get('Host', '')
+            if host:
+                params['host'] = host
+            fp = data.get('client-fingerprint', '')
+            if fp:
+                params['fp'] = fp
+            name_encoded = urllib.parse.quote(name)
+            query = urllib.parse.urlencode(params)
+            return f"vless://{uuid}@{server}:{port}?{query}#{name_encoded}"
+        
+        # VMess (Clash формат)
+        if proxy_type == 'vmess':
+            uuid = data.get('uuid', '')
+            if not uuid:
+                return None
+            vmess_obj = {
+                "v": "2",
+                "ps": name,
+                "add": server,
+                "port": port,
+                "id": uuid,
+                "aid": str(data.get('alterId', data.get('aid', '0'))),
+                "scy": data.get('cipher', 'auto'),
+                "net": data.get('network', 'tcp'),
+                "type": "none",
+                "host": data.get('ws-opts', {}).get('headers', {}).get('Host', ''),
+                "path": data.get('ws-opts', {}).get('path', ''),
+                "tls": "tls" if data.get('tls', False) else "",
+                "sni": data.get('sni', ''),
+            }
+            encoded = base64.b64encode(
+                json.dumps(vmess_obj, ensure_ascii=False).encode()
+            ).decode()
+            return f"vmess://{encoded}"
+        
+        # Hysteria2
+        if proxy_type in ('hysteria2', 'hy2'):
+            password = data.get('password', data.get('auth', ''))
+            if not password:
+                return None
+            sni = data.get('sni', server)
+            name_encoded = urllib.parse.quote(name)
+            return f"hysteria2://{password}@{server}:{port}?sni={sni}#{name_encoded}"
+        
+        # TUIC
+        if proxy_type == 'tuic':
+            uuid = data.get('uuid', '')
+            password = data.get('password', '')
+            if not uuid:
+                return None
+            sni = data.get('sni', server)
+            name_encoded = urllib.parse.quote(name)
+            return f"tuic://{uuid}:{password}@{server}:{port}?sni={sni}#{name_encoded}"
+        
+        return None
+    except:
+        return None
+
 def _parse_keys_from_content(content):
     all_keys = []
     if not content:
         return []
-    all_keys.extend(_extract_vpn_keys(content))
+    
+    # 1. Прямой поиск VPN ключей в тексте
+    direct_keys = _extract_vpn_keys(content)
+    all_keys.extend(direct_keys)
+    
+    # 2. JSON парсинг (работает параллельно с прямым поиском)
+    json_keys = _extract_keys_from_json(content)
+    all_keys.extend(json_keys)
+    
+    # 3. Base64 декодирование всего контента
     cleaned = re.sub(r'\s+', '', content.strip())
     if len(cleaned) >= 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', cleaned):
-        decoded = _try_multilevel_b64(cleaned, max_depth=5)
-        if decoded:
-            for item in decoded:
+        decoded_items = _try_multilevel_b64(cleaned, max_depth=5)
+        if decoded_items:
+            for item in decoded_items:
                 all_keys.extend(_extract_vpn_keys(item))
+                all_keys.extend(_extract_keys_from_json(item))
                 all_keys.extend(_try_multilevel_b64(item, max_depth=3))
+    
+    # 4. Построчный анализ
     for line in content.splitlines():
         line = line.strip()
         if not line:
             continue
         all_keys.extend(_extract_vpn_keys(line))
+        # Base64 строки
         if len(line) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', line):
-            all_keys.extend(_try_multilevel_b64(line, max_depth=4))
+            decoded_line = _try_multilevel_b64(line, max_depth=4)
+            for dk in decoded_line:
+                all_keys.extend(_extract_vpn_keys(dk))
+                all_keys.extend(_extract_keys_from_json(dk))
+        # Вложенные URL
         urls = re.findall(r'https?://[^\s<>"\']+', line)
         for url in urls:
             try:
-                resp = requests.get(url, timeout=10, headers={'User-Agent': 'v2rayNG/1.8.7'})
+                resp = requests.get(
+                    url, timeout=10,
+                    headers={'User-Agent': 'v2rayNG/1.8.7'},
+                    verify=False
+                )
                 if resp.status_code == 200:
                     all_keys.extend(_parse_keys_from_content(resp.text))
             except:
                 pass
+    
+    # Дедупликация — удаляем все повторы
     return _dedup(all_keys)
 
 # ==================== CHECKS ====================
@@ -1453,7 +1706,7 @@ def _parse_subscription_any(raw, steps=None):
         steps.append(f"🔗 Обнаружена ссылка Belka VPN")
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            resp = requests.get(text, timeout=30, headers=headers)
+            resp = requests.get(text, timeout=30, headers=headers, verify=False)
             if resp.status_code == 200:
                 content = resp.text
                 steps.append(f"✅ Загружено {len(content)} символов")
@@ -1487,7 +1740,7 @@ def _parse_subscription_any(raw, steps=None):
                     for link in sub_links:
                         steps.append(f"⬇️ Пробую загрузить: {link[:50]}...")
                         try:
-                            sub_resp = requests.get(link, timeout=30, headers=headers)
+                            sub_resp = requests.get(link, timeout=30, headers=headers, verify=False)
                             if sub_resp.status_code == 200:
                                 keys = _parse_keys_from_content(sub_resp.text)
                                 if keys:
@@ -1518,7 +1771,7 @@ def _parse_subscription_any(raw, steps=None):
                 for item in decoded:
                     if re.match(r'https?://', item.strip(), re.IGNORECASE):
                         try:
-                            resp = requests.get(item.strip(), timeout=30)
+                            resp = requests.get(item.strip(), timeout=30, verify=False)
                             if resp.status_code == 200:
                                 return _parse_subscription_any(resp.text, steps)
                         except:
@@ -1528,7 +1781,7 @@ def _parse_subscription_any(raw, steps=None):
                         return _dedup(keys), steps
         if re.match(r'https?://', payload, re.IGNORECASE):
             try:
-                resp = requests.get(payload, timeout=30)
+                resp = requests.get(payload, timeout=30, verify=False)
                 if resp.status_code == 200:
                     return _parse_subscription_any(resp.text, steps)
             except:
@@ -1538,7 +1791,7 @@ def _parse_subscription_any(raw, steps=None):
             return _dedup(keys), steps
         return [], steps
 
-    # ========== HTTP URL (ОБНОВЛЁННЫЙ БЛОК С SSL И ОШИБКАМИ) ==========
+    # ========== HTTP URL (ОБНОВЛЁННЫЙ БЛОК С JSON ПАРСИНГОМ) ==========
     if re.match(r'^https?://', text, re.IGNORECASE):
         steps.append(f"⬇️ Загружаю URL: {text[:80]}...")
         
@@ -1555,16 +1808,15 @@ def _parse_subscription_any(raw, steps=None):
         
         # Пробуем разные User-Agent
         for ua in user_agents:
-            for attempt in range(2):  # 2 попытки на каждый UA
+            for attempt in range(2):
                 try:
                     steps.append(f"🔄 Попытка {attempt+1}/2 с User-Agent: {ua[:20]}...")
                     
-                    # Основной запрос с verify=False для обхода SSL ошибок
                     resp = requests.get(
                         text,
                         timeout=15,
                         headers={'User-Agent': ua},
-                        verify=False,  # отключаем проверку SSL сертификата
+                        verify=False,
                         allow_redirects=True
                     )
                     
@@ -1600,33 +1852,38 @@ def _parse_subscription_any(raw, steps=None):
             if resp and resp.status_code == 200:
                 break
         
-        # Проверяем успешность загрузки
         if not resp or resp.status_code != 200:
             steps.append(f"❌ Ошибка после всех попыток: {last_error}")
             return [], steps
         
-        # Обработка успешно загруженного контента
         content = resp.text.strip()
         steps.append(f"✅ Загружено {len(content)} символов")
         
-        # Пробуем декодировать Base64
+        # 1. Base64
         if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
             decoded = _try_multilevel_b64(content, max_depth=5)
             if decoded:
                 all_keys = []
                 for item in decoded:
                     all_keys.extend(_extract_vpn_keys(item))
+                    all_keys.extend(_extract_keys_from_json(item))
                 if all_keys:
-                    steps.append(f"✅ Найдено {len(all_keys)} ключей (Base64)")
+                    steps.append(f"✅ Найдено {len(all_keys)} ключей (Base64 + JSON)")
                     return _dedup(all_keys), steps
         
-        # Ищем ключи напрямую
+        # 2. JSON напрямую
+        json_keys = _extract_keys_from_json(content)
+        if json_keys:
+            steps.append(f"✅ Найдено {len(json_keys)} ключей (JSON)")
+            return _dedup(json_keys), steps
+        
+        # 3. Прямой поиск
         keys = _extract_vpn_keys(content)
         if keys:
             steps.append(f"✅ Найдено {len(keys)} ключей")
             return _dedup(keys), steps
         
-        # Если это HTML — ищем ссылки на подписки
+        # 4. HTML ссылки
         if '<' in content and '>' in content:
             steps.append("🔍 Обнаружен HTML, ищу ссылки на подписки...")
             soup = BeautifulSoup(content, 'html.parser')
@@ -1636,7 +1893,7 @@ def _parse_subscription_any(raw, steps=None):
                     if href.startswith('http'):
                         steps.append(f"⬇️ Пробую загрузить: {href[:50]}...")
                         try:
-                            sub_resp = requests.get(href, timeout=30, headers={'User-Agent': user_agents[0]})
+                            sub_resp = requests.get(href, timeout=30, headers={'User-Agent': user_agents[0]}, verify=False)
                             if sub_resp.status_code == 200:
                                 sub_keys = _parse_keys_from_content(sub_resp.text)
                                 if sub_keys:
@@ -1834,6 +2091,7 @@ def _show_admin_list_for_call(call):
 
 # ==================== УПРАВЛЕНИЕ КЛЮЧАМИ ====================
 
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys")
 def callback_admin_keys(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -2302,10 +2560,7 @@ def callback_reset_perm(call):
 
 
 def _redraw_admin_perms(call, target_id):
-    """
-    Перерисовывает меню настройки прав без использования fake CallbackQuery.
-    Эта функция используется вместо создания фиктивных callback-запросов.
-    """
+    """Перерисовывает меню настройки прав без использования fake CallbackQuery."""
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -4365,4 +4620,3 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-        
