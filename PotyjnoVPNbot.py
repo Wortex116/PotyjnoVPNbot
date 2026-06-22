@@ -18,7 +18,7 @@ from telebot import types
 import psycopg2
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask
+from flask import Flask, request
 
 try:
     import socks
@@ -923,9 +923,7 @@ def cmd_start(message):
     ok, msg = check_subscribe_rate()
     if not ok:
         bot.reply_to(message, f"⚠️ {msg}")
-        return
-
-    add_subscribe_record(user_id)
+        return    add_subscribe_record(user_id)
 
     referrer_id = None
     if message.text:
@@ -1487,51 +1485,116 @@ def _parse_subscription_any(raw, steps=None):
             return _dedup(keys), steps
         return [], steps
 
-    # HTTP URL
+    # ========== HTTP URL (ОБНОВЛЁННЫЙ БЛОК С SSL И ОШИБКАМИ) ==========
     if re.match(r'^https?://', text, re.IGNORECASE):
-        steps.append(f"⬇️ Загружаю URL...")
-        try:
-            session = requests.Session()
-            session.max_redirects = 10
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            resp = session.get(text, timeout=30, headers=headers, allow_redirects=True)
-            if resp.status_code == 200:
-                content = resp.text.strip()
-                steps.append(f"✅ Загружено {len(content)} символов")
-                if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
-                    decoded = _try_multilevel_b64(content, max_depth=5)
-                    if decoded:
-                        all_keys = []
-                        for item in decoded:
-                            all_keys.extend(_extract_vpn_keys(item))
-                        if all_keys:
-                            return _dedup(all_keys), steps
-                keys = _extract_vpn_keys(content)
-                if keys:
-                    return _dedup(keys), steps
-                if '<' in content and '>' in content:
-                    soup = BeautifulSoup(content, 'html.parser')
-                    for a in soup.find_all('a'):
-                        href = a.get('href', '')
-                        if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href):
-                            if href.startswith('http'):
-                                try:
-                                    sub_resp = requests.get(href, timeout=30, headers=headers)
-                                    if sub_resp.status_code == 200:
-                                        sub_keys = _parse_keys_from_content(sub_resp.text)
-                                        if sub_keys:
-                                            steps.append(f"✅ Найдено {len(sub_keys)} ключей")
-                                            return _dedup(sub_keys), steps
-                                except:
-                                    pass
-                steps.append(f"❌ Ключи не найдены")
-                return [], steps
-            else:
-                steps.append(f"❌ Ошибка: HTTP {resp.status_code}")
-                return [], steps
-        except Exception as e:
-            steps.append(f"❌ Ошибка: {e}")
+        steps.append(f"⬇️ Загружаю URL: {text[:80]}...")
+        
+        # Массив User-Agent для перебора
+        user_agents = [
+            'v2rayNG/1.8.7',
+            'clash/1.18.0',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Hiddify/2.0.0',
+        ]
+        
+        last_error = None
+        resp = None
+        
+        # Пробуем разные User-Agent
+        for ua in user_agents:
+            for attempt in range(2):  # 2 попытки на каждый UA
+                try:
+                    steps.append(f"🔄 Попытка {attempt+1}/2 с User-Agent: {ua[:20]}...")
+                    
+                    # Основной запрос с verify=False для обхода SSL ошибок
+                    resp = requests.get(
+                        text,
+                        timeout=15,
+                        headers={'User-Agent': ua},
+                        verify=False,  # отключаем проверку SSL сертификата
+                        allow_redirects=True
+                    )
+                    
+                    steps.append(f"📊 Статус: {resp.status_code}, размер: {len(resp.text)} байт")
+                    
+                    if resp.status_code == 200:
+                        break
+                    last_error = f"HTTP {resp.status_code}"
+                    
+                except requests.exceptions.SSLError as e:
+                    steps.append(f"⚠️ SSL ошибка: {e}")
+                    last_error = f"SSL: {e}"
+                    # При SSL ошибке пробуем с verify=False (уже установлено)
+                    continue
+                    
+                except requests.exceptions.ConnectionError as e:
+                    steps.append(f"❌ Ошибка соединения: {e}")
+                    last_error = f"Connection: {e}"
+                    time.sleep(1)
+                    continue
+                    
+                except requests.exceptions.Timeout:
+                    steps.append(f"⏰ Таймаут (15s)")
+                    last_error = "Timeout"
+                    time.sleep(1)
+                    continue
+                    
+                except Exception as e:
+                    steps.append(f"❌ Неизвестная ошибка: {type(e).__name__}: {e}")
+                    last_error = f"{type(e).__name__}: {e}"
+                    time.sleep(1)
+                    continue
+            
+            if resp and resp.status_code == 200:
+                break
+        
+        # Проверяем успешность загрузки
+        if not resp or resp.status_code != 200:
+            steps.append(f"❌ Ошибка после всех попыток: {last_error}")
             return [], steps
+        
+        # Обработка успешно загруженного контента
+        content = resp.text.strip()
+        steps.append(f"✅ Загружено {len(content)} символов")
+        
+        # Пробуем декодировать Base64
+        if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
+            decoded = _try_multilevel_b64(content, max_depth=5)
+            if decoded:
+                all_keys = []
+                for item in decoded:
+                    all_keys.extend(_extract_vpn_keys(item))
+                if all_keys:
+                    steps.append(f"✅ Найдено {len(all_keys)} ключей (Base64)")
+                    return _dedup(all_keys), steps
+        
+        # Ищем ключи напрямую
+        keys = _extract_vpn_keys(content)
+        if keys:
+            steps.append(f"✅ Найдено {len(keys)} ключей")
+            return _dedup(keys), steps
+        
+        # Если это HTML — ищем ссылки на подписки
+        if '<' in content and '>' in content:
+            steps.append("🔍 Обнаружен HTML, ищу ссылки на подписки...")
+            soup = BeautifulSoup(content, 'html.parser')
+            for a in soup.find_all('a'):
+                href = a.get('href', '')
+                if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href):
+                    if href.startswith('http'):
+                        steps.append(f"⬇️ Пробую загрузить: {href[:50]}...")
+                        try:
+                            sub_resp = requests.get(href, timeout=30, headers={'User-Agent': user_agents[0]})
+                            if sub_resp.status_code == 200:
+                                sub_keys = _parse_keys_from_content(sub_resp.text)
+                                if sub_keys:
+                                    steps.append(f"✅ Найдено {len(sub_keys)} ключей (по ссылке)")
+                                    return _dedup(sub_keys), steps
+                        except:
+                            pass
+        
+        steps.append(f"❌ Ключи не найдены")
+        return [], steps
 
     # ОБЫЧНЫЙ ТЕКСТ
     keys = load_keys_from_text(text)
@@ -2122,6 +2185,81 @@ def callback_edit_admin(call):
         bot.answer_callback_query(call.id, "❌ Админ не найден.")
         return
     
+    # Перерисовываем меню прав
+    _redraw_admin_perms(call, target_id)
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_perm_'))
+def callback_toggle_perm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    perm_key = parts[3]
+    
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя менять права владельца.")
+        return
+    
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Админ не найден.")
+        return
+    
+    current_perms = get_admin_permissions(target_id)
+    current_perms[perm_key] = not current_perms.get(perm_key, False)
+    update_admin_permissions(target_id, current_perms)
+    
+    bot.answer_callback_query(call.id, f"✅ {'Включено' if current_perms[perm_key] else 'Отключено'}")
+    
+    # Перерисовываем меню прав напрямую
+    _redraw_admin_perms(call, target_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reset_perm_'))
+def callback_reset_perm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    target_id = int(call.data.split('_')[2])
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя сбросить права владельца.")
+        return
+    
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Админ не найден.")
+        return
+    
+    role = get_admin_role(target_id) or 'junior'
+    new_perms = ROLE_PRESETS[role]['permissions'].copy()
+    update_admin_permissions(target_id, new_perms)
+    
+    bot.answer_callback_query(call.id, "✅ Права сброшены к настройкам роли!")
+    
+    # Перерисовываем меню прав напрямую
+    _redraw_admin_perms(call, target_id)
+
+
+def _redraw_admin_perms(call, target_id):
+    """
+    Перерисовывает меню настройки прав без использования fake CallbackQuery.
+    Эта функция используется вместо создания фиктивных callback-запросов.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not result:
+        return
+    
     current_perms = get_admin_permissions(target_id)
     role = result[0] or 'junior'
     role_name = ROLE_PRESETS.get(role, {}).get('name', role)
@@ -2147,90 +2285,7 @@ def callback_edit_admin(call):
             reply_markup=kb
         )
     except Exception as e:
-        bot.send_message(
-            user_id,
-            text,
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    bot.answer_callback_query(call.id)
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_perm_'))
-def callback_toggle_perm(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    
-    parts = call.data.split('_')
-    target_id = int(parts[2])
-    perm_key = parts[3]
-    
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя менять права владельца.")
-        return
-    
-    # Проверяем, существует ли админ
-    if not is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Админ не найден.")
-        return
-    
-    current_perms = get_admin_permissions(target_id)
-    current_perms[perm_key] = not current_perms.get(perm_key, False)
-    update_admin_permissions(target_id, current_perms)
-    
-    bot.answer_callback_query(call.id, f"✅ {'Включено' if current_perms[perm_key] else 'Отключено'}")
-    
-    # Обновляем сообщение с правами
-    try:
-        fake_call = types.CallbackQuery(
-            id="dummy",
-            from_user=call.from_user,
-            message=call.message,
-            chat_instance="dummy",
-            data=f"edit_admin_{target_id}"
-        )
-        callback_edit_admin(fake_call)
-    except Exception as e:
-        print(f"[toggle_perm] Ошибка обновления: {e}")
-
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('reset_perm_'))
-def callback_reset_perm(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    
-    target_id = int(call.data.split('_')[2])
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя сбросить права владельца.")
-        return
-    
-    # Проверяем, существует ли админ
-    if not is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Админ не найден.")
-        return
-    
-    role = get_admin_role(target_id) or 'junior'
-    new_perms = ROLE_PRESETS[role]['permissions'].copy()
-    update_admin_permissions(target_id, new_perms)
-    
-    bot.answer_callback_query(call.id, "✅ Права сброшены к настройкам роли!")
-    
-    # Обновляем сообщение с правами
-    try:
-        fake_call = types.CallbackQuery(
-            id="dummy",
-            from_user=call.from_user,
-            message=call.message,
-            chat_instance="dummy",
-            data=f"edit_admin_{target_id}"
-        )
-        callback_edit_admin(fake_call)
-    except Exception as e:
-        print(f"[reset_perm] Ошибка обновления: {e}")
+        print(f"[_redraw_admin_perms] Ошибка: {e}")
 
 
 # ==================== УПРАВЛЕНИЕ АДМИНАМИ ====================
@@ -2401,16 +2456,9 @@ def callback_remove_admin(call):
     except:
         pass
     
-    # Возвращаемся к списку админов
+    # Возвращаемся к списку админов — используем реальный call
     try:
-        fake_call = types.CallbackQuery(
-            id="dummy",
-            from_user=call.from_user,
-            message=call.message,
-            chat_instance="dummy",
-            data="admin_manage_admins"
-        )
-        _show_admin_list_for_call(fake_call)
+        _show_admin_list_for_call(call)
     except Exception as e:
         print(f"[remove_admin] Ошибка обновления: {e}")
 
@@ -4090,6 +4138,95 @@ def ping():
 @app.route('/health')
 def health():
     return "OK", 200
+
+@app.route('/test_network')
+def test_network():
+    """Тестовый маршрут для проверки сетевого подключения бота"""
+    results = {
+        'status': 'ok',
+        'timestamp': datetime.now().isoformat(),
+        'tests': {}
+    }
+    
+    # Тест 1: HTTP-запрос к Telegram API
+    try:
+        resp = requests.get(f'https://api.telegram.org/bot{BOT_TOKEN}/getMe', timeout=10)
+        results['tests']['telegram_api'] = {
+            'status': 'ok',
+            'code': resp.status_code,
+            'elapsed': resp.elapsed.total_seconds()
+        }
+    except Exception as e:
+        results['tests']['telegram_api'] = {
+            'status': 'fail',
+            'error': str(e)
+        }
+        results['status'] = 'fail'
+    
+    # Тест 2: Проверка DNS (google.com)
+    try:
+        socket.gethostbyname('google.com')
+        results['tests']['dns'] = {'status': 'ok'}
+    except Exception as e:
+        results['tests']['dns'] = {
+            'status': 'fail',
+            'error': str(e)
+        }
+        results['status'] = 'fail'
+    
+    # Тест 3: Проверка подключения к Telegram Bot
+    try:
+        bot.get_me()
+        results['tests']['telegram_bot'] = {'status': 'ok'}
+    except Exception as e:
+        results['tests']['telegram_bot'] = {
+            'status': 'fail',
+            'error': str(e)
+        }
+        results['status'] = 'fail'
+    
+    # Тест 4: Проверка базы данных
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        conn.close()
+        results['tests']['database'] = {'status': 'ok'}
+    except Exception as e:
+        results['tests']['database'] = {
+            'status': 'fail',
+            'error': str(e)
+        }
+        results['status'] = 'fail'
+    
+    # Форматируем ответ в зависимости от формата запроса
+    if request.args.get('format') == 'json':
+        return json.dumps(results, indent=2), 200, {'Content-Type': 'application/json'}
+    else:
+        # Человекочитаемый ответ
+        html = f"""
+        <html>
+        <head><title>Network Test</title></head>
+        <body>
+            <h1>🌐 Тест сетевого подключения</h1>
+            <p>Время: {results['timestamp']}</p>
+            <p>Общий статус: <b>{'✅ OK' if results['status'] == 'ok' else '❌ FAIL'}</b></p>
+            <hr>
+            <h2>Результаты тестов:</h2>
+            <ul>
+        """
+        for test_name, test_result in results['tests'].items():
+            status = '✅' if test_result['status'] == 'ok' else '❌'
+            html += f"<li><b>{test_name}</b>: {status} {test_result.get('error', '')}</li>"
+        html += """
+            </ul>
+            <hr>
+            <p><a href="/test_network?format=json">JSON-версия</a></p>
+        </body>
+        </html>
+        """
+        return html
 
 @app.route('/sub/<token>')
 def subscription(token):
