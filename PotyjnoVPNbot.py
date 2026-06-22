@@ -1914,6 +1914,40 @@ def callback_admin_keys_reset_issued(call):
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
 
+# ==================== ОБРАБОТЧИК ЗАГРУЗКИ КЛЮЧЕЙ (АДМИН) ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in admin_keys_loading)
+def admin_load_keys_inline(message):
+    user_id = message.from_user.id
+    if user_id not in admin_keys_loading:
+        return
+    
+    raw = message.text or message.caption or ''
+    keys = load_keys_from_text(raw) if raw else []
+    
+    if not keys and message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            data = bot.download_file(file.file_path)
+            keys = load_keys_from_text(data.decode('utf-8', errors='ignore'))
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+            return
+    
+    if keys:
+        admin_keys_loading[user_id]['keys'].extend(keys)
+        admin_keys_loading[user_id]['keys'] = _dedup(admin_keys_loading[user_id]['keys'])
+        bot.reply_to(
+            message,
+            f"✅ Загружено {len(keys)} ключей.\n"
+            f"📊 Всего в списке: {len(admin_keys_loading[user_id]['keys'])} ключей\n\n"
+            "Продолжайте загрузку или нажмите *Завершить*",
+            parse_mode="Markdown"
+        )
+    else:
+        bot.reply_to(message, "❌ Не найдено ключей. Проверьте формат.")
+
+
 # ==================== ADMIN CALLBACKS ====================
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
@@ -3219,14 +3253,19 @@ def cmd_check_user(message):
     user_id = message.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'check_user'):
         return
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ /check [ID или @username]")
+    
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ /check [ID или @username]\n\nПример: `/check 123456789` или `/check @mel1ste` или `/check tg://user?id=123456789`", parse_mode="Markdown")
         return
-    target_id = get_user_id_from_input(args[1])
+    
+    target_input = parts[1].strip()
+    target_id = get_user_id_from_input(target_input)
     if not target_id:
-        bot.reply_to(message, "❌ Неверный ID")
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{target_input}`")
         return
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT subscription_end, is_blocked, token FROM users WHERE user_id = %s", (target_id,))
@@ -3249,14 +3288,19 @@ def cmd_user_info(message):
     user_id = message.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'user_info'):
         return
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ /user [ID или @username]")
+    
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ /user [ID или @username]\n\nПример: `/user 123456789` или `/user @mel1ste` или `/user tg://user?id=123456789`", parse_mode="Markdown")
         return
-    target_id = get_user_id_from_input(args[1])
+    
+    target_input = parts[1].strip()
+    target_id = get_user_id_from_input(target_input)
     if not target_id:
-        bot.reply_to(message, "❌ Неверный ID")
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{target_input}`")
         return
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT subscription_end, is_blocked, token, last_activity FROM users WHERE user_id = %s", (target_id,))
@@ -3279,19 +3323,33 @@ def cmd_add_days(message):
     user_id = message.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'add_days'):
         return
-    args = message.text.split()
-    if len(args) < 3:
-        bot.reply_to(message, "❌ /add_days [ID или @username] [дни]")
+    
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ /add_days [ID или @username] [дни]\n\nПример: `/add_days 123456789 30` или `/add_days @mel1ste 30` или `/add_days tg://user?id=123456789 30`", parse_mode="Markdown")
         return
-    target_id = get_user_id_from_input(args[1])
+    
+    args = parts[1].strip().split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ /add_days [ID или @username] [дни]", parse_mode="Markdown")
+        return
+    
+    target_id = get_user_id_from_input(args[0])
     if not target_id:
-        bot.reply_to(message, "❌ Неверный ID")
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{args[0]}`")
         return
+    
     try:
-        days = int(args[2])
+        days = int(args[1])
     except:
         bot.reply_to(message, "❌ Дни должны быть числом")
         return
+    
+    if days < 1:
+        bot.reply_to(message, "❌ Количество дней должно быть больше 0.")
+        return
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
@@ -3315,19 +3373,33 @@ def cmd_remove_days(message):
     user_id = message.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'remove_days'):
         return
-    args = message.text.split()
-    if len(args) < 3:
-        bot.reply_to(message, "❌ /remove_days [ID или @username] [дни]")
+    
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ /remove_days [ID или @username] [дни]\n\nПример: `/remove_days 123456789 30` или `/remove_days @mel1ste 30` или `/remove_days tg://user?id=123456789 30`", parse_mode="Markdown")
         return
-    target_id = get_user_id_from_input(args[1])
+    
+    args = parts[1].strip().split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ /remove_days [ID или @username] [дни]", parse_mode="Markdown")
+        return
+    
+    target_id = get_user_id_from_input(args[0])
     if not target_id:
-        bot.reply_to(message, "❌ Неверный ID")
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{args[0]}`")
         return
+    
     try:
-        days = int(args[2])
+        days = int(args[1])
     except:
         bot.reply_to(message, "❌ Дни должны быть числом")
         return
+    
+    if days < 1:
+        bot.reply_to(message, "❌ Количество дней должно быть больше 0.")
+        return
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
@@ -3353,17 +3425,23 @@ def cmd_block_user(message):
     user_id = message.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'block_user'):
         return
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ /block [ID или @username]")
+    
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ /block [ID или @username]\n\nПример: `/block 123456789` или `/block @mel1ste` или `/block tg://user?id=123456789`", parse_mode="Markdown")
         return
-    target_id = get_user_id_from_input(args[1])
+    
+    target_input = parts[1].strip()
+    target_id = get_user_id_from_input(target_input)
     if not target_id:
-        bot.reply_to(message, "❌ Неверный ID")
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{target_input}`")
         return
+    
     if target_id == ADMIN_ID:
-        bot.reply_to(message, "❌ Нельзя")
+        bot.reply_to(message, "❌ Нельзя заблокировать создателя.")
         return
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("UPDATE users SET is_blocked = 1 WHERE user_id = %s", (target_id,))
@@ -3377,14 +3455,19 @@ def cmd_unblock_user(message):
     user_id = message.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'unblock_user'):
         return
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ /unblock [ID или @username]")
+    
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ /unblock [ID или @username]\n\nПример: `/unblock 123456789` или `/unblock @mel1ste` или `/unblock tg://user?id=123456789`", parse_mode="Markdown")
         return
-    target_id = get_user_id_from_input(args[1])
+    
+    target_input = parts[1].strip()
+    target_id = get_user_id_from_input(target_input)
     if not target_id:
-        bot.reply_to(message, "❌ Неверный ID")
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{target_input}`")
         return
+    
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("UPDATE users SET is_blocked = 0 WHERE user_id = %s", (target_id,))
@@ -3403,16 +3486,18 @@ def cmd_add_admin(message):
         bot.reply_to(message, "⛔️ У вас нет прав на управление админами.")
         return
     
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ Использование: `/add_admin [ID или @username]`\n\nПример: `/add_admin 123456789` или `/add_admin @mel1ste`", parse_mode="Markdown")
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ Использование: `/add_admin [ID или @username]`\n\nПример: `/add_admin 123456789` или `/add_admin @mel1ste` или `/add_admin tg://user?id=123456789`", parse_mode="Markdown")
         return
     
-    target_input = args[1]
+    target_input = parts[1].strip()
     target_id = get_user_id_from_input(target_input)
     
     if not target_id:
-        bot.reply_to(message, f"❌ Не удалось найти пользователя: `{target_input}`\n\nПроверьте правильность ID или @username.", parse_mode="Markdown")
+        bot.reply_to(message, f"❌ Не удалось найти пользователя: `{target_input}`\n\nПроверьте правильность ID, @username или ссылки.", parse_mode="Markdown")
         return
     
     if target_id == ADMIN_ID:
@@ -3439,19 +3524,26 @@ def cmd_add_admin(message):
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
-        (target_id, role, json.dumps(perms), user_id, int(time.time()))
-    )
-    conn.commit()
+    try:
+        cur.execute(
+            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
+            (target_id, role, json.dumps(perms), user_id, int(time.time()))
+        )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        bot.reply_to(message, f"❌ Ошибка БД: {e}")
+        cur.close()
+        conn.close()
+        return
     cur.close()
     conn.close()
     
     name = get_user_display_name(target_id)
-    bot.reply_to(message, f"✅ {name} (`{target_id}`) назначен админом!")
+    bot.reply_to(message, f"✅ {name} (`{target_id}`) назначен админом!", parse_mode="Markdown")
     
     try:
-        bot.send_message(target_id, f"👑 Вам назначена роль администратора!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
+        bot.send_message(target_id, "👑 Вам назначена роль администратора!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
     except:
         pass
 
@@ -3465,12 +3557,14 @@ def cmd_remove_admin(message):
         bot.reply_to(message, "⛔️ У вас нет прав на управление админами.")
         return
     
-    args = message.text.split()
-    if len(args) < 2:
-        bot.reply_to(message, "❌ Использование: `/remove_admin [ID или @username]`\n\nПример: `/remove_admin 123456789` или `/remove_admin @mel1ste`", parse_mode="Markdown")
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    
+    if len(parts) < 2:
+        bot.reply_to(message, "❌ Использование: `/remove_admin [ID или @username]`\n\nПример: `/remove_admin 123456789` или `/remove_admin @mel1ste` или `/remove_admin tg://user?id=123456789`", parse_mode="Markdown")
         return
     
-    target_input = args[1]
+    target_input = parts[1].strip()
     target_id = get_user_id_from_input(target_input)
     
     if not target_id:
@@ -3487,13 +3581,20 @@ def cmd_remove_admin(message):
     
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
-    conn.commit()
+    try:
+        cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        bot.reply_to(message, f"❌ Ошибка БД: {e}")
+        cur.close()
+        conn.close()
+        return
     cur.close()
     conn.close()
     
     name = get_user_display_name(target_id)
-    bot.reply_to(message, f"✅ У {name} (`{target_id}`) отозваны права администратора!")
+    bot.reply_to(message, f"✅ У {name} (`{target_id}`) отозваны права администратора!", parse_mode="Markdown")
     
     try:
         bot.send_message(target_id, "❌ Ваши права администратора были отозваны.")
@@ -3548,9 +3649,8 @@ def handle_private_messages(message):
         admin_announce_text(message)
         return
 
-    if user_id in admin_keys_loading:
-        admin_load_keys_inline(message)
-        return
+    # 🔥 admin_keys_loading обрабатывается отдельным декоратором
+    # НЕ вызываем здесь admin_load_keys_inline
 
     if user_id in autopost_loading:
         handle_autopost_load_keys(message)
@@ -3839,4 +3939,3 @@ if __name__ == "__main__":
         print(f"❌ Ошибка бота: {e}")
         time.sleep(5)
         os.execv(sys.executable, ['python'] + sys.argv)
-    
