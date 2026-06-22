@@ -244,6 +244,8 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
+    
+    # Создаём таблицу users
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -256,15 +258,34 @@ def init_db():
     """)
     cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
     conn.commit()
+
+    # Создаём таблицу admins (если не существует)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS admins (
-            user_id BIGINT PRIMARY KEY,
-            role TEXT DEFAULT 'junior',
-            permissions TEXT,
-            added_by BIGINT,
-            added_at BIGINT
+            user_id BIGINT PRIMARY KEY
         )
     """)
+    conn.commit()
+    
+    # МИГРАЦИЯ: добавляем недостающие колонки в существующую таблицу
+    cur.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'junior'")
+    cur.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS permissions TEXT")
+    cur.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS added_by BIGINT")
+    cur.execute("ALTER TABLE admins ADD COLUMN IF NOT EXISTS added_at BIGINT")
+    conn.commit()
+    
+    # Добавляем владельца, если его нет
+    try:
+        cur.execute("""
+            INSERT INTO admins (user_id, role, permissions, added_by, added_at) 
+            VALUES (%s, %s, %s, %s, %s) 
+            ON CONFLICT (user_id) DO UPDATE SET role = %s, permissions = %s
+        """, (ADMIN_ID, 'owner', json.dumps({p: True for p in PERMISSIONS}), ADMIN_ID, int(time.time()), 'owner', json.dumps({p: True for p in PERMISSIONS})))
+        conn.commit()
+        print(f"[init] ✅ Создатель {ADMIN_ID} добавлен с ролью Владелец")
+    except Exception as e:
+        print(f"[init] Ошибка добавления создателя: {e}")
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS referrals (
             id SERIAL PRIMARY KEY,
@@ -283,18 +304,6 @@ def init_db():
             value TEXT
         )
     """)
-
-    try:
-        cur.execute("""
-            INSERT INTO admins (user_id, role, permissions, added_by, added_at) 
-            VALUES (%s, %s, %s, %s, %s) 
-            ON CONFLICT (user_id) DO UPDATE SET role = %s, permissions = %s
-        """, (ADMIN_ID, 'owner', json.dumps({p: True for p in PERMISSIONS}), ADMIN_ID, int(time.time()), 'owner', json.dumps({p: True for p in PERMISSIONS})))
-        conn.commit()
-        print(f"[init] ✅ Создатель {ADMIN_ID} добавлен с ролью Владелец")
-    except Exception as e:
-        print(f"[init] Ошибка добавления создателя: {e}")
-
     conn.commit()
     cur.close()
     conn.close()
@@ -655,7 +664,6 @@ def get_user_display_name(user_id):
         return str(user_id)
 
 def update_user_username(user_id, username):
-    """Обновить юзернейм пользователя в базе данных"""
     if not username:
         return
     try:
@@ -669,7 +677,6 @@ def update_user_username(user_id, username):
         print(f"[update_user_username] Ошибка: {e}")
 
 def _find_user_by_username_in_db(username):
-    """Поиск пользователя по юзернейму в базе данных"""
     try:
         username_lower = username.lower().lstrip('@')
         conn = get_db_connection()
@@ -685,10 +692,8 @@ def _find_user_by_username_in_db(username):
     return None
 
 def get_user_id_from_input(user_input):
-    """Получить ID пользователя из различных форматов ввода"""
     user_input = user_input.strip()
     
-    # Формат tg://user?id=123456789
     tg_match = re.search(r'tg://user\?id=(\d+)', user_input)
     if tg_match:
         try:
@@ -696,7 +701,6 @@ def get_user_id_from_input(user_input):
         except:
             return None
     
-    # Формат https://t.me/username или t.me/username
     tme_match = re.search(r't\.me/([a-zA-Z0-9_]+)', user_input)
     if tme_match:
         username = tme_match.group(1)
@@ -709,7 +713,6 @@ def get_user_id_from_input(user_input):
         except:
             return None
     
-    # @username
     if user_input.startswith('@'):
         username = user_input.lstrip('@')
         uid = _find_user_by_username_in_db(username)
@@ -721,7 +724,6 @@ def get_user_id_from_input(user_input):
         except:
             return None
     
-    # Просто число
     try:
         return int(user_input)
     except:
@@ -925,7 +927,6 @@ def cmd_start(message):
 
     add_subscribe_record(user_id)
 
-    # Парсинг реферальной ссылки
     referrer_id = None
     if message.text:
         parts = message.text.strip().split()
@@ -1037,7 +1038,6 @@ def _register_user(user_id, referrer_id=None):
     )
     conn.commit()
     
-    # Сохраняем юзернейм после регистрации
     try:
         chat = bot.get_chat(user_id)
         if chat.username:
@@ -1717,7 +1717,6 @@ def _show_admin_list_for_call(call):
 
 # ==================== УПРАВЛЕНИЕ КЛЮЧАМИ ====================
 
-# УБРАН @bot.callback_query_handler декоратор — вызывается только из admin_callback
 def callback_admin_keys(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -2054,6 +2053,186 @@ def admin_callback(call):
         return
 
 
+# ==================== НАСТРОЙКА ПРАВ АДМИНОВ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "edit_admin_perms")
+def callback_edit_admin_perms(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    bot.answer_callback_query(call.id)
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, role FROM admins WHERE user_id != %s", (ADMIN_ID,))
+    admins = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    if not admins:
+        bot.send_message(user_id, "❌ Нет других админов для настройки.")
+        return
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for admin_id, role in admins:
+        name = get_user_display_name(admin_id)
+        kb.add(types.InlineKeyboardButton(f"{name} ({role})", callback_data=f"edit_admin_{admin_id}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_manage_admins"))
+    
+    try:
+        bot.edit_message_text(
+            "⚙️ *Выберите админа для настройки прав:*",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    except:
+        bot.send_message(
+            user_id,
+            "⚙️ *Выберите админа для настройки прав:*",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('edit_admin_'))
+def callback_edit_admin(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    target_id = int(call.data.split('_')[2])
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя редактировать владельца.")
+        return
+    
+    # Проверяем, существует ли админ
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not result:
+        bot.answer_callback_query(call.id, "❌ Админ не найден.")
+        return
+    
+    current_perms = get_admin_permissions(target_id)
+    role = result[0] or 'junior'
+    role_name = ROLE_PRESETS.get(role, {}).get('name', role)
+    name = get_user_display_name(target_id)
+    
+    text = f"⚙️ *Настройка прав*\n\n👤 {name} (`{target_id}`)\n👑 Роль: {role_name}\n\nВключите/отключите нужные разрешения:\n\n"
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    
+    for perm_key, perm_name in PERMISSIONS.items():
+        status = "✅" if current_perms.get(perm_key, False) else "❌"
+        kb.add(types.InlineKeyboardButton(f"{status} {perm_name}", callback_data=f"toggle_perm_{target_id}_{perm_key}"))
+    
+    kb.add(types.InlineKeyboardButton("🔄 Сбросить к роли", callback_data=f"reset_perm_{target_id}"))
+    kb.add(types.InlineKeyboardButton("🗑️ Удалить админа", callback_data=f"remove_admin_{target_id}"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="edit_admin_perms"))
+    
+    try:
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    except Exception as e:
+        bot.send_message(
+            user_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_perm_'))
+def callback_toggle_perm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    perm_key = parts[3]
+    
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя менять права владельца.")
+        return
+    
+    # Проверяем, существует ли админ
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Админ не найден.")
+        return
+    
+    current_perms = get_admin_permissions(target_id)
+    current_perms[perm_key] = not current_perms.get(perm_key, False)
+    update_admin_permissions(target_id, current_perms)
+    
+    bot.answer_callback_query(call.id, f"✅ {'Включено' if current_perms[perm_key] else 'Отключено'}")
+    
+    # Обновляем сообщение с правами
+    try:
+        fake_call = types.CallbackQuery(
+            id="dummy",
+            from_user=call.from_user,
+            message=call.message,
+            chat_instance="dummy",
+            data=f"edit_admin_{target_id}"
+        )
+        callback_edit_admin(fake_call)
+    except Exception as e:
+        print(f"[toggle_perm] Ошибка обновления: {e}")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reset_perm_'))
+def callback_reset_perm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    target_id = int(call.data.split('_')[2])
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя сбросить права владельца.")
+        return
+    
+    # Проверяем, существует ли админ
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Админ не найден.")
+        return
+    
+    role = get_admin_role(target_id) or 'junior'
+    new_perms = ROLE_PRESETS[role]['permissions'].copy()
+    update_admin_permissions(target_id, new_perms)
+    
+    bot.answer_callback_query(call.id, "✅ Права сброшены к настройкам роли!")
+    
+    # Обновляем сообщение с правами
+    try:
+        fake_call = types.CallbackQuery(
+            id="dummy",
+            from_user=call.from_user,
+            message=call.message,
+            chat_instance="dummy",
+            data=f"edit_admin_{target_id}"
+        )
+        callback_edit_admin(fake_call)
+    except Exception as e:
+        print(f"[reset_perm] Ошибка обновления: {e}")
+
+
 # ==================== УПРАВЛЕНИЕ АДМИНАМИ ====================
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_admin_start")
@@ -2192,7 +2371,7 @@ def callback_grant_admin(call):
 # ==================== ЗАБРАТЬ АДМИНКУ ====================
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
-def callback_remove_admin_cb(call):
+def callback_remove_admin(call):
     user_id = call.from_user.id
     target_id = int(call.data.split('_')[2])
 
@@ -2204,6 +2383,10 @@ def callback_remove_admin_cb(call):
         bot.answer_callback_query(call.id, "❌ Нельзя удалить владельца.")
         return
 
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Пользователь не является админом.")
+        return
+
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
@@ -2211,12 +2394,25 @@ def callback_remove_admin_cb(call):
     cur.close()
     conn.close()
 
-    bot.answer_callback_query(call.id, "✅ Админские права отозваны!")
+    bot.answer_callback_query(call.id, "✅ Админ удален!")
 
     try:
         bot.send_message(target_id, "❌ Ваши права администратора были отозваны.")
     except:
         pass
+    
+    # Возвращаемся к списку админов
+    try:
+        fake_call = types.CallbackQuery(
+            id="dummy",
+            from_user=call.from_user,
+            message=call.message,
+            chat_instance="dummy",
+            data="admin_manage_admins"
+        )
+        _show_admin_list_for_call(fake_call)
+    except Exception as e:
+        print(f"[remove_admin] Ошибка обновления: {e}")
 
 
 # ==================== ADMIN USERS LIST ====================
@@ -2700,6 +2896,7 @@ def callback_unblock(call):
     except:
         pass
 
+
 # ==================== АВТОПОСТИНГ ====================
 
 @bot.callback_query_handler(func=lambda call: call.data == "autopost_back")
@@ -3014,6 +3211,7 @@ def auto_post_keys_to_channel():
         increment_setting('total_keys_issued', 1)
     except Exception as e:
         print(f"[autopost] Ошибка: {e}")
+
 
 # ==================== РАССЫЛКА ====================
 
@@ -3648,9 +3846,6 @@ def handle_private_messages(message):
     if user_id in announce_data:
         admin_announce_text(message)
         return
-
-    # 🔥 admin_keys_loading обрабатывается отдельным декоратором
-    # НЕ вызываем здесь admin_load_keys_inline
 
     if user_id in autopost_loading:
         handle_autopost_load_keys(message)
