@@ -15,6 +15,7 @@ import warnings
 import urllib3
 from datetime import datetime, timedelta
 from threading import Thread
+from waitress import serve  # ДОБАВЛЕН ИМПОРТ
 
 import telebot
 from telebot import types
@@ -81,32 +82,30 @@ def update_activity():
 last_activity_time = time.time()
 
 # ==================== CONFIG ====================
-BOT_TOKEN = os.getenv( 'BOT_TOKEN', '8621740437:AAFFrgKmayXan20sx6JwQehPy1XKb_E7o8w')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '8176196456'))
-DATABASE_URL = os.getenv('DATABASE_URL')
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+ADMIN_ID = 8176196456  # ИСПРАВЛЕНО: установлен ID владельца
+DATABASE_URL = 'postgresql://vpn_bot_c8ir_user:lSmTECwXp5L4ORrcCyBSLs4ni4BI1PuX@dpg-d8rdoqernols73fa7t30-a:5432/vpn_bot_c8ir'  # ИСПРАВЛЕНО
 CHANNEL_ID = -1003668283208
 CHANNEL_LINK = 'https://t.me/ciorsa'
 SUPPORT = '@mel1ste'
 AUTO_POST_CHANNEL = -1003668283208
 AUTO_POST_TOPIC_ID = 461
 AUTO_POST_INTERVAL = 600
+PROXY_LOADING_TIMEOUT = 600  # 10 минут
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
-check_results = {}
+# Активные словари
 search_cache = {}
 decrypt_results = {}
-proxy_check_results = {}
-loading_sessions = {}
 announce_data = {}
-channel_selection = {}
 manage_cache = {}
 captcha_sessions = {}
-autopost_history = {}
-autopost_active = {}
-admin_keys_loading = {}
 autopost_loading = {}
+proxy_url_loading = {}
+autopost_active = {}
+autopost_history = {}
 
 KEY_TEMPLATE = """\
 #profile-title: 🌐 Потужно VPN Free
@@ -597,10 +596,10 @@ def load_keys_from_url(raw_url):
             continue
     if not content:
         return []
-    return _parse_keys_from_content(content)
+    return _parse_keys_from_content(content, depth=0)
 
 def load_keys_from_text(text):
-    return _parse_keys_from_content(text)
+    return _parse_keys_from_content(text, depth=0)
 
 def _extract_keys_from_json(content):
     """Извлекает VPN ключи из JSON разных форматов"""
@@ -831,9 +830,10 @@ def _build_key_from_clash(data):
     except:
         return None
 
-def _parse_keys_from_content(content):
+def _parse_keys_from_content(content, depth=0):
+    """Парсинг ключей с защитой от бесконечной рекурсии"""
     all_keys = []
-    if not content:
+    if not content or depth > 3:
         return []
     
     # 1. Прямой поиск VPN ключей в тексте
@@ -866,7 +866,7 @@ def _parse_keys_from_content(content):
             for dk in decoded_line:
                 all_keys.extend(_extract_vpn_keys(dk))
                 all_keys.extend(_extract_keys_from_json(dk))
-        # Вложенные URL
+        # Вложенные URL - с ограничением глубины
         urls = re.findall(r'https?://[^\s<>"\']+', line)
         for url in urls:
             try:
@@ -876,7 +876,7 @@ def _parse_keys_from_content(content):
                     verify=False
                 )
                 if resp.status_code == 200:
-                    all_keys.extend(_parse_keys_from_content(resp.text))
+                    all_keys.extend(_parse_keys_from_content(resp.text, depth + 1))
             except:
                 pass
     
@@ -1475,12 +1475,31 @@ def cabinet(message):
 │
 └ ℹ️ *Ссылка автообновляется при белых списках*
 
+━━━━━━━━━━━━━━━━━━━━━
+✨ *Рекомендуем клиент Incy VPN*
+
+Простой и удобный VPN-клиент:
+• 🚀 Быстрое подключение в 1 клик
+• 🔒 Надёжное шифрование
+• 📱 iOS и Android
+• ⚡ Поддержка всех наших протоколов
+
+*Импортируй подписку прямо в приложение!*
+━━━━━━━━━━━━━━━━━━━━━
+
 💬 Поддержка: {SUPPORT}"""
 
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
             types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
+        )
+        kb.add(
+            types.InlineKeyboardButton("📲 Импорт в Incy", url=f"incy://sub/{link}"),
+        )
+        kb.row(
+            types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
+            types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
         )
 
         bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
@@ -1525,11 +1544,24 @@ def my_subscription(message):
 └ ℹ️ *Ссылка автообновляется при белых списках*
    *Используйте её для импорта в клиент*
 
+━━━━━━━━━━━━━━━━━━━━━
+✨ *Рекомендуем клиент Incy VPN*
+
+Простой и удобный VPN-клиент:
+• 🚀 Быстрое подключение в 1 клик
+• 🔒 Надёжное шифрование
+• 📱 iOS и Android
+• ⚡ Поддержка всех наших протоколов
+
+*Импортируй подписку прямо в приложение!*
+━━━━━━━━━━━━━━━━━━━━━
+
 📱 *Поддерживаемые клиенты:*
 • V2Ray / V2RayNG
 • Hiddify / Nekobox
 • FlClash / Mihomo
 • Clash Meta / Sing-Box
+• ✨ *Incy VPN (рекомендуем)*
 
 💬 Поддержка: {SUPPORT}"""
 
@@ -1537,6 +1569,13 @@ def my_subscription(message):
             kb.add(
                 types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
                 types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
+            )
+            kb.add(
+                types.InlineKeyboardButton("📲 Импорт в Incy", url=f"incy://sub/{link}"),
+            )
+            kb.row(
+                types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
+                types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
             )
 
             bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
@@ -1669,250 +1708,6 @@ def support(message):
 
 # ==================== РАСШИФРОВКА ПОДПИСКИ ====================
 
-@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
-def decrypt_subscription_start(message):
-    update_activity()
-    if message.chat.type != 'private':
-        return
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    if user_id in decrypt_results:
-        del decrypt_results[user_id]
-    decrypt_results[user_id] = {'waiting': True}
-    bot.reply_to(
-        message,
-        "🔓 *Расшифровка VPN подписки*\n\n"
-        "Отправьте ссылку, текст или файл подписки.\n\n"
-        "Поддерживаю:\n"
-        "• URL подписки\n"
-        "• Base64 (все уровни)\n"
-        "• HTML/JSON\n"
-        "• Схемы: happ://, incy:// и др.\n"
-        "• Файлы с ключами\n\n"
-        "📄 Получите `.txt` файл со всеми ключами.\n\n"
-        "❗ Чтобы выйти из режима расшифровки - нажмите /cancel",
-        parse_mode="Markdown"
-    )
-
-def _parse_subscription_any(raw, steps=None):
-    if steps is None:
-        steps = []
-    text = raw.strip()
-
-    # BELKA.NETWORK
-    if 'belka.network' in text:
-        steps.append(f"🔗 Обнаружена ссылка Belka VPN")
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            resp = requests.get(text, timeout=30, headers=headers, verify=False)
-            if resp.status_code == 200:
-                content = resp.text
-                steps.append(f"✅ Загружено {len(content)} символов")
-                soup = BeautifulSoup(content, 'html.parser')
-                sub_links = []
-                for a in soup.find_all('a'):
-                    href = a.get('href', '')
-                    if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href or 'vless' in href or 'vmess' in href):
-                        sub_links.append(href)
-                    if a.text and ('Получить ссылку' in a.text or 'Copy' in a.text or 'скопировать' in a.text):
-                        onclick = a.get('onclick', '')
-                        if onclick:
-                            match = re.search(r"['\"](https?://[^'\"]+)['\"]", onclick)
-                            if match:
-                                sub_links.append(match.group(1))
-                scripts = soup.find_all('script')
-                for script in scripts:
-                    if script.string:
-                        found = re.findall(r'https?://[^\s<>"\'`]+', script.string)
-                        for link in found:
-                            if len(link) > 30 and ('sub' in link or 'config' in link or 'profile' in link):
-                                sub_links.append(link)
-                text_content = soup.get_text()
-                found_links = re.findall(r'https?://[^\s<>"\'`]+', text_content)
-                for link in found_links:
-                    if len(link) > 30 and ('sub' in link or 'config' in link or 'profile' in link or 'clash' in link):
-                        sub_links.append(link)
-                sub_links = _dedup([l.strip() for l in sub_links if l and l.startswith('http')])
-                if sub_links:
-                    steps.append(f"🔍 Найдено {len(sub_links)} ссылок на подписку")
-                    for link in sub_links:
-                        steps.append(f"⬇️ Пробую загрузить: {link[:50]}...")
-                        try:
-                            sub_resp = requests.get(link, timeout=30, headers=headers, verify=False)
-                            if sub_resp.status_code == 200:
-                                keys = _parse_keys_from_content(sub_resp.text)
-                                if keys:
-                                    steps.append(f"✅ Найдено {len(keys)} ключей")
-                                    return _dedup(keys), steps
-                        except:
-                            pass
-                    steps.append(f"📋 Найдены ссылки, но ключи не извлечены")
-                    return sub_links, steps
-                steps.append(f"❌ Не найдена ссылка на подписку на странице Belka")
-                return [], steps
-            else:
-                steps.append(f"❌ Ошибка загрузки: HTTP {resp.status_code}")
-                return [], steps
-        except Exception as e:
-            steps.append(f"❌ Ошибка: {e}")
-            return [], steps
-
-    # СХЕМЫ ПРИЛОЖЕНИЙ
-    app_scheme_match = re.match(r'^(?:' + APP_SCHEMES + r')://(?:add|sub|crypt\d*|import|install|update|get|fetch)/+(.+)$', text, re.IGNORECASE)
-    if app_scheme_match:
-        steps.append("📱 Обнаружена схема приложения")
-        payload = app_scheme_match.group(1).strip()
-        payload = urllib.parse.unquote(payload)
-        if re.match(r'^[A-Za-z0-9+/_\-=]+$', payload) and len(payload) > 10:
-            decoded = _try_multilevel_b64(payload, max_depth=3)
-            if decoded:
-                for item in decoded:
-                    if re.match(r'https?://', item.strip(), re.IGNORECASE):
-                        try:
-                            resp = requests.get(item.strip(), timeout=30, verify=False)
-                            if resp.status_code == 200:
-                                return _parse_subscription_any(resp.text, steps)
-                        except:
-                            pass
-                    keys = _extract_vpn_keys(item)
-                    if keys:
-                        return _dedup(keys), steps
-        if re.match(r'https?://', payload, re.IGNORECASE):
-            try:
-                resp = requests.get(payload, timeout=30, verify=False)
-                if resp.status_code == 200:
-                    return _parse_subscription_any(resp.text, steps)
-            except:
-                pass
-        keys = _extract_vpn_keys(payload)
-        if keys:
-            return _dedup(keys), steps
-        return [], steps    # ========== HTTP URL (ОБНОВЛЁННЫЙ БЛОК С JSON ПАРСИНГОМ) ==========
-    if re.match(r'^https?://', text, re.IGNORECASE):
-        steps.append(f"⬇️ Загружаю URL: {text[:80]}...")
-        
-        # Массив User-Agent для перебора
-        user_agents = [
-            'v2rayNG/1.8.7',
-            'clash/1.18.0',
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Hiddify/2.0.0',
-        ]
-        
-        last_error = None
-        resp = None
-        
-        # Пробуем разные User-Agent
-        for ua in user_agents:
-            for attempt in range(2):
-                try:
-                    steps.append(f"🔄 Попытка {attempt+1}/2 с User-Agent: {ua[:20]}...")
-                    
-                    resp = requests.get(
-                        text,
-                        timeout=15,
-                        headers={'User-Agent': ua},
-                        verify=False,
-                        allow_redirects=True
-                    )
-                    
-                    steps.append(f"📊 Статус: {resp.status_code}, размер: {len(resp.text)} байт")
-                    
-                    if resp.status_code == 200:
-                        break
-                    last_error = f"HTTP {resp.status_code}"
-                    
-                except requests.exceptions.SSLError as e:
-                    steps.append(f"⚠️ SSL ошибка: {e}")
-                    last_error = f"SSL: {e}"
-                    continue
-                    
-                except requests.exceptions.ConnectionError as e:
-                    steps.append(f"❌ Ошибка соединения: {e}")
-                    last_error = f"Connection: {e}"
-                    time.sleep(1)
-                    continue
-                    
-                except requests.exceptions.Timeout:
-                    steps.append(f"⏰ Таймаут (15s)")
-                    last_error = "Timeout"
-                    time.sleep(1)
-                    continue
-                    
-                except Exception as e:
-                    steps.append(f"❌ Неизвестная ошибка: {type(e).__name__}: {e}")
-                    last_error = f"{type(e).__name__}: {e}"
-                    time.sleep(1)
-                    continue
-            
-            if resp and resp.status_code == 200:
-                break
-        
-        if not resp or resp.status_code != 200:
-            steps.append(f"❌ Ошибка после всех попыток: {last_error}")
-            return [], steps
-        
-        content = resp.text.strip()
-        steps.append(f"✅ Загружено {len(content)} символов")
-        
-        # 1. Base64
-        if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
-            decoded = _try_multilevel_b64(content, max_depth=5)
-            if decoded:
-                all_keys = []
-                for item in decoded:
-                    all_keys.extend(_extract_vpn_keys(item))
-                    all_keys.extend(_extract_keys_from_json(item))
-                if all_keys:
-                    steps.append(f"✅ Найдено {len(all_keys)} ключей (Base64 + JSON)")
-                    return _dedup(all_keys), steps
-        
-        # 2. JSON напрямую
-        json_keys = _extract_keys_from_json(content)
-        if json_keys:
-            steps.append(f"✅ Найдено {len(json_keys)} ключей (JSON)")
-            return _dedup(json_keys), steps
-        
-        # 3. Прямой поиск
-        keys = _extract_vpn_keys(content)
-        if keys:
-            steps.append(f"✅ Найдено {len(keys)} ключей")
-            return _dedup(keys), steps
-        
-        # 4. HTML ссылки
-        if '<' in content and '>' in content:
-            steps.append("🔍 Обнаружен HTML, ищу ссылки на подписки...")
-            soup = BeautifulSoup(content, 'html.parser')
-            for a in soup.find_all('a'):
-                href = a.get('href', '')
-                if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href):
-                    if href.startswith('http'):
-                        steps.append(f"⬇️ Пробую загрузить: {href[:50]}...")
-                        try:
-                            sub_resp = requests.get(href, timeout=30, headers={'User-Agent': user_agents[0]}, verify=False)
-                            if sub_resp.status_code == 200:
-                                sub_keys = _parse_keys_from_content(sub_resp.text)
-                                if sub_keys:
-                                    steps.append(f"✅ Найдено {len(sub_keys)} ключей (по ссылке)")
-                                    return _dedup(sub_keys), steps
-                        except:
-                            pass
-        
-        steps.append(f"❌ Ключи не найдены")
-        return [], steps
-
-    # ОБЫЧНЫЙ ТЕКСТ
-    keys = load_keys_from_text(text)
-    if not keys:
-        keys = _extract_vpn_keys(text)
-    if keys:
-        steps.append(f"🔍 Найдено {len(keys)} ключей")
-        return _dedup(keys), steps
-    steps.append("❌ Ключи не найдены")
-    return [], steps
-
 def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
     if user_id in decrypt_results:
         del decrypt_results[user_id]
@@ -2005,6 +1800,252 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
     t.daemon = True
     t.start()
 
+@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
+def decrypt_subscription_start(message):
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    if user_id in decrypt_results:
+        del decrypt_results[user_id]
+    decrypt_results[user_id] = {'waiting': True}
+    bot.reply_to(
+        message,
+        "🔓 *Расшифровка VPN подписки*\n\n"
+        "Отправьте ссылку, текст или файл подписки.\n\n"
+        "Поддерживаю:\n"
+        "• URL подписки\n"
+        "• Base64 (все уровни)\n"
+        "• HTML/JSON\n"
+        "• Схемы: happ://, incy:// и др.\n"
+        "• Файлы с ключами\n\n"
+        "📄 Получите `.txt` файл со всеми ключами.\n\n"
+        "❗ Чтобы выйти из режима расшифровки - нажмите /cancel",
+        parse_mode="Markdown"
+    )
+
+def _parse_subscription_any(raw, steps=None):
+    if steps is None:
+        steps = []
+    text = raw.strip()
+
+    # BELKA.NETWORK
+    if 'belka.network' in text:
+        steps.append(f"🔗 Обнаружена ссылка Belka VPN")
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            resp = requests.get(text, timeout=30, headers=headers, verify=False)
+            if resp.status_code == 200:
+                content = resp.text
+                steps.append(f"✅ Загружено {len(content)} символов")
+                soup = BeautifulSoup(content, 'html.parser')
+                sub_links = []
+                for a in soup.find_all('a'):
+                    href = a.get('href', '')
+                    if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href or 'vless' in href or 'vmess' in href):
+                        sub_links.append(href)
+                    if a.text and ('Получить ссылку' in a.text or 'Copy' in a.text or 'скопировать' in a.text):
+                        onclick = a.get('onclick', '')
+                        if onclick:
+                            match = re.search(r"['\"](https?://[^'\"]+)['\"]", onclick)
+                            if match:
+                                sub_links.append(match.group(1))
+                scripts = soup.find_all('script')
+                for script in scripts:
+                    if script.string:
+                        found = re.findall(r'https?://[^\s<>"\'`]+', script.string)
+                        for link in found:
+                            if len(link) > 30 and ('sub' in link or 'config' in link or 'profile' in link):
+                                sub_links.append(link)
+                text_content = soup.get_text()
+                found_links = re.findall(r'https?://[^\s<>"\'`]+', text_content)
+                for link in found_links:
+                    if len(link) > 30 and ('sub' in link or 'config' in link or 'profile' in link or 'clash' in link):
+                        sub_links.append(link)
+                sub_links = _dedup([l.strip() for l in sub_links if l and l.startswith('http')])
+                if sub_links:
+                    steps.append(f"🔍 Найдено {len(sub_links)} ссылок на подписку")
+                    for link in sub_links:
+                        steps.append(f"⬇️ Пробую загрузить: {link[:50]}...")
+                        try:
+                            sub_resp = requests.get(link, timeout=30, headers=headers, verify=False)
+                            if sub_resp.status_code == 200:
+                                keys = _parse_keys_from_content(sub_resp.text, depth=0)
+                                if keys:
+                                    steps.append(f"✅ Найдено {len(keys)} ключей")
+                                    return _dedup(keys), steps
+                        except:
+                            pass
+                    steps.append(f"📋 Найдены ссылки, но ключи не извлечены")
+                    return sub_links, steps
+                steps.append(f"❌ Не найдена ссылка на подписку на странице Belka")
+                return [], steps
+            else:
+                steps.append(f"❌ Ошибка загрузки: HTTP {resp.status_code}")
+                return [], steps
+        except Exception as e:
+            steps.append(f"❌ Ошибка: {e}")
+            return [], steps
+
+    # СХЕМЫ ПРИЛОЖЕНИЙ
+    app_scheme_match = re.match(r'^(?:' + APP_SCHEMES + r')://(?:add|sub|crypt\d*|import|install|update|get|fetch)/+(.+)$', text, re.IGNORECASE)
+    if app_scheme_match:
+        steps.append("📱 Обнаружена схема приложения")
+        payload = app_scheme_match.group(1).strip()
+        payload = urllib.parse.unquote(payload)
+        if re.match(r'^[A-Za-z0-9+/_\-=]+$', payload) and len(payload) > 10:
+            decoded = _try_multilevel_b64(payload, max_depth=3)
+            if decoded:
+                for item in decoded:
+                    if re.match(r'https?://', item.strip(), re.IGNORECASE):
+                        try:
+                            resp = requests.get(item.strip(), timeout=30, verify=False)
+                            if resp.status_code == 200:
+                                return _parse_subscription_any(resp.text, steps)
+                        except:
+                            pass
+                    keys = _extract_vpn_keys(item)
+                    if keys:
+                        return _dedup(keys), steps
+        if re.match(r'https?://', payload, re.IGNORECASE):
+            try:
+                resp = requests.get(payload, timeout=30, verify=False)
+                if resp.status_code == 200:
+                    return _parse_subscription_any(resp.text, steps)
+            except:
+                pass
+        keys = _extract_vpn_keys(payload)
+        if keys:
+            return _dedup(keys), steps
+        return [], steps
+
+    # ========== HTTP URL (ОБНОВЛЁННЫЙ БЛОК С JSON ПАРСИНГОМ) ==========
+    if re.match(r'^https?://', text, re.IGNORECASE):
+        steps.append(f"⬇️ Загружаю URL: {text[:80]}...")
+        
+        # Массив User-Agent для перебора
+        user_agents = [
+            'v2rayNG/1.8.7',
+            'clash/1.18.0',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Hiddify/2.0.0',
+        ]
+        
+        last_error = None
+        resp = None
+        
+        # Пробуем разные User-Agent
+        for ua in user_agents:
+            for attempt in range(2):
+                try:
+                    steps.append(f"🔄 Попытка {attempt+1}/2 с User-Agent: {ua[:20]}...")
+                    
+                    resp = requests.get(
+                        text,
+                        timeout=15,
+                        headers={'User-Agent': ua},
+                        verify=False,
+                        allow_redirects=True
+                    )
+                    
+                    steps.append(f"📊 Статус: {resp.status_code}, размер: {len(resp.text)} байт")
+                    
+                    if resp.status_code == 200:
+                        break
+                    last_error = f"HTTP {resp.status_code}"
+                    
+                except requests.exceptions.SSLError as e:
+                    steps.append(f"⚠️ SSL ошибка: {e}")
+                    last_error = f"SSL: {e}"
+                    continue
+                    
+                except requests.exceptions.ConnectionError as e:
+                    steps.append(f"❌ Ошибка соединения: {e}")
+                    last_error = f"Connection: {e}"
+                    time.sleep(1)
+                    continue
+                    
+                except requests.exceptions.Timeout:
+                    steps.append(f"⏰ Таймаут (15s)")
+                    last_error = "Timeout"
+                    time.sleep(1)
+                    continue
+                    
+                except Exception as e:
+                    steps.append(f"❌ Неизвестная ошибка: {type(e).__name__}: {e}")
+                    last_error = f"{type(e).__name__}: {e}"
+                    time.sleep(1)
+                    continue
+            
+            if resp and resp.status_code == 200:
+                break
+        
+        if not resp or resp.status_code != 200:
+            steps.append(f"❌ Ошибка после всех попыток: {last_error}")  # ИСПРАВЛЕНО
+            return [], steps
+        
+        content = resp.text.strip()
+        steps.append(f"✅ Загружено {len(content)} символов")
+        
+        # 1. Base64
+        if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
+            decoded = _try_multilevel_b64(content, max_depth=5)
+            if decoded:
+                all_keys = []
+                for item in decoded:
+                    all_keys.extend(_extract_vpn_keys(item))
+                    all_keys.extend(_extract_keys_from_json(item))
+                if all_keys:
+                    steps.append(f"✅ Найдено {len(all_keys)} ключей (Base64 + JSON)")
+                    return _dedup(all_keys), steps
+        
+        # 2. JSON напрямую
+        json_keys = _extract_keys_from_json(content)
+        if json_keys:
+            steps.append(f"✅ Найдено {len(json_keys)} ключей (JSON)")
+            return _dedup(json_keys), steps
+        
+        # 3. Прямой поиск
+        keys = _extract_vpn_keys(content)
+        if keys:
+            steps.append(f"✅ Найдено {len(keys)} ключей")
+            return _dedup(keys), steps
+        
+        # 4. HTML ссылки
+        if '<' in content and '>' in content:
+            steps.append("🔍 Обнаружен HTML, ищу ссылки на подписки...")
+            soup = BeautifulSoup(content, 'html.parser')
+            for a in soup.find_all('a'):
+                href = a.get('href', '')
+                if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href):
+                    if href.startswith('http'):
+                        steps.append(f"⬇️ Пробую загрузить: {href[:50]}...")
+                        try:
+                            sub_resp = requests.get(href, timeout=30, headers={'User-Agent': user_agents[0]}, verify=False)
+                            if sub_resp.status_code == 200:
+                                sub_keys = _parse_keys_from_content(sub_resp.text, depth=0)
+                                if sub_keys:
+                                    steps.append(f"✅ Найдено {len(sub_keys)} ключей (по ссылке)")
+                                    return _dedup(sub_keys), steps
+                        except:
+                            pass
+        
+        steps.append(f"❌ Ключи не найдены")
+        return [], steps
+
+    # ОБЫЧНЫЙ ТЕКСТ
+    keys = load_keys_from_text(text)
+    if not keys:
+        keys = _extract_vpn_keys(text)
+    if keys:
+        steps.append(f"🔍 Найдено {len(keys)} ключей")
+        return _dedup(keys), steps
+    steps.append("❌ Ключи не найдены")
+    return [], steps
+
 # ==================== ADMIN MENU ====================
 
 def admin_menu():
@@ -2029,23 +2070,31 @@ def show_keys_menu(user_id, chat_id, message_id):
     keys = get_keys_from_db()
     total_issued = int(get_setting('total_keys_issued', '0'))
     total_checked = int(get_setting('total_keys_checked', '0'))
+    proxy_url = get_setting('proxy_sub_url', '')
+    proxy_status = f"🔗 {proxy_url[:40]}..." if proxy_url else "❌ Не задана"
+    
     text = f"""🔑 *Управление ключами*
 
 📦 Ключей в базе: {len(keys)}
 🗑️ Выдано ключей: {total_issued}
 📊 Всего проверено: {total_checked}
+🌐 Прокси ссылка: {proxy_status}
 
 Выберите действие:"""
+    
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="admin_keys_load"),
-        types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="admin_keys_clean_dead")
+        types.InlineKeyboardButton("🌐 Загрузить из прокси", callback_data="admin_keys_proxy_menu")
     )
     kb.add(
-        types.InlineKeyboardButton("🗑️ Очистить все", callback_data="admin_keys_clear_all"),
-        types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued")
+        types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="admin_keys_clean_dead"),
+        types.InlineKeyboardButton("🗑️ Очистить все", callback_data="admin_keys_clear_all")
     )
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel"))
+    kb.add(
+        types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
+    )
     try:
         bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=kb)
     except:
@@ -2089,14 +2138,6 @@ def _show_admin_list_for_call(call):
 
 # ==================== УПРАВЛЕНИЕ КЛЮЧАМИ ====================
 
-def callback_admin_keys(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление ключами.")
-        return
-    bot.answer_callback_query(call.id)
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
 @bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load")
 def callback_admin_keys_load(call):
     user_id = call.from_user.id
@@ -2122,7 +2163,7 @@ def callback_admin_keys_load(call):
         parse_mode="Markdown",
         reply_markup=kb
     )
-    admin_keys_loading[user_id] = {
+    autopost_loading[user_id] = {
         'keys': [],
         'message_id': msg.message_id
     }
@@ -2133,10 +2174,10 @@ def callback_admin_keys_load_finish(call):
     if not has_permission(user_id, 'manage_keys'):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
-    if user_id not in admin_keys_loading:
+    if user_id not in autopost_loading:
         bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
         return
-    keys = admin_keys_loading[user_id]['keys']
+    keys = autopost_loading[user_id]['keys']
     if not keys:
         bot.answer_callback_query(call.id, "❌ Нет загруженных ключей")
         return
@@ -2148,7 +2189,7 @@ def callback_admin_keys_load_finish(call):
             p = m.group(1).lower()
             proto_stats[p] = proto_stats.get(p, 0) + 1
     stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
-    del admin_keys_loading[user_id]
+    del autopost_loading[user_id]
     bot.answer_callback_query(call.id, f"✅ Загружено {len(keys)} ключей!")
     total_in_db = len(get_keys_from_db())
     try:
@@ -2168,8 +2209,8 @@ def callback_admin_keys_load_finish(call):
 @bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_cancel")
 def callback_admin_keys_load_cancel(call):
     user_id = call.from_user.id
-    if user_id in admin_keys_loading:
-        del admin_keys_loading[user_id]
+    if user_id in autopost_loading:
+        del autopost_loading[user_id]
     bot.answer_callback_query(call.id, "❌ Отменено")
     try:
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -2276,38 +2317,250 @@ def callback_admin_keys_reset_issued(call):
     bot.answer_callback_query(call.id, f"🔄 Сброшено {current_issued} выданных ключей!")
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
-# ==================== ОБРАБОТЧИК ЗАГРУЗКИ КЛЮЧЕЙ (АДМИН) ====================
+# ==================== ПРОКСИ ССЫЛКИ ====================
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in admin_keys_loading)
-def admin_load_keys_inline(message):
-    user_id = message.from_user.id
-    if user_id not in admin_keys_loading:
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_menu")
+def callback_admin_keys_proxy_menu(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id)
+    _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
+
+def _show_proxy_menu(chat_id, message_id, user_id):
+    proxy_url = get_setting('proxy_sub_url', '')
+    proxy_urls = get_setting('proxy_sub_urls', '')  # несколько URL через |||
+    
+    if proxy_urls:
+        url_list = [u for u in proxy_urls.split('|||') if u]
+        proxy_text = f"🔗 Загружено ссылок: {len(url_list)}\n"
+        for i, u in enumerate(url_list[:3], 1):
+            proxy_text += f"  {i}. {u[:50]}...\n" if len(u) > 50 else f"  {i}. {u}\n"
+        if len(url_list) > 3:
+            proxy_text += f"  ... и ещё {len(url_list) - 3}\n"
+    elif proxy_url:
+        proxy_text = f"🔗 {proxy_url[:60]}..." if len(proxy_url) > 60 else f"🔗 {proxy_url}"
+    else:
+        proxy_text = "❌ Прокси ссылка не задана"
+    
+    text = f"🌐 *Загрузить из прокси ссылки*\n\n{proxy_text}"
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📥 Загрузить прокси ссылку", callback_data="admin_keys_proxy_load"),
+        types.InlineKeyboardButton("🗑️ Сбросить прокси ссылку", callback_data="admin_keys_proxy_reset"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back_main")
+    )
+    
+    try:
+        bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_back_main")
+def callback_admin_keys_back_main(call):
+    user_id = call.from_user.id
+    bot.answer_callback_query(call.id)
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_reset")
+def callback_admin_keys_proxy_reset(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
     
-    raw = message.text or message.caption or ''
-    keys = load_keys_from_text(raw) if raw else []
+    set_setting('proxy_sub_url', '')
+    set_setting('proxy_sub_urls', '')
     
-    if not keys and message.document:
-        try:
-            file = bot.get_file(message.document.file_id)
-            data = bot.download_file(file.file_path)
-            keys = load_keys_from_text(data.decode('utf-8', errors='ignore'))
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка загрузки файла: {e}")
+    bot.answer_callback_query(call.id, "✅ Прокси ссылки сброшены!")
+    _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_load")
+def callback_admin_keys_proxy_load(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id)
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Завершить загрузку", callback_data="admin_keys_proxy_finish"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_proxy_menu")
+    )
+    
+    msg = bot.send_message(
+        user_id,
+        "🌐 *Загрузка прокси ссылок*\n\n"
+        "Отправляйте ссылки на подписки по одной.\n"
+        "Можно загрузить несколько ссылок — ключи из всех будут объединены.\n\n"
+        "Поддерживаются:\n"
+        "• Обычные HTTP/HTTPS ссылки на подписки\n"
+        "• Base64-закодированные ссылки\n"
+        "• Схемы приложений (happ://, incy:// и др.)\n\n"
+        "⚠️ Ключи будут *добавлены* к уже существующим в базе.\n\n"
+        "Когда закончите — нажмите *✅ Завершить загрузку*",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+    
+    proxy_url_loading[user_id] = {
+        'urls': [],
+        'message_id': msg.message_id,
+        'timestamp': int(time.time())  # Добавлен таймаут
+    }
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_finish")
+def callback_admin_keys_proxy_finish(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    if user_id not in proxy_url_loading:
+        bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
+        return
+    
+    urls = proxy_url_loading[user_id].get('urls', [])
+    if not urls:
+        bot.answer_callback_query(call.id, "❌ Нет добавленных ссылок")
+        return
+    
+    bot.answer_callback_query(call.id, f"⏳ Загружаю ключи из {len(urls)} ссылок...")
+    
+    proxy_url_loading.pop(user_id)
+    
+    def process_proxy_urls():
+        all_keys = []
+        results = []
+        
+        for url in urls:
+            try:
+                keys = load_keys_from_url(url)
+                results.append((url, len(keys), True))
+                all_keys.extend(keys)
+            except Exception as e:
+                results.append((url, 0, False))
+        
+        all_keys = _dedup(all_keys)
+        
+        if not all_keys:
+            try:
+                bot.send_message(
+                    user_id,
+                    "❌ Не удалось извлечь ключи ни из одной ссылки.\n\n"
+                    "Проверьте доступность ссылок и формат подписки."
+                )
+            except:
+                pass
             return
-    
-    if keys:
-        admin_keys_loading[user_id]['keys'].extend(keys)
-        admin_keys_loading[user_id]['keys'] = _dedup(admin_keys_loading[user_id]['keys'])
-        bot.reply_to(
-            message,
-            f"✅ Загружено {len(keys)} ключей.\n"
-            f"📊 Всего в списке: {len(admin_keys_loading[user_id]['keys'])} ключей\n\n"
-            "Продолжайте загрузку или нажмите *Завершить*",
-            parse_mode="Markdown"
+        
+        # Сохраняем URL для истории
+        existing_urls = get_setting('proxy_sub_urls', '')
+        all_urls = [u for u in existing_urls.split('|||') if u] if existing_urls else []
+        all_urls.extend(urls)
+        all_urls = list(dict.fromkeys(all_urls))  # дедупликация
+        set_setting('proxy_sub_urls', '|||'.join(all_urls))
+        if urls:
+            set_setting('proxy_sub_url', urls[-1])  # последняя как основная
+        
+        # Добавляем ключи к существующим
+        current_keys = get_keys_from_db()
+        merged = _dedup(current_keys + all_keys)
+        save_keys_to_db(merged)
+        
+        # Статистика по протоколам
+        proto_stats = {}
+        for k in all_keys:
+            m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+            if m:
+                p = m.group(1).lower()
+                proto_stats[p] = proto_stats.get(p, 0) + 1
+        
+        stats_text = '\n'.join(
+            f"  • {p}:// — {c}"
+            for p, c in sorted(proto_stats.items(), key=lambda x: -x[1])
         )
-    else:
-        bot.reply_to(message, "❌ Не найдено ключей. Проверьте формат.")
+        
+        results_text = ""
+        for url, count, ok in results:
+            short_url = url[:45] + "..." if len(url) > 45 else url
+            icon = "✅" if ok else "❌"
+            results_text += f"{icon} {short_url} — {count} ключей\n"
+        
+        report = (
+            f"✅ *Загрузка из прокси завершена!*\n\n"
+            f"🔗 Обработано ссылок: {len(urls)}\n"
+            f"🔑 Новых ключей: {len(all_keys)}\n"
+            f"📦 Всего в базе: {len(merged)}\n\n"
+            f"📋 По протоколам:\n{stats_text}\n\n"
+            f"📊 Результаты по ссылкам:\n{results_text}"
+        )
+        
+        if len(report) > 4000:
+            report = report[:3950].rstrip() + "\n…"
+        
+        try:
+            bot.send_message(user_id, report, parse_mode="Markdown")
+        except:
+            bot.send_message(user_id, report)
+    
+    t = threading.Thread(target=process_proxy_urls)
+    t.daemon = True
+    t.start()
+
+def handle_proxy_url_input(message):
+    user_id = message.from_user.id
+    if user_id not in proxy_url_loading:
+        return
+    
+    # Проверка таймаута
+    session = proxy_url_loading[user_id]
+    if int(time.time()) - session.get('timestamp', 0) > PROXY_LOADING_TIMEOUT:
+        del proxy_url_loading[user_id]
+        bot.reply_to(message, "⏰ Время сессии истекло. Начните заново через меню.")
+        return
+    
+    text = (message.text or '').strip()
+    if not text:
+        bot.reply_to(message, "❌ Отправьте ссылку текстом.")
+        return
+    
+    # Извлекаем все URL из сообщения
+    urls_found = re.findall(r'https?://[^\s<>"\']+', text)
+    
+    # Также проверяем схемы приложений
+    app_urls = re.findall(
+        r'(?:' + APP_SCHEMES + r')://[^\s<>"\']+',
+        text, re.IGNORECASE
+    )
+    
+    # Если вся строка — это одна ссылка (даже без http)
+    if not urls_found and not app_urls:
+        # Попробуем принять строку как есть
+        urls_found = [text]
+    
+    all_found = list(dict.fromkeys(urls_found + app_urls))
+    
+    if not all_found:
+        bot.reply_to(message, "❌ Не найдено ни одной ссылки.")
+        return
+    
+    proxy_url_loading[user_id]['urls'].extend(all_found)
+    proxy_url_loading[user_id]['urls'] = list(dict.fromkeys(proxy_url_loading[user_id]['urls']))
+    
+    total = len(proxy_url_loading[user_id]['urls'])
+    added = len(all_found)
+    
+    bot.reply_to(
+        message,
+        f"✅ Добавлено ссылок: {added}\n"
+        f"📋 Всего в очереди: {total}\n\n"
+        "Отправьте ещё или нажмите *✅ Завершить загрузку*",
+        parse_mode="Markdown"
+    )
 
 # ==================== ADMIN CALLBACKS ====================
 
@@ -2382,9 +2635,12 @@ def admin_callback(call):
             bot.send_message(user_id, f"👥 Пользователи ({len(users)}):", reply_markup=kb)
         return
 
-    # Управление ключами - вызываем функцию без декоратора
     if data == "admin_keys":
-        callback_admin_keys(call)
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление ключами.")
+            return
+        bot.answer_callback_query(call.id)
+        show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
         return
 
     if data == "admin_autopost":
@@ -2613,6 +2869,11 @@ def callback_add_admin_role(call):
     if not has_permission(user_id, 'manage_admins'):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
+    
+    # Очищаем старую сессию перед созданием новой
+    if user_id in search_cache:
+        del search_cache[user_id]
+    
     role = call.data.split('_')[3]
     search_cache[user_id] = {'action': 'add_admin', 'role': role}
     bot.answer_callback_query(call.id, f"✅ Выбрана роль: {ROLE_PRESETS[role]['name']}")
@@ -3247,6 +3508,34 @@ def callback_unblock(call):
 
 # ==================== АВТОПОСТИНГ ====================
 
+def autopost_scheduler():
+    """Периодический запуск автопостинга в отдельном потоке"""
+    print("[autopost_scheduler] Запущен планировщик автопостинга")
+    while True:
+        try:
+            config = get_autopost_config()
+            if config['enabled']:
+                # Проверяем, прошло ли достаточно времени с последнего поста
+                last_post = int(get_setting('autopost_last_post', '0'))
+                current_time = int(time.time())
+                
+                if current_time - last_post >= config['interval']:
+                    print(f"[autopost_scheduler] Запуск автопостинга (интервал: {config['interval']}с)")
+                    auto_post_keys_to_channel()
+                    set_setting('autopost_last_post', str(current_time))
+                else:
+                    remaining = config['interval'] - (current_time - last_post)
+                    if remaining % 60 < 5:  # Логируем раз в минуту для отладки
+                        print(f"[autopost_scheduler] Следующий пост через {remaining//60} мин")
+            else:
+                print("[autopost_scheduler] Автопостинг отключен")
+            
+            # Спим 30 секунд перед следующей проверкой
+            time.sleep(30)
+        except Exception as e:
+            print(f"[autopost_scheduler] Ошибка: {e}")
+            time.sleep(60)
+
 @bot.callback_query_handler(func=lambda call: call.data == "autopost_back")
 def callback_autopost_back(call):
     user_id = call.from_user.id
@@ -3318,6 +3607,7 @@ def callback_autopost_start(call):
     save_autopost_config(config)
     bot.answer_callback_query(call.id, "🚀 Запущен!")
     auto_post_keys_to_channel()
+    set_setting('autopost_last_post', str(int(time.time())))
     callback_autopost_back(call)
 
 @bot.callback_query_handler(func=lambda call: call.data == "autopost_channel_settings")
@@ -3697,18 +3987,15 @@ def cmd_priority_handler(message):
     user_id = message.from_user.id
     command = message.text.split()[0].lower() if message.text else ''
     
+    # Очистка активных сессий
     if user_id in decrypt_results:
         del decrypt_results[user_id]
-    if user_id in check_results:
-        del check_results[user_id]
-    if user_id in proxy_check_results:
-        del proxy_check_results[user_id]
-    if user_id in admin_keys_loading:
-        del admin_keys_loading[user_id]
     if user_id in autopost_loading:
         del autopost_loading[user_id]
     if user_id in announce_data:
         del announce_data[user_id]
+    if user_id in proxy_url_loading:
+        del proxy_url_loading[user_id]
 
     if command == '/admin':
         admin_panel(message)
@@ -3743,20 +4030,14 @@ def cmd_cancel(message):
     if user_id in decrypt_results:
         del decrypt_results[user_id]
         cleared = True
-    if user_id in check_results:
-        del check_results[user_id]
-        cleared = True
-    if user_id in proxy_check_results:
-        del proxy_check_results[user_id]
-        cleared = True
-    if user_id in admin_keys_loading:
-        del admin_keys_loading[user_id]
-        cleared = True
     if user_id in autopost_loading:
         del autopost_loading[user_id]
         cleared = True
     if user_id in announce_data:
         del announce_data[user_id]
+        cleared = True
+    if user_id in proxy_url_loading:
+        del proxy_url_loading[user_id]
         cleared = True
     if cleared:
         bot.reply_to(message, "✅ Все режимы отменены.")
@@ -4175,6 +4456,11 @@ def handle_private_messages(message):
     if text.startswith('/'):
         return
 
+    # ========== ПРОВЕРКА ПРОКСИ ССЫЛОК ==========
+    if user_id in proxy_url_loading:
+        handle_proxy_url_input(message)
+        return
+
     if user_id in announce_data:
         admin_announce_text(message)
         return
@@ -4196,50 +4482,7 @@ def handle_private_messages(message):
             _do_decrypt(message, user_id, text=text)
         return
 
-    if user_id in check_results and check_results[user_id].get('waiting'):
-        if message.document:
-            try:
-                file = bot.get_file(message.document.file_id)
-                file_bytes = bot.download_file(file.file_path)
-                raw = file_bytes.decode('utf-8', errors='ignore')
-                keys = load_keys_from_text(raw)
-                if not keys:
-                    bot.reply_to(message, "❌ Не найдено ключей.")
-                    return
-                msg = bot.reply_to(message, f"🔍 Найдено ключей: {len(keys)}\n⏳ Начинаю проверку...")
-                t = threading.Thread(target=check_keys_async, args=(message.chat.id, keys, user_id, msg.message_id))
-                t.daemon = True
-                t.start()
-            except Exception as e:
-                bot.reply_to(message, f"❌ Ошибка: {e}")
-            return
-        raw_text = text.strip()
-        if raw_text:
-            keys = load_keys_from_text(raw_text)
-            if not keys:
-                bot.reply_to(message, "❌ Не найдено ключей.")
-                return
-            msg = bot.reply_to(message, f"🔍 Найдено ключей: {len(keys)}\n⏳ Начинаю проверку...")
-            t = threading.Thread(target=check_keys_async, args=(message.chat.id, keys, user_id, msg.message_id))
-            t.daemon = True
-            t.start()
-        return
-
-    if user_id in proxy_check_results and proxy_check_results[user_id].get('waiting'):
-        if message.document:
-            try:
-                file = bot.get_file(message.document.file_id)
-                file_bytes = bot.download_file(file.file_path)
-                raw = file_bytes.decode('utf-8', errors='ignore')
-                _process_proxies(message, raw, user_id)
-            except Exception as e:
-                bot.reply_to(message, f"❌ Ошибка: {e}")
-            return
-        raw_text = text.strip()
-        if raw_text:
-            _process_proxies(message, raw_text, user_id)
-        return
-
+    # Обработка поиска (search_cache)
     if user_id in search_cache:
         action = search_cache.get(user_id, {}).get('action', '')
         if action == 'autopost_set_channel':
@@ -4255,153 +4498,6 @@ def handle_private_messages(message):
 
     if text:
         bot.reply_to(message, "Используйте кнопки меню или /cancel для отмены текущего режима.", reply_markup=main_menu())
-
-# ==================== CHECK KEYS ASYNC ====================
-
-def check_keys_async(chat_id, keys, user_id, message_id):
-    results = []
-    working = 0
-    not_working = 0
-    for i, key in enumerate(keys):
-        if i % 3 == 0:
-            try:
-                bot.edit_message_text(
-                    f"🔍 Проверяю ключи...\n⏳ Прогресс: {i}/{len(keys)}",
-                    chat_id, message_id
-                )
-            except:
-                pass
-        status = ping_key(key)
-        results.append((key, status))
-        if status:
-            working += 1
-        else:
-            not_working += 1
-    try:
-        increment_setting('total_keys_checked', len(keys))
-    except:
-        pass
-    report = (
-        f"📊 *Результаты проверки*\n\n"
-        f"✅ Работает: {working}\n"
-        f"❌ Не работает: {not_working}\n"
-        f"📡 Всего проверено: {len(keys)}\n\n"
-    )
-    if not_working > 0:
-        report += "*❌ Не работающие ключи:*\n"
-        for key, status in results:
-            if not status:
-                short_key = key[:60] + '...' if len(key) > 60 else key
-                report += f"└ `{short_key}`\n"
-    else:
-        report += "🎉 *Все ключи работают!*"
-    try:
-        bot.send_message(chat_id, report, parse_mode="Markdown")
-    except:
-        bot.send_message(chat_id, report)
-    if user_id in check_results:
-        del check_results[user_id]
-
-def ping_key(key):
-    match = re.search(r'@([\d\.]+):(\d+)', key)
-    if not match:
-        return False
-    ip = match.group(1)
-    port = int(match.group(2))
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(3)
-        result = sock.connect_ex((ip, port))
-        sock.close()
-        return result == 0
-    except:
-        return False
-
-# ==================== PROXY CHECK ====================
-
-def _process_proxies(message, raw_text, user_id):
-    lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
-    if not lines:
-        bot.reply_to(message, "❌ Не найдено ни одной строки с прокси.")
-        return
-    lines = list(dict.fromkeys(lines))
-    msg = bot.reply_to(
-        message,
-        f"🔍 Найдено прокси: {len(lines)}\n⏳ Начинаю проверку..."
-    )
-    t = threading.Thread(target=proxy_check_async, args=(message.chat.id, lines, user_id, msg.message_id))
-    t.daemon = True
-    t.start()
-
-def proxy_check_async(chat_id, proxy_lines, user_id, message_id):
-    results = []
-    working = 0
-    not_working = 0
-    total = len(proxy_lines)
-    for i, line in enumerate(proxy_lines):
-        if i % 3 == 0:
-            try:
-                bot.edit_message_text(
-                    f"🛡️ Проверяю прокси...\n⏳ Прогресс: {i}/{total}",
-                    chat_id, message_id
-                )
-            except:
-                pass
-        test_result = _test_proxy_simple(line)
-        results.append((line, test_result))
-        if test_result:
-            working += 1
-        else:
-            not_working += 1
-    try:
-        increment_setting('total_proxies_checked', total)
-    except:
-        pass
-    report = (
-        f"📊 *Результаты проверки прокси*\n\n"
-        f"✅ Работает: {working}\n"
-        f"❌ Не работает: {not_working}\n"
-        f"🌐 Всего проверено: {total}\n\n"
-    )
-    if working > 0:
-        report += "*✅ Работающие прокси:*\n"
-        for line, res in results:
-            if res:
-                short_line = line[:50] + '...' if len(line) > 50 else line
-                report += f"└ `{short_line}`\n"
-        report += "\n"
-    if not_working > 0:
-        report += "*❌ Не работающие прокси:*\n"
-        for line, res in results:
-            if not res:
-                short_line = line[:50] + '...' if len(line) > 50 else line
-                report += f"└ `{short_line}`\n"
-    if len(report) > 4000:
-        report = report[:3950].rstrip() + "\n…"
-    try:
-        bot.send_message(chat_id, report, parse_mode="Markdown")
-    except:
-        try:
-            bot.send_message(chat_id, report)
-        except:
-            pass
-    if user_id in proxy_check_results:
-        del proxy_check_results[user_id]
-
-def _test_proxy_simple(line):
-    try:
-        parts = re.split(r'[:@]', line)
-        if len(parts) >= 2:
-            host = parts[0]
-            port = parts[1]
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(3)
-            result = sock.connect_ex((host, int(port)))
-            sock.close()
-            return result == 0
-    except:
-        pass
-    return False
 
 # ==================== FLASK APP ====================
 
@@ -4535,20 +4631,25 @@ def subscription(token):
 # ==================== MAIN ====================
 
 if __name__ == "__main__":
-    init_db()
+    print("🚀 Запуск бота...")
+    try:
+        init_db()
+        print("✅ База данных инициализирована")
+    except Exception as e:
+        print(f"❌ Ошибка инициализации базы данных: {e}")
+        sys.exit(1)
     ensure_bot_start_time()
-    print("✅ Бот запущен!")
-
-    Thread(target=keep_alive_ping, daemon=True).start()
-    Thread(target=auto_restart_monitor, daemon=True).start()
-
-    from waitress import serve
+    print("✅ Время запуска сохранено")
+    if os.getenv('RENDER'):
+        print("📡 Запущен на Render, активируем keep-alive")
+        Thread(target=keep_alive_ping, daemon=True).start()
+        Thread(target=auto_restart_monitor, daemon=True).start()
+        Thread(target=autopost_scheduler, daemon=True).start()
+    print("📡 Запускаем Flask сервер...")
     Thread(target=lambda: serve(app, host='0.0.0.0', port=int(os.getenv('PORT', 5000))), daemon=True).start()
-
+    print("🤖 Бот запущен и готов к работе!")
     try:
         bot.infinity_polling()
     except Exception as e:
-        print(f"❌ Ошибка бота: {e}")
-        time.sleep(5)
-        os.execv(sys.executable, ['python'] + sys.argv)
-            
+        print(f"❌ Критическая ошибка в polling: {e}")
+        sys.exit(1)
