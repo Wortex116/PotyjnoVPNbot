@@ -81,7 +81,7 @@ def update_activity():
 last_activity_time = time.time()
 
 # ==================== CONFIG ====================
-BOT_TOKEN = os.getenv('8621740437:AAFFrgKmayXan20sx6JwQehPy1XKb_E7o8w')
+BOT_TOKEN = os.getenv( 'BOT_TOKEN', '8621740437:AAFFrgKmayXan20sx6JwQehPy1XKb_E7o8w')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8176196456'))
 DATABASE_URL = os.getenv('DATABASE_URL')
 CHANNEL_ID = -1003668283208
