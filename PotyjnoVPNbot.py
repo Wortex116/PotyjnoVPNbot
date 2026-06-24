@@ -1771,9 +1771,7 @@ def cabinet(message):
             types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
             types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
         )
-        kb.add(
-            types.InlineKeyboardButton("📲 Импорт в Incy", url=f"incy://sub/{link}"),
-        )
+        # Убрана кнопка с невалидной ссылкой incy://
         kb.row(
             types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
             types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
@@ -1848,9 +1846,7 @@ def my_subscription(message):
                 types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
                 types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
             )
-            kb.add(
-                types.InlineKeyboardButton("📲 Импорт в Incy", url=f"incy://sub/{link}"),
-            )
+            # Убрана кнопка с невалидной ссылкой incy://
             kb.row(
                 types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
                 types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
@@ -4321,9 +4317,18 @@ if __name__ == "__main__":
     Thread(target=lambda: serve(app, host='0.0.0.0', port=int(os.getenv('PORT', 5000))), daemon=True).start()
     
     print("🤖 Бот запущен и готов к работе!")
+    
+    # Сбрасываем webhook для предотвращения конфликтов
     try:
-        bot.infinity_polling()
+        bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Webhook сброшен")
+    except Exception as e:
+        print(f"[webhook] Ошибка: {e}")
+    
+    time.sleep(2)
+    
+    try:
+        bot.infinity_polling(timeout=30, long_polling_timeout=30)
     except Exception as e:
         print(f"❌ Критическая ошибка в polling: {e}")
         sys.exit(1)
-            
