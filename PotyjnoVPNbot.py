@@ -45,13 +45,17 @@ MENU_BUTTONS = {
 
 # ==================== KEEP ALIVE ====================
 
-def keep_alive_ping():
+# ИСПРАВЛЕНО #11 - динамический URL
+def get_bot_url():
     url = os.getenv('RENDER_EXTERNAL_URL', '')
     if not url:
         url = os.getenv('PUBLIC_URL', '')
     if not url:
         url = 'https://potyjnovpnbot.onrender.com'
-    url = url.rstrip('/')
+    return url.rstrip('/')
+
+def keep_alive_ping():
+    url = get_bot_url()
     print(f"[keep_alive] Запущен пинг-механизм для {url}")
     ping_count = 0
     while True:
@@ -75,7 +79,7 @@ def auto_restart_monitor():
             if idle_time > max_idle_time:
                 print(f"[auto_restart] Длительное бездействие, выполняем мягкий перезапуск...")
                 try:
-                    url = os.getenv('RENDER_EXTERNAL_URL', 'https://potyjnovpnbot.onrender.com')
+                    url = get_bot_url()
                     for _ in range(3):
                         requests.get(f"{url}/ping", timeout=5)
                         time.sleep(1)
@@ -133,6 +137,7 @@ def return_db_connection(conn):
 
 # Активные словари
 search_cache = {}
+exchange_cache = {}  # отдельный словарь для обмена баллов
 decrypt_results = {}
 announce_data = {}
 manage_cache = {}
@@ -162,6 +167,13 @@ def cleanup_expired_sessions():
             to_remove.append(user_id)
     for user_id in to_remove:
         del search_cache[user_id]
+    
+    to_remove = []
+    for user_id, cache in exchange_cache.items():
+        if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT:
+            to_remove.append(user_id)
+    for user_id in to_remove:
+        del exchange_cache[user_id]
     
     to_remove = []
     for user_id, session in decrypt_results.items():
@@ -1217,11 +1229,11 @@ def get_subscription_link(user_id):
         result = cur.fetchone()
         if result and result[0]:
             token = result[0]
-            return f"https://potyjnovpnbot.onrender.com/sub/{token}"
+            return f"https://{os.getenv('RENDER_EXTERNAL_URL', 'potyjnovpnbot.onrender.com').replace('https://', '')}/sub/{token}"
         token = generate_subscription_token()
         cur.execute("UPDATE users SET token = %s WHERE user_id = %s", (token, user_id))
         conn.commit()
-        return f"https://potyjnovpnbot.onrender.com/sub/{token}"
+        return f"https://{os.getenv('RENDER_EXTERNAL_URL', 'potyjnovpnbot.onrender.com').replace('https://', '')}/sub/{token}"
     finally:
         return_db_connection(conn)
 
@@ -1632,18 +1644,17 @@ def show_keys_menu(user_id, chat_id, message_id):
     else:
         auto_info = "Ещё не запускалось"
     
-    text = f"""🔑 *Управление ключами*
-
-📦 Ключей в базе: {len(keys)}
-🗑️ Выдано ключей: {total_issued}
-📊 Всего проверено: {total_checked}
-🌐 Прокси ссылка: {proxy_status}
-
-🔄 *Автообновление:* {auto_status}
-⏱ Интервал: каждые {auto_interval} ч.
-{auto_info}
-
-Выберите действие:"""
+    text = (
+        f"🔑 *Управление ключами*\n\n"
+        f"📦 Ключей в базе: {len(keys)}\n"
+        f"🗑️ Выдано ключей: {total_issued}\n"
+        f"📊 Всего проверено: {total_checked}\n"
+        f"🌐 Прокси ссылка: {proxy_status}\n\n"
+        f"🔄 *Автообновление:* {auto_status}\n"
+        f"⏱ Интервал: каждые {auto_interval} ч.\n"
+        f"{auto_info}\n\n"
+        f"Выберите действие:"
+    )
     
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -1722,7 +1733,12 @@ def _redraw_admin_perms(call, target_id):
     role_name = ROLE_PRESETS.get(role, {}).get('name', role)
     name = get_user_display_name(target_id)
     
-    text = f"⚙️ *Настройка прав*\n\n👤 {name} (`{target_id}`)\n👑 Роль: {role_name}\n\nВключите/отключите нужные разрешения:\n\n"
+    text = (
+        f"⚙️ *Настройка прав*\n\n"
+        f"👤 {name} (`{target_id}`)\n"
+        f"👑 Роль: {role_name}\n\n"
+        f"Включите/отключите нужные разрешения:\n\n"
+    )
     kb = types.InlineKeyboardMarkup(row_width=2)
     
     for perm_key, perm_name in PERMISSIONS.items():
@@ -1981,7 +1997,7 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка Notion: {e}")
 
-    # BELKA.NETWORK
+    # BELKA.NETWORK - ИСПРАВЛЕНО #4 - не возвращаем ссылки, а идём дальше
     if 'belka.network' in text:
         steps.append(f"🔗 Обнаружена ссылка Belka VPN")
         try:
@@ -1994,7 +2010,7 @@ def _parse_subscription_any(raw, steps=None):
                 sub_links = []
                 for a in soup.find_all('a'):
                     href = a.get('href', '')
-                    if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href or 'vless' in href or 'vmess' in href):
+                    if href and ('sub' in href or 'config' in href or 'profile' in href or 'clash' in href):
                         sub_links.append(href)
                     if a.text and ('Получить ссылку' in a.text or 'Copy' in a.text or 'скопировать' in a.text):
                         onclick = a.get('onclick', '')
@@ -2029,7 +2045,8 @@ def _parse_subscription_any(raw, steps=None):
                         except:
                             pass
                     steps.append(f"📋 Найдены ссылки, но ключи не извлечены")
-                    return sub_links, steps
+                    # ИСПРАВЛЕНО: возвращаем пустой список вместо ссылок
+                    return [], steps
                 steps.append(f"❌ Не найдена ссылка на подписку на странице Belka")
                 return [], steps
             else:
@@ -2357,20 +2374,20 @@ def cabinet(message):
         rank = get_rank(points)
         days_available = get_days_available(points)
         
-        text = f"""👤 *Личный кабинет*
-
-🆔 ID: `{user_id}`
-📊 Статус: {status}
-📅 Подписка до: `{expire_date}`
-⏳ Осталось: `{time_left}`
-
-━━━━━━━━━━━━━━━━━━━━━
-{rank['name']}
-🪙 *Баллов:* `{points:,}`
-💬 Сообщений: `{total_messages:,}`
-💰 Курс: `{rank['cost']}` баллов = 1 день
-🎁 Можно обменять: `{days_available}` дн.
-━━━━━━━━━━━━━━━━━━━━━"""
+        text = (
+            f"👤 *Личный кабинет*\n\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📊 Статус: {status}\n"
+            f"📅 Подписка до: `{expire_date}`\n"
+            f"⏳ Осталось: `{time_left}`\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{rank['name']}\n"
+            f"🪙 *Баллов:* `{points:,}`\n"
+            f"💬 Сообщений: `{total_messages:,}`\n"
+            f"💰 Курс: `{rank['cost']}` баллов = 1 день\n"
+            f"🎁 Можно обменять: `{days_available}` дн.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
 
         kb = types.InlineKeyboardMarkup(row_width=2)
         if days_available > 0:
@@ -2429,20 +2446,20 @@ def callback_refresh_cabinet(call):
         rank = get_rank(points)
         days_available = get_days_available(points)
         
-        text = f"""👤 *Личный кабинет*
-
-🆔 ID: `{user_id}`
-📊 Статус: {status}
-📅 Подписка до: `{expire_date}`
-⏳ Осталось: `{time_left}`
-
-━━━━━━━━━━━━━━━━━━━━━
-{rank['name']}
-🪙 *Баллов:* `{points:,}`
-💬 Сообщений: `{total_messages:,}`
-💰 Курс: `{rank['cost']}` баллов = 1 день
-🎁 Можно обменять: `{days_available}` дн.
-━━━━━━━━━━━━━━━━━━━━━"""
+        text = (
+            f"👤 *Личный кабинет*\n\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"📊 Статус: {status}\n"
+            f"📅 Подписка до: `{expire_date}`\n"
+            f"⏳ Осталось: `{time_left}`\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{rank['name']}\n"
+            f"🪙 *Баллов:* `{points:,}`\n"
+            f"💬 Сообщений: `{total_messages:,}`\n"
+            f"💰 Курс: `{rank['cost']}` баллов = 1 день\n"
+            f"🎁 Можно обменять: `{days_available}` дн.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
 
         kb = types.InlineKeyboardMarkup(row_width=2)
         if days_available > 0:
@@ -2493,7 +2510,7 @@ def callback_exchange_points(call):
             bot.answer_callback_query(call.id, "❌ Недостаточно баллов")
             return
         
-        search_cache[user_id] = {
+        exchange_cache[user_id] = {
             'exchange_days': 1,
             'max_days': days_available,
             'points': points,
@@ -2510,17 +2527,17 @@ def _show_exchange_panel(call, user_id, selected_days, max_days, points):
     rank = get_rank(points)
     cost = get_exchange_cost(points, selected_days)
     
-    text = f"""🎁 *Обмен баллов*
-
-🪙 Ваши баллы: `{points:,}`
-{rank['name']}
-💰 Курс: `{rank['cost']}` баллов = 1 день
-📅 Максимум дней: `{max_days}`
-
-━━━━━━━━━━━━━━━━━━━━━
-Выбрано: *{selected_days} дн.* = `{cost:,}` баллов
-Останется: `{points - cost:,}` баллов
-━━━━━━━━━━━━━━━━━━━━━"""
+    text = (
+        f"🎁 *Обмен баллов*\n\n"
+        f"🪙 Ваши баллы: `{points:,}`\n"
+        f"{rank['name']}\n"
+        f"💰 Курс: `{rank['cost']}` баллов = 1 день\n"
+        f"📅 Максимум дней: `{max_days}`\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Выбрано: *{selected_days} дн.* = `{cost:,}` баллов\n"
+        f"Останется: `{points - cost:,}` баллов\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+    )
     
     kb = types.InlineKeyboardMarkup(row_width=3)
     
@@ -2606,17 +2623,18 @@ def callback_exchange_action(call):
             
             bot.answer_callback_query(call.id, f"✅ +{days} дней!")
             
-            text = f"""✅ *Обмен выполнен!*
-
-🎁 Получено: +{days} дней
-💸 Потрачено: {cost:,} баллов
-🪙 Осталось: {new_points:,} баллов
-📅 Подписка до: {datetime.fromtimestamp(new_end).strftime('%d.%m.%Y')}"""
+            text = (
+                f"✅ *Обмен выполнен!*\n\n"
+                f"🎁 Получено: +{days} дней\n"
+                f"💸 Потрачено: {cost:,} баллов\n"
+                f"🪙 Осталось: {new_points:,} баллов\n"
+                f"📅 Подписка до: {datetime.fromtimestamp(new_end).strftime('%d.%m.%Y')}"
+            )
             
-            if user_id in search_cache:
-                search_cache[user_id]['points'] = new_points
-                search_cache[user_id]['max_days'] = new_points // rank['cost']
-                search_cache[user_id]['timestamp'] = int(time.time())
+            if user_id in exchange_cache:
+                exchange_cache[user_id]['points'] = new_points
+                exchange_cache[user_id]['max_days'] = new_points // rank['cost']
+                exchange_cache[user_id]['timestamp'] = int(time.time())
             
             try:
                 bot.edit_message_text(
@@ -2636,7 +2654,7 @@ def callback_exchange_action(call):
         bot.answer_callback_query(call.id)
         return
     
-    cached = search_cache.get(user_id, {})
+    cached = exchange_cache.get(user_id, {})
     cache_age = int(time.time()) - cached.get('timestamp', 0)
     
     if cache_age > 60 or not cached.get('points'):
@@ -2648,7 +2666,7 @@ def callback_exchange_action(call):
             if result:
                 points = result[0] or 0
                 max_days = get_days_available(points)
-                search_cache[user_id] = {
+                exchange_cache[user_id] = {
                     'exchange_days': days,
                     'max_days': max_days,
                     'points': points,
@@ -2657,13 +2675,13 @@ def callback_exchange_action(call):
         finally:
             return_db_connection(conn)
     
-    cached = search_cache.get(user_id, {})
+    cached = exchange_cache.get(user_id, {})
     max_days = cached.get('max_days', 1)
     points = cached.get('points', 0)
     
     days = max(1, min(days, max_days))
-    search_cache[user_id]['exchange_days'] = days
-    search_cache[user_id]['timestamp'] = int(time.time())
+    exchange_cache[user_id]['exchange_days'] = days
+    exchange_cache[user_id]['timestamp'] = int(time.time())
     
     _show_exchange_panel(call, user_id, days, max_days, points)
     bot.answer_callback_query(call.id)
@@ -2700,16 +2718,14 @@ def my_subscription(message):
         subscription_end, is_frozen, frozen_days_left = result
         
         if is_frozen:
-            text = f"""📡 *Моя подписка*
-
-❄️ *Подписка заморожена*
-
-⏳ Сохранено дней: `{frozen_days_left}`
-
-Нажмите кнопку ниже чтобы разморозить.
-Будет сгенерирован новый токен подписки.
-
-💬 Поддержка: {SUPPORT}"""
+            text = (
+                f"📡 *Моя подписка*\n\n"
+                f"❄️ *Подписка заморожена*\n\n"
+                f"⏳ Сохранено дней: `{frozen_days_left}`\n\n"
+                f"Нажмите кнопку ниже чтобы разморозить.\n"
+                f"Будет сгенерирован новый токен подписки.\n\n"
+                f"💬 Поддержка: {SUPPORT}"
+            )
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton(
                 "🔥 Разморозить подписку",
@@ -2727,19 +2743,30 @@ def my_subscription(message):
         else:
             status_text = "❌ Не активна\n\nДля продления обратитесь к администратору:"
 
-        text = f"""📡 *Моя подписка*
-
-📊 Статус: {status_text}
-
-{'' if not link else f'┌ 🔗 *Обычная ссылка:*\n│ `{link}`\n│\n├ 🔄 *Для белых списков:*\n│ `{yandex_link}`\n│\n└ ℹ️ *Ссылка автообновляется*'}
-
-📱 *Поддерживаемые клиенты:*
-• V2Ray / V2RayNG
-• Hiddify / Nekobox
-• FlClash / Mihomo
-• Clash Meta / Sing-Box
-
-💬 Поддержка: {SUPPORT}"""
+        text = (
+            f"📡 *Моя подписка*\n\n"
+            f"📊 Статус: {status_text}\n\n"
+        )
+        
+        if link:
+            text += (
+                f"┌ 🔗 *Обычная ссылка:*\n"
+                f"│ `{link}`\n"
+                f"│\n"
+                f"├ 🔄 *Для белых списков:*\n"
+                f"│ `{yandex_link}`\n"
+                f"│\n"
+                f"└ ℹ️ *Ссылка автообновляется*\n\n"
+            )
+        
+        text += (
+            f"📱 *Поддерживаемые клиенты:*\n"
+            f"• V2Ray / V2RayNG\n"
+            f"• Hiddify / Nekobox\n"
+            f"• FlClash / Mihomo\n"
+            f"• Clash Meta / Sing-Box\n\n"
+            f"💬 Поддержка: {SUPPORT}"
+        )
 
         kb = types.InlineKeyboardMarkup(row_width=2)
         
@@ -2794,16 +2821,15 @@ def callback_freeze_sub(call):
     finally:
         return_db_connection(conn)
     
-    text = f"""❄️ *Заморозка подписки*
-
-⚠️ *Внимание!*
-
-• Текущий токен подписки будет *удалён*
-• Сохранится: `{days_left}` дней
-• При разморозке генерируется *новый токен*
-• Старая ссылка перестанет работать
-
-Вы уверены?"""
+    text = (
+        f"❄️ *Заморозка подписки*\n\n"
+        f"⚠️ *Внимание!*\n\n"
+        f"• Текущий токен подписки будет *удалён*\n"
+        f"• Сохранится: `{days_left}` дней\n"
+        f"• При разморозке генерируется *новый токен*\n"
+        f"• Старая ссылка перестанет работать\n\n"
+        f"Вы уверены?"
+    )
     
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -2903,21 +2929,21 @@ def callback_unfreeze_sub(call):
         """, (new_sub_end, new_token, user_id))
         conn.commit()
         
-        new_link = f"https://potyjnovpnbot.onrender.com/sub/{new_token}"
+        new_link = f"https://{os.getenv('RENDER_EXTERNAL_URL', 'potyjnovpnbot.onrender.com').replace('https://', '')}/sub/{new_token}"
         
     finally:
         return_db_connection(conn)
     
     bot.answer_callback_query(call.id, "🔥 Подписка разморожена!")
     
-    text = f"""🔥 *Подписка разморожена!*
-
-✅ Активна ещё: `{frozen_days}` дней
-🔗 Новая ссылка:
-`{new_link}`
-
-⚠️ Старая ссылка больше не работает!
-Обновите подписку в клиенте."""
+    text = (
+        f"🔥 *Подписка разморожена!*\n\n"
+        f"✅ Активна ещё: `{frozen_days}` дней\n"
+        f"🔗 Новая ссылка:\n"
+        f"`{new_link}`\n\n"
+        f"⚠️ Старая ссылка больше не работает!\n"
+        f"Обновите подписку в клиенте."
+    )
     
     try:
         bot.edit_message_text(
@@ -2976,7 +3002,20 @@ def auto_post_keys_to_channel():
         working = keys[:1]
     
     key = working[0]
+    
+    # ИСПРАВЛЕНО #12 - вычисляем реальную задержку
     latency = 0
+    match = re.search(r'@([\d\.]+):(\d+)', key)
+    if match:
+        try:
+            start = time.time()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            sock.connect_ex((match.group(1), int(match.group(2))))
+            sock.close()
+            latency = int((time.time() - start) * 1000)
+        except:
+            latency = 0
     
     name = "VPN Server"
     country_emoji = "🌍"
@@ -3011,20 +3050,19 @@ def auto_post_keys_to_channel():
     
     moscow_time = datetime.now() + timedelta(hours=3)
     
-    formatted = f"""🚀 #1 | {country_emoji} {country_name}
-
-┌ 🏷 Название: {name}
-├ 🔗 Протокол: {proto_icon} {protocol}
-├ 📡 Пинг: {latency} ms
-├ ⚡ Скорость: {speed}
-├ 🌍 Город: {country_name}
-└ 🏢 Провайдер: {ip}
-
-🔑 Ключ для подключения:
-`{key}`
-
-⏱ Проверено: {moscow_time.strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot
-🔗 @ciorsa"""
+    formatted = (
+        f"🚀 #1 | {country_emoji} {country_name}\n\n"
+        f"┌ 🏷 Название: {name}\n"
+        f"├ 🔗 Протокол: {proto_icon} {protocol}\n"
+        f"├ 📡 Пинг: {latency} ms\n"
+        f"├ ⚡ Скорость: {speed}\n"
+        f"├ 🌍 Город: {country_name}\n"
+        f"└ 🏢 Провайдер: {ip}\n\n"
+        f"🔑 Ключ для подключения:\n"
+        f"`{key}`\n\n"
+        f"⏱ Проверено: {moscow_time.strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot\n"
+        f"🔗 @ciorsa"
+    )
     
     try:
         if topic_id:
@@ -3123,7 +3161,12 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         config = get_autopost_config()
         status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
-        text = f"📡 *АВТОПОСТИНГ*\n\nСтатус: {status}\nИнтервал: {config['interval'] // 60} мин\nКанал: {config['channel_id']}"
+        text = (
+            f"📡 *АВТОПОСТИНГ*\n\n"
+            f"Статус: {status}\n"
+            f"Интервал: {config['interval'] // 60} мин\n"
+            f"Канал: {config['channel_id']}"
+        )
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
             types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="autopost_load_keys"),
@@ -3198,7 +3241,8 @@ def admin_callback(call):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
         try:
-            chat_id = int(data.split('_')[3])
+            parts = data.split('_')
+            chat_id = int('_'.join(parts[3:]))
         except (IndexError, ValueError):
             bot.answer_callback_query(call.id, "❌ Ошибка формата")
             return
@@ -3222,7 +3266,8 @@ def admin_callback(call):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
         try:
-            chat_id = int(data.split('_')[3])
+            parts = data.split('_')
+            chat_id = int('_'.join(parts[3:]))
         except (IndexError, ValueError):
             bot.answer_callback_query(call.id, "❌ Ошибка формата")
             return
@@ -3311,13 +3356,13 @@ def _show_admin_points_system(call):
     finally:
         return_db_connection(conn)
     
-    text = f"""🪙 *Система баллов*
-
-📊 Активных чатов: `{active_chats}`
-🪙 Всего баллов выдано: `{total_points:,}`
-💬 Сообщений в логах: `{total_logs:,}`
-
-*Коэффициент:* 1000 баллов = 1 день"""
+    text = (
+        f"🪙 *Система баллов*\n\n"
+        f"📊 Активных чатов: `{active_chats}`\n"
+        f"🪙 Всего баллов выдано: `{total_points:,}`\n"
+        f"💬 Сообщений в логах: `{total_logs:,}`\n\n"
+        f"*Коэффициент:* 1000 баллов = 1 день"
+    )
     
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -3460,13 +3505,14 @@ def _show_auto_update_menu(chat_id, message_id, user_id):
     notify_status = "✅ ВКЛ" if notify else "❌ ВЫКЛ"
     last_str = datetime.fromtimestamp(last).strftime("%d.%m в %H:%M") if last else "Никогда"
     
-    text = f"""🔄 *Автообновление ключей*
-
-📊 Статус: {status}
-⏱ Интервал: каждые {interval} ч.
-🔗 Прокси ссылок: {url_count}
-🔔 Уведомления: {notify_status}
-🕐 Последнее: {last_str}"""
+    text = (
+        f"🔄 *Автообновление ключей*\n\n"
+        f"📊 Статус: {status}\n"
+        f"⏱ Интервал: каждые {interval} ч.\n"
+        f"🔗 Прокси ссылок: {url_count}\n"
+        f"🔔 Уведомления: {notify_status}\n"
+        f"🕐 Последнее: {last_str}"
+    )
     
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
@@ -3489,14 +3535,38 @@ def _show_auto_update_menu(chat_id, message_id, user_id):
 
 # ==================== ОБРАБОТЧИКИ ГРУППОВЫХ СООБЩЕНИЙ ====================
 
+# ИСПРАВЛЕНО #3 - больше не отправляем сообщения для проверки блокировки
+# Флаг блокировки проверяется через кэш
+_user_blocked_cache = {}
+_user_blocked_cache_lock = Lock()
+USER_BLOCKED_CACHE_TTL = 3600  # 1 час
+
 def is_user_blocked_bot(user_id):
+    """Проверяет, заблокировал ли пользователь бота с кэшированием"""
+    current_time = int(time.time())
+    
+    with _user_blocked_cache_lock:
+        cached = _user_blocked_cache.get(user_id, {})
+        if cached.get('timestamp', 0) > current_time - USER_BLOCKED_CACHE_TTL:
+            return cached.get('blocked', False)
+    
     try:
-        bot.send_message(user_id, "🔄 Проверка связи...", disable_notification=True)
-        return False
+        # Используем send_chat_action вместо send_message - меньше спама
+        bot.send_chat_action(user_id, 'typing')
+        blocked = False
     except Exception as e:
         if 'blocked' in str(e).lower() or 'deactivated' in str(e).lower():
-            return True
-        return False
+            blocked = True
+        else:
+            blocked = False
+    
+    with _user_blocked_cache_lock:
+        _user_blocked_cache[user_id] = {
+            'blocked': blocked,
+            'timestamp': current_time
+        }
+    
+    return blocked
 
 @bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'])
 def handle_group_message(message):
@@ -3525,6 +3595,7 @@ def handle_group_message(message):
         if not user or user[1] == 1:
             return
         
+        # Используем кэшированную проверку
         if is_user_blocked_bot(user_id):
             return
         
@@ -3667,6 +3738,21 @@ def cmd_top_chat(message):
                 ORDER BY points DESC
                 LIMIT 10
             """)
+            rows = cur.fetchall()
+            # ИСПРАВЛЕНО #7 - для лички только 2 колонки
+            medals = ['🥇', '🥈', '🥉']
+            text = "🏆 *Топ по баллам (все пользователи)*\n\n"
+            
+            for i, row in enumerate(rows):
+                uid = row[0]
+                points = row[1]
+                rank = get_rank(points)
+                name = get_user_display_name(uid)
+                icon = medals[i] if i < 3 else f"{i+1}."
+                text += f"{icon} {name}\n{rank['name']} • `{points:,}` баллов\n\n"
+            
+            bot.reply_to(message, text, parse_mode="Markdown")
+            return
         else:
             cur.execute("""
                 SELECT ca.user_id, u.points, ca.messages_count
@@ -3677,38 +3763,33 @@ def cmd_top_chat(message):
                 LIMIT 10
             """, (chat_id,))
 
-        rows = cur.fetchall()
+            rows = cur.fetchall()
 
-        if not rows:
-            bot.reply_to(message, "📭 Пока никто не набрал баллов.")
-            return
+            if not rows:
+                bot.reply_to(message, "📭 Пока никто не набрал баллов.")
+                return
 
-        medals = ['🥇', '🥈', '🥉']
-        text = f"🏆 *Топ активных*\n\n"
+            medals = ['🥇', '🥈', '🥉']
+            text = f"🏆 *Топ активных*\n\n"
 
-        for i, row in enumerate(rows):
-            uid = row[0]
-            points = row[1]
-            msg_count = row[2] if len(row) > 2 else 0
-            rank = get_rank(points)
+            for i, row in enumerate(rows):
+                uid = row[0]
+                points = row[1]
+                msg_count = row[2] if len(row) > 2 else 0
+                rank = get_rank(points)
 
-            try:
-                member = bot.get_chat_member(chat_id, uid)
-                name = member.user.first_name or str(uid)
-                if member.user.username:
-                    name = f"@{member.user.username}"
-            except:
-                name = str(uid)
+                try:
+                    member = bot.get_chat_member(chat_id, uid)
+                    name = member.user.first_name or str(uid)
+                    if member.user.username:
+                        name = f"@{member.user.username}"
+                except:
+                    name = str(uid)
 
-            icon = medals[i] if i < 3 else f"{i+1}."
-
-            if message.chat.type == 'private':
-                text += f"{icon} {name}\n{rank['name']} • `{points:,}` баллов\n\n"
-            else:
+                icon = medals[i] if i < 3 else f"{i+1}."
                 text += f"{icon} {name}\n{rank['name']} • 💬 {msg_count:,} сообщ. • 🪙 {points:,}\n\n"
 
-        user_id = message.from_user.id
-        if message.chat.type != 'private':
+            user_id = message.from_user.id
             cur.execute("""
                 SELECT COUNT(*) + 1 FROM chat_activity ca
                 JOIN users u ON u.user_id = ca.user_id
@@ -3732,7 +3813,7 @@ def cmd_top_chat(message):
             text += f"─────────────\n"
             text += f"👤 Ты: #{my_rank} • 💬 {my_msgs:,} сообщ."
 
-        bot.reply_to(message, text, parse_mode="Markdown")
+            bot.reply_to(message, text, parse_mode="Markdown")
 
     finally:
         return_db_connection(conn)
@@ -3787,12 +3868,14 @@ def cmd_rank(message):
         else:
             position_text = ""
 
-        text = f"👤 *Твой профиль*\n\n"
-        text += f"{rank['name']}\n"
-        text += f"🪙 Баллов: `{points:,}`\n"
-        text += position_text
-        text += f"🎁 Можно обменять: `{days_available}` дн.\n"
-        text += f"💰 Курс: `{rank['cost']}` баллов = 1 день\n"
+        text = (
+            f"👤 *Твой профиль*\n\n"
+            f"{rank['name']}\n"
+            f"🪙 Баллов: `{points:,}`\n"
+            f"{position_text}"
+            f"🎁 Можно обменять: `{days_available}` дн.\n"
+            f"💰 Курс: `{rank['cost']}` баллов = 1 день\n"
+        )
 
         if next_rank:
             needed = next_rank['min'] - points
@@ -3932,7 +4015,14 @@ def bot_stats_command(message):
     try:
         cur.execute("SELECT COUNT(*) FROM users")
         total_users = cur.fetchone()[0]
-        text = f"📊 *Статистика*\n\n⏳ Стаж: {stats['uptime_text']}\n👥 Пользователей: {total_users}\n📦 Ключей: {stats['current_keys']}\n🔑 Проверено: {stats['total_keys_checked']}\n🔓 Расшифровано: {stats['total_decryptions']}"
+        text = (
+            f"📊 *Статистика*\n\n"
+            f"⏳ Стаж: {stats['uptime_text']}\n"
+            f"👥 Пользователей: {total_users}\n"
+            f"📦 Ключей: {stats['current_keys']}\n"
+            f"🔑 Проверено: {stats['total_keys_checked']}\n"
+            f"🔓 Расшифровано: {stats['total_decryptions']}"
+        )
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
         return_db_connection(conn)
@@ -4272,7 +4362,12 @@ def callback_autopost_back(call):
     
     config = get_autopost_config()
     status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
-    text = f"📡 *АВТОПОСТИНГ*\n\nСтатус: {status}\nИнтервал: {config['interval'] // 60} мин\nКанал: {config['channel_id']}"
+    text = (
+        f"📡 *АВТОПОСТИНГ*\n\n"
+        f"Статус: {status}\n"
+        f"Интервал: {config['interval'] // 60} мин\n"
+        f"Канал: {config['channel_id']}"
+    )
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="autopost_load_keys"),
@@ -4344,7 +4439,11 @@ def callback_autopost_channel_settings(call):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
     config = get_autopost_config()
-    text = f"⚙️ *Канал*\n\n📢 Текущий: {config['channel_id']}\n📝 Ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}"
+    text = (
+        f"⚙️ *Канал*\n\n"
+        f"📢 Текущий: {config['channel_id']}\n"
+        f"📝 Ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}"
+    )
     kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton("📢 Сменить", callback_data="autopost_change_channel"),
@@ -4763,7 +4862,42 @@ def callback_edit_admin(call):
     _redraw_admin_perms(call, target_id)
     bot.answer_callback_query(call.id)
 
-# ИСПРАВЛЕНО #3 - toggle_perm_ с правильным split
+# ==================== ИСПРАВЛЕНО #1 - remove_days split ====================
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_days_'))
+def callback_remove_days(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    if not has_permission(call.from_user.id, 'remove_days'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на забирание дней.")
+        return
+    parts = call.data.split('_')
+    # "remove_days_123456789_30" -> ["remove", "days", "123456789", "30"]
+    target_id = int(parts[2])
+    days = int(parts[3])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
+            return
+        current_time = int(time.time())
+        current_end = result[0] if (result[0] and result[0] > current_time) else current_time
+        new_end = current_end - days * 24 * 60 * 60
+        if new_end < current_time:
+            new_end = current_time - 1
+        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        conn.commit()
+    finally:
+        return_db_connection(conn)
+    bot.answer_callback_query(call.id, f"✅ Убавлено {days} дней!")
+    try:
+        bot.send_message(target_id, f"⚠️ Администратор забрал {days} дней подписки!")
+    except:
+        pass
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_perm_'))
 def callback_toggle_perm(call):
     user_id = call.from_user.id
@@ -4772,7 +4906,7 @@ def callback_toggle_perm(call):
         return
     parts = call.data.split('_')
     target_id = int(parts[2])
-    perm_key = '_'.join(parts[3:])  # ИСПРАВЛЕНО
+    perm_key = '_'.join(parts[3:])
     
     if target_id == ADMIN_ID:
         bot.answer_callback_query(call.id, "❌ Нельзя менять права владельца.")
@@ -5170,38 +5304,7 @@ def callback_prolong(call):
         pass
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_days_'))
-def callback_remove_days(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    if not has_permission(call.from_user.id, 'remove_days'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на забирание дней.")
-        return
-    parts = call.data.split('_')
-    target_id = int(parts[2])
-    days = int(parts[3])
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
-        result = cur.fetchone()
-        if not result:
-            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
-            return
-        current_time = int(time.time())
-        current_end = result[0] if (result[0] and result[0] > current_time) else current_time
-        new_end = current_end - days * 24 * 60 * 60
-        if new_end < current_time:
-            new_end = current_time - 1
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
-        conn.commit()
-    finally:
-        return_db_connection(conn)
-    bot.answer_callback_query(call.id, f"✅ Убавлено {days} дней!")
-    try:
-        bot.send_message(target_id, f"⚠️ Администратор забрал {days} дней подписки!")
-    except:
-        pass
+# уже исправлено выше
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
 def callback_remove_sub(call):
@@ -5330,9 +5433,9 @@ def callback_announce_all_channels(call):
     bot.send_message(user_id, "📢 *Объявление во все каналы*\n\nОтправьте текст или медиа.", parse_mode="Markdown")
     announce_data[user_id] = {'type': 'all_channels', 'waiting': True, 'timestamp': int(time.time())}
 
-# ==================== ОБРАБОТЧИКИ ДЛЯ РЕЖИМОВ ====================
+# ==================== ОБРАБОТЧИКИ ДЛЯ РЕЖИМОВ (БЕЗ ДЕКОРАТОРОВ) ====================
 
-def handle_autopost_load_keys(message):  # БЕЗ декоратора
+def handle_autopost_load_keys(message):
     user_id = message.from_user.id
     if user_id not in autopost_loading:
         return
@@ -5352,7 +5455,7 @@ def handle_autopost_load_keys(message):  # БЕЗ декоратора
     else:
         bot.reply_to(message, "❌ Не найдено ключей")
 
-def handle_autopost_set_channel(message):  # БЕЗ декоратора
+def handle_autopost_set_channel(message):
     user_id = message.from_user.id
     text = message.text.strip()
     channel_id = None
@@ -5384,7 +5487,7 @@ def handle_autopost_set_channel(message):  # БЕЗ декоратора
     del search_cache[user_id]
     bot.reply_to(message, f"✅ Канал установлен: {channel_id}")
 
-def handle_autopost_set_interval(message):  # БЕЗ декоратора
+def handle_autopost_set_interval(message):
     user_id = message.from_user.id
     try:
         minutes = int(message.text.strip())
@@ -5399,7 +5502,7 @@ def handle_autopost_set_interval(message):  # БЕЗ декоратора
     except:
         bot.reply_to(message, "❌ Введите число")
 
-def handle_add_admin_input(message):  # БЕЗ декоратора
+def handle_add_admin_input(message):
     user_id = message.from_user.id
     if not has_permission(user_id, 'manage_admins'):
         return
@@ -5443,7 +5546,7 @@ def handle_add_admin_input(message):  # БЕЗ декоратора
     except:
         pass
 
-def admin_announce_text(message):  # БЕЗ декоратора
+def admin_announce_text(message):
     user_id = message.from_user.id
     if user_id not in announce_data:
         return
@@ -6018,6 +6121,7 @@ def ping():
 def health():
     return "OK", 200
 
+# ИСПРАВЛЕНО #10 - обновляем активность при обращении к подписке
 @app.route('/sub/<token>')
 def subscription(token):
     if not token:
@@ -6033,6 +6137,10 @@ def subscription(token):
         
         if is_blocked:
             return "User blocked", 403
+        
+        # ИСПРАВЛЕНО #10 - обновляем активность
+        cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (int(time.time()), user_id))
+        conn.commit()
         
         current_time = int(time.time())
         
@@ -6111,4 +6219,3 @@ if __name__ == "__main__":
                 bot.delete_webhook(drop_pending_updates=True)
             except:
                 pass
-                
