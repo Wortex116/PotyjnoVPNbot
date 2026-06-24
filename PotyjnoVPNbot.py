@@ -1201,6 +1201,8 @@ def admin_menu():
     )
     return kb
 
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ show_keys_menu ====================
+
 def show_keys_menu(user_id, chat_id, message_id):
     keys = get_keys_from_db()
     total_issued = int(get_setting('total_keys_issued', '0'))
@@ -1230,10 +1232,20 @@ def show_keys_menu(user_id, chat_id, message_id):
         types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued"),
         types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
     )
-    try:
-        bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=kb)
-    except:
-        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+    
+    sent = False
+    if message_id:
+        try:
+            bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=kb)
+            sent = True
+        except Exception as e:
+            print(f"[show_keys_menu] edit failed: {e}")
+    
+    if not sent:
+        try:
+            bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb)
+        except Exception as e:
+            print(f"[show_keys_menu] send failed: {e}")
 
 def _show_admin_list_for_call(call):
     user_id = call.from_user.id
@@ -1335,7 +1347,7 @@ def _show_proxy_menu(chat_id, message_id, user_id):
     kb.add(
         types.InlineKeyboardButton("📥 Загрузить прокси ссылку", callback_data="admin_keys_proxy_load"),
         types.InlineKeyboardButton("🗑️ Сбросить прокси ссылку", callback_data="admin_keys_proxy_reset"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back_main")
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back")
     )
     
     try:
@@ -1696,8 +1708,97 @@ def _parse_subscription_any(raw, steps=None):
     steps.append("❌ Ключи не найдены")
     return [], steps
 
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ "МОЯ ПОДПИСКА" ====================
+
+@bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
+def my_subscription(message):
+    print(f"[DEBUG] my_subscription вызван от {message.from_user.id}, текст: {message.text}")
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    current_time = int(time.time())
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    if not is_subscribed(user_id):
+        bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
+            return
+        subscription_end = result[0]
+        if subscription_end and subscription_end > current_time:
+            link = get_subscription_link(user_id)
+            yandex_link = f"https://translate.yandex.ru/translate?url={link}"
+            encoded_link = urllib.parse.quote(link, safe='')
+
+            text = f"""📡 *Моя подписка*
+
+┌ 🔗 *Обычная ссылка:*
+│ `{link}`
+│
+├ 🔄 *Для белых списков:*
+│ `{yandex_link}`
+│
+└ ℹ️ *Ссылка автообновляется при белых списках*
+   *Используйте её для импорта в клиент*
+
+━━━━━━━━━━━━━━━━━━━━━
+✨ *Рекомендуем клиент Incy VPN*
+
+Простой и удобный VPN-клиент:
+• 🚀 Быстрое подключение в 1 клик
+• 🔒 Надёжное шифрование
+• 📱 iOS и Android
+• ⚡ Поддержка всех наших протоколов
+
+*Импортируй подписку прямо в приложение!*
+━━━━━━━━━━━━━━━━━━━━━
+
+📱 *Поддерживаемые клиенты:*
+• V2Ray / V2RayNG
+• Hiddify / Nekobox
+• FlClash / Mihomo
+• Clash Meta / Sing-Box
+• ✨ *Incy VPN (рекомендуем)*
+
+💬 Поддержка: {SUPPORT}"""
+
+            kb = types.InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
+                types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
+            )
+            kb.row(
+                types.InlineKeyboardButton("🍎 Incy iOS", url=f"sing-box://import-remote?url={encoded_link}"),
+                types.InlineKeyboardButton("🤖 Incy Android", url=f"sing-box://import-remote?url={encoded_link}")
+            )
+            kb.row(
+                types.InlineKeyboardButton("📦 v2RayTun", url=f"v2raytun://import/{encoded_link}"),
+                types.InlineKeyboardButton("📥 Happ", url=f"happ://import-remote?url={encoded_link}")
+            )
+            kb.row(
+                types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
+                types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
+            )
+
+            bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            bot.reply_to(
+                message,
+                f"❌ Ваша подписка неактивна или истекла.\n\nДля продления обратитесь к администратору:\n{SUPPORT}"
+            )
+    finally:
+        cur.close()
+        conn.close()
+
 # ==================== ОБРАБОТЧИКИ КНОПОК МЕНЮ ====================
-# ВАЖНО: Эти хендлеры должны быть зарегистрированы ДО handle_private_messages!
 
 @bot.message_handler(func=lambda m: m.text == "👤 Личный кабинет")
 def cabinet(message):
@@ -1771,93 +1872,12 @@ def cabinet(message):
             types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
             types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
         )
-        # Убрана кнопка с невалидной ссылкой incy://
         kb.row(
             types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
             types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
         )
 
         bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
-    finally:
-        cur.close()
-        conn.close()
-
-@bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
-def my_subscription(message):
-    print(f"[DEBUG] my_subscription вызван от {message.from_user.id}, текст: {message.text}")
-    update_activity()
-    if message.chat.type != 'private':
-        return
-    user_id = message.from_user.id
-    current_time = int(time.time())
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    if not is_subscribed(user_id):
-        bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
-        result = cur.fetchone()
-        if not result:
-            bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
-            return
-        subscription_end = result[0]
-        if subscription_end and subscription_end > current_time:
-            link = get_subscription_link(user_id)
-            yandex_link = f"https://translate.yandex.ru/translate?url={link}"
-
-            text = f"""📡 *Моя подписка*
-
-┌ 🔗 *Обычная ссылка:*
-│ `{link}`
-│
-├ 🔄 *Для белых списков:*
-│ `{yandex_link}`
-│
-└ ℹ️ *Ссылка автообновляется при белых списках*
-   *Используйте её для импорта в клиент*
-
-━━━━━━━━━━━━━━━━━━━━━
-✨ *Рекомендуем клиент Incy VPN*
-
-Простой и удобный VPN-клиент:
-• 🚀 Быстрое подключение в 1 клик
-• 🔒 Надёжное шифрование
-• 📱 iOS и Android
-• ⚡ Поддержка всех наших протоколов
-
-*Импортируй подписку прямо в приложение!*
-━━━━━━━━━━━━━━━━━━━━━
-
-📱 *Поддерживаемые клиенты:*
-• V2Ray / V2RayNG
-• Hiddify / Nekobox
-• FlClash / Mihomo
-• Clash Meta / Sing-Box
-• ✨ *Incy VPN (рекомендуем)*
-
-💬 Поддержка: {SUPPORT}"""
-
-            kb = types.InlineKeyboardMarkup(row_width=2)
-            kb.add(
-                types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
-                types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
-            )
-            # Убрана кнопка с невалидной ссылкой incy://
-            kb.row(
-                types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
-                types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
-            )
-
-            bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
-        else:
-            bot.reply_to(
-                message,
-                f"❌ Ваша подписка неактивна или истекла.\n\nДля продления обратитесь к администратору:\n{SUPPORT}"
-            )
     finally:
         cur.close()
         conn.close()
@@ -2174,8 +2194,6 @@ def admin_announce_text(message):
         bot.reply_to(message, f"✅ Отправлено в {sent} каналов")
 
 # ==================== ОБРАБОТЧИК ПРИВАТНЫХ СООБЩЕНИЙ ====================
-# ВАЖНО: Этот хендлер НЕ должен перехватывать команды (/start, /admin и т.д.)
-# и кнопки меню обрабатываются отдельными хендлерами выше
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and not (m.text or '').startswith('/'))
 def handle_private_messages(message):
@@ -2185,7 +2203,6 @@ def handle_private_messages(message):
     if message.from_user.username:
         update_user_username(user_id, message.from_user.username)
 
-    # Если это кнопка меню — пропускаем, её обработает специфичный хендлер
     if text in MENU_BUTTONS:
         return
 
@@ -3063,12 +3080,6 @@ def callback_admin_keys_proxy_menu(call):
     bot.answer_callback_query(call.id)
     _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_back_main")
-def callback_admin_keys_back_main(call):
-    user_id = call.from_user.id
-    bot.answer_callback_query(call.id)
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
 @bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_reset")
 def callback_admin_keys_proxy_reset(call):
     user_id = call.from_user.id
@@ -3090,7 +3101,7 @@ def callback_admin_keys_proxy_load(call):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
         types.InlineKeyboardButton("✅ Завершить загрузку", callback_data="admin_keys_proxy_finish"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_proxy_menu")
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back")
     )
     msg = bot.send_message(
         user_id,
@@ -4318,7 +4329,6 @@ if __name__ == "__main__":
     
     print("🤖 Бот запущен и готов к работе!")
     
-    # Сбрасываем webhook для предотвращения конфликтов
     try:
         bot.delete_webhook(drop_pending_updates=True)
         print("✅ Webhook сброшен")
