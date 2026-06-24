@@ -2686,6 +2686,98 @@ def callback_exchange_action(call):
     _show_exchange_panel(call, user_id, days, max_days, points)
     bot.answer_callback_query(call.id)
 
+        @bot.message_handler(commands=['decrypt'])
+def cmd_decrypt(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    # Проверка на блокировку
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    
+    # Получаем текст команды
+    text = message.text.strip()
+    parts = text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "❌ Использование: `/decrypt [ссылка]`\n\n"
+            "Пример: `/decrypt https://example.com/sub`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    url = parts[1].strip()
+    
+    # Отправляем сообщение о начале обработки
+    wait_msg = bot.reply_to(message, "⏳ Расшифровываю подписку...")
+    
+    # Запускаем расшифровку в отдельном потоке
+    def process_decrypt():
+        try:
+            keys, steps = _parse_subscription_any(url, [])
+            
+            if not keys:
+                info = '\n'.join(steps) if steps else '—'
+                err_text = (
+                    "❌ Не удалось найти VPN ключи\n\n"
+                    f"Шаги:\n{info}"
+                )
+                bot.edit_message_text(err_text, chat_id, wait_msg.message_id)
+                return
+            
+            # Считаем протоколы
+            proto_stats = {}
+            for k in keys:
+                m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                if m:
+                    p = m.group(1).lower()
+                    proto_stats[p] = proto_stats.get(p, 0) + 1
+            
+            stats_text = '\n'.join(
+                f"  • {p}:// — {c}"
+                for p, c in sorted(proto_stats.items(), key=lambda x: -x[1])
+            )
+            
+            # Формируем результат
+            result_text = (
+                f"✅ *Расшифровка завершена!*\n\n"
+                f"📊 Найдено ключей: {len(keys)}\n"
+                f"📋 По протоколам:\n{stats_text}\n\n"
+                f"🔑 *Ключи:*\n"
+                f"`{keys[0]}`"
+            )
+            
+            if len(keys) > 1:
+                result_text += f"\n\n_... и ещё {len(keys)-1} ключей_"
+            
+            # Отправляем результат
+            try:
+                bot.edit_message_text(
+                    result_text,
+                    chat_id,
+                    wait_msg.message_id,
+                    parse_mode="Markdown"
+                )
+            except:
+                bot.send_message(chat_id, result_text, parse_mode="Markdown")
+                
+        except Exception as e:
+            try:
+                bot.edit_message_text(
+                    f"❌ Ошибка: {e}",
+                    chat_id,
+                    wait_msg.message_id
+                )
+            except:
+                bot.send_message(chat_id, f"❌ Ошибка: {e}")
+    
+    t = threading.Thread(target=process_decrypt)
+    t.daemon = True
+    t.start()
+    
 # ==================== "МОЯ ПОДПИСКА" С ЗАМОРОЗКОЙ ====================
 
 @bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
@@ -3819,7 +3911,7 @@ def cmd_top_chat(message):
         return_db_connection(conn)
 
 @bot.message_handler(commands=['rank'])
-def cmd_rank(message):
+        def cmd_rank(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
