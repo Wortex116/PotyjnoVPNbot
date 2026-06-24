@@ -855,7 +855,6 @@ def update_user_username(user_id, username):
         print(f"[update_user_username] Ошибка: {e}")
 
 def _find_user_by_username_in_db(username):
-    """Ищет пользователя по username в БД"""
     try:
         username_lower = username.lower().lstrip('@')
         conn = get_db_connection()
@@ -1696,6 +1695,537 @@ def _parse_subscription_any(raw, steps=None):
         return _dedup(keys), steps
     steps.append("❌ Ключи не найдены")
     return [], steps
+
+# ==================== ОБРАБОТЧИКИ КНОПОК МЕНЮ ====================
+# ВАЖНО: Эти хендлеры должны быть зарегистрированы ДО handle_private_messages!
+
+@bot.message_handler(func=lambda m: m.text == "👤 Личный кабинет")
+def cabinet(message):
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    current_time = int(time.time())
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end, token FROM users WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.reply_to(message, "❌ Используйте /start")
+            return
+        subscription_end = result[0]
+        token = result[1]
+
+        if subscription_end and subscription_end > current_time:
+            status = "✅ Активна"
+            days_left = (subscription_end - current_time) // (24 * 60 * 60)
+            hours_left = ((subscription_end - current_time) // 3600) % 24
+            time_left = f"{days_left} дн {hours_left} ч"
+            expire_date = datetime.fromtimestamp(subscription_end).strftime("%d.%m.%Y в %H:%M")
+            link = get_subscription_link(user_id)
+            yandex_link = f"https://translate.yandex.ru/translate?url={link}"
+        else:
+            status = "❌ Не активна"
+            time_left = "Закончилась"
+            expire_date = "Закончилась"
+            link = "❌ Нет активной подписки"
+            yandex_link = "❌ Нет активной подписки"
+
+        text = f"""👤 *Личный кабинет*
+
+🆔 ID: `{user_id}`
+
+📅 Подписка до: `{expire_date}`
+⏳ Осталось: `{time_left}`
+📊 Статус: {status}
+
+┌ 🔗 *Ссылка для импорта:*
+│ `{link}`
+│
+├ 🔄 *Для белых списков:*
+│ `{yandex_link}`
+│
+└ ℹ️ *Ссылка автообновляется при белых списках*
+
+━━━━━━━━━━━━━━━━━━━━━
+✨ *Рекомендуем клиент Incy VPN*
+
+Простой и удобный VPN-клиент:
+• 🚀 Быстрое подключение в 1 клик
+• 🔒 Надёжное шифрование
+• 📱 iOS и Android
+• ⚡ Поддержка всех наших протоколов
+
+*Импортируй подписку прямо в приложение!*
+━━━━━━━━━━━━━━━━━━━━━
+
+💬 Поддержка: {SUPPORT}"""
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
+            types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
+        )
+        kb.add(
+            types.InlineKeyboardButton("📲 Импорт в Incy", url=f"incy://sub/{link}"),
+        )
+        kb.row(
+            types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
+            types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
+        )
+
+        bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+    finally:
+        cur.close()
+        conn.close()
+
+@bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
+def my_subscription(message):
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    current_time = int(time.time())
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    if not is_subscribed(user_id):
+        bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (user_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
+            return
+        subscription_end = result[0]
+        if subscription_end and subscription_end > current_time:
+            link = get_subscription_link(user_id)
+            yandex_link = f"https://translate.yandex.ru/translate?url={link}"
+
+            text = f"""📡 *Моя подписка*
+
+┌ 🔗 *Обычная ссылка:*
+│ `{link}`
+│
+├ 🔄 *Для белых списков:*
+│ `{yandex_link}`
+│
+└ ℹ️ *Ссылка автообновляется при белых списках*
+   *Используйте её для импорта в клиент*
+
+━━━━━━━━━━━━━━━━━━━━━
+✨ *Рекомендуем клиент Incy VPN*
+
+Простой и удобный VPN-клиент:
+• 🚀 Быстрое подключение в 1 клик
+• 🔒 Надёжное шифрование
+• 📱 iOS и Android
+• ⚡ Поддержка всех наших протоколов
+
+*Импортируй подписку прямо в приложение!*
+━━━━━━━━━━━━━━━━━━━━━
+
+📱 *Поддерживаемые клиенты:*
+• V2Ray / V2RayNG
+• Hiddify / Nekobox
+• FlClash / Mihomo
+• Clash Meta / Sing-Box
+• ✨ *Incy VPN (рекомендуем)*
+
+💬 Поддержка: {SUPPORT}"""
+
+            kb = types.InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
+                types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
+            )
+            kb.add(
+                types.InlineKeyboardButton("📲 Импорт в Incy", url=f"incy://sub/{link}"),
+            )
+            kb.row(
+                types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
+                types.InlineKeyboardButton("🤖 Incy для Android", url="https://play.google.com/store/apps/details?id=llc.itdev.incy")
+            )
+
+            bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
+        else:
+            bot.reply_to(
+                message,
+                f"❌ Ваша подписка неактивна или истекла.\n\nДля продления обратитесь к администратору:\n{SUPPORT}"
+            )
+    finally:
+        cur.close()
+        conn.close()
+
+@bot.message_handler(func=lambda m: m.text == "👥 Рефералы")
+def referrals(message):
+    update_activity()
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+        if not cur.fetchone():
+            bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
+            return
+        cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
+        total = cur.fetchone()[0]
+        today_start = int(time.time()) - 24 * 60 * 60
+        cur.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_date > %s",
+            (user_id, today_start)
+        )
+        today = cur.fetchone()[0]
+        bot_username = bot.get_me().username
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+        text = f"👥 *Рефералы*\n\n📊 Всего: {total}\n📅 Сегодня: {today} / 10\n\n🔗 Ссылка: `{ref_link}`\n\n📌 За каждого друга +3 дня."
+        bot.reply_to(message, text, parse_mode="Markdown")
+    finally:
+        cur.close()
+        conn.close()
+
+@bot.message_handler(func=lambda m: m.text == "🏆 Топ рефералов")
+def top_referrals(message):
+    update_activity()
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT referrer_id, COUNT(*) FROM referrals GROUP BY referrer_id ORDER BY COUNT(*) DESC LIMIT 10")
+        rows = cur.fetchall()
+        if not rows:
+            bot.reply_to(message, "📭 Нет рефералов.")
+            return
+        text = "🏆 *Топ рефералов:*\n\n"
+        medals = ['🥇', '🥈', '🥉']
+        for i, (ref_id, count) in enumerate(rows):
+            name = get_user_display_name(ref_id)
+            icon = medals[i] if i < 3 else f"{i+1}."
+            text += f"{icon} {name} — {count} реф.\n"
+        bot.reply_to(message, text, parse_mode="Markdown")
+    finally:
+        cur.close()
+        conn.close()
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Стаж бота")
+def bot_stats_command(message):
+    update_activity()
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    stats = get_bot_stats()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()[0]
+        text = f"📊 *Статистика*\n\n⏳ Стаж: {stats['uptime_text']}\n👥 Пользователей: {total_users}\n📦 Ключей: {stats['current_keys']}\n🔑 Проверено: {stats['total_keys_checked']}\n🔓 Расшифровано: {stats['total_decryptions']}"
+        bot.reply_to(message, text, parse_mode="Markdown")
+    finally:
+        cur.close()
+        conn.close()
+
+@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
+def decrypt_subscription_start(message):
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    if user_id in decrypt_results:
+        del decrypt_results[user_id]
+    decrypt_results[user_id] = {'waiting': True}
+    bot.reply_to(
+        message,
+        "🔓 *Расшифровка VPN подписки*\n\n"
+        "Отправьте ссылку, текст или файл подписки.\n\n"
+        "Поддерживаю:\n"
+        "• URL подписки\n"
+        "• Base64 (все уровни)\n"
+        "• HTML/JSON\n"
+        "• Схемы: happ://, incy:// и др.\n"
+        "• Файлы с ключами\n\n"
+        "📄 Получите `.txt` файл со всеми ключами.\n\n"
+        "❗ Чтобы выйти из режима расшифровки - нажмите /cancel",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda m: m.text == "❓ Поддержка")
+def support(message):
+    bot.reply_to(message, f"💬 Поддержка: {SUPPORT}")
+
+# ==================== ОБРАБОТЧИКИ ДЛЯ РЕЖИМОВ ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in autopost_loading and (m.text or '') not in MENU_BUTTONS)
+def handle_autopost_load_keys(message):
+    user_id = message.from_user.id
+    if user_id not in autopost_loading:
+        return
+    raw = message.text or message.caption or ''
+    keys = load_keys_from_text(raw) if raw else []
+    if not keys and message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            data = bot.download_file(file.file_path)
+            keys = load_keys_from_text(data.decode('utf-8', errors='ignore'))
+        except:
+            pass
+    if keys:
+        autopost_loading[user_id]['keys'].extend(keys)
+        autopost_loading[user_id]['keys'] = _dedup(autopost_loading[user_id]['keys'])
+        bot.reply_to(message, f"✅ Загружено {len(keys)}. Всего: {len(autopost_loading[user_id]['keys'])}")
+    else:
+        bot.reply_to(message, "❌ Не найдено ключей")
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel' and (m.text or '') not in MENU_BUTTONS)
+def handle_autopost_set_channel(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    channel_id = None
+    topic_id = 0
+    if 't.me/' in text:
+        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
+        if match:
+            try:
+                chat = bot.get_chat(f"@{match.group(1)}")
+                channel_id = chat.id
+            except:
+                pass
+    if not channel_id:
+        try:
+            channel_id = int(text)
+        except:
+            pass
+    if 'thread_id=' in text:
+        match = re.search(r'thread_id=(\d+)', text)
+        if match:
+            topic_id = int(match.group(1))
+    if not channel_id:
+        bot.reply_to(message, "❌ Не удалось распознать")
+        return
+    config = get_autopost_config()
+    config['channel_id'] = channel_id
+    config['topic_id'] = topic_id
+    save_autopost_config(config)
+    del search_cache[user_id]
+    bot.reply_to(message, f"✅ Канал установлен: {channel_id}")
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval' and (m.text or '') not in MENU_BUTTONS)
+def handle_autopost_set_interval(message):
+    user_id = message.from_user.id
+    try:
+        minutes = int(message.text.strip())
+        if minutes < 5 or minutes > 1440:
+            bot.reply_to(message, "❌ 5-1440 минут")
+            return
+        config = get_autopost_config()
+        config['interval'] = minutes * 60
+        save_autopost_config(config)
+        del search_cache[user_id]
+        bot.reply_to(message, f"✅ Интервал: {minutes} мин")
+    except:
+        bot.reply_to(message, "❌ Введите число")
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'add_admin' and (m.text or '') not in MENU_BUTTONS)
+def handle_add_admin_input(message):
+    user_id = message.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        return
+    target_id = get_user_id_from_input(message.text.strip())
+    if not target_id:
+        bot.reply_to(message, "❌ Неверный ID или юзернейм.")
+        return
+    if target_id == ADMIN_ID:
+        bot.reply_to(message, "❌ Это владелец бота.")
+        return
+    if is_admin(target_id):
+        bot.reply_to(message, "❌ Пользователь уже является админом.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
+        user_exists = cur.fetchone()
+    finally:
+        cur.close()
+        conn.close()
+    if not user_exists:
+        bot.reply_to(message, "❌ Пользователь не зарегистрирован в боте.")
+        return
+    role = search_cache[user_id].get('role', 'junior')
+    perms = ROLE_PRESETS[role]['permissions'].copy()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
+            (target_id, role, json.dumps(perms), user_id, int(time.time()))
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
+    del search_cache[user_id]
+    name = get_user_display_name(target_id)
+    bot.reply_to(message, f"✅ {name} (`{target_id}`) назначен {ROLE_PRESETS[role]['name']}!")
+    try:
+        bot.send_message(target_id, f"👑 Вам назначена роль {ROLE_PRESETS[role]['name']}!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
+    except:
+        pass
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data and (m.text or '') not in MENU_BUTTONS)
+def admin_announce_text(message):
+    user_id = message.from_user.id
+    if user_id not in announce_data:
+        return
+    data = announce_data[user_id]
+    del announce_data[user_id]
+    announce_type = data.get('type', 'dm')
+    text = message.text
+    caption = message.caption or ''
+    
+    if announce_type == 'dm':
+        if not text and not message.photo and not message.video and not message.document:
+            bot.reply_to(message, "❌ Отправьте текст или медиа.")
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT user_id FROM users")
+            users = cur.fetchall()
+        finally:
+            cur.close()
+            conn.close()
+        sent = 0
+        for (uid,) in users:
+            try:
+                if message.photo:
+                    bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
+                elif message.video:
+                    bot.send_video(uid, message.video.file_id, caption=caption)
+                elif message.document:
+                    bot.send_document(uid, message.document.file_id, caption=caption)
+                else:
+                    bot.send_message(uid, text)
+                sent += 1
+            except:
+                pass
+        bot.reply_to(message, f"✅ Отправлено {sent} пользователям")
+    elif announce_type == 'channel':
+        channel_id = data.get('channel_id')
+        try:
+            if message.photo:
+                bot.send_photo(channel_id, message.photo[-1].file_id, caption=caption)
+            elif message.video:
+                bot.send_video(channel_id, message.video.file_id, caption=caption)
+            elif message.document:
+                bot.send_document(channel_id, message.document.file_id, caption=caption)
+            else:
+                bot.send_message(channel_id, text)
+            bot.reply_to(message, "✅ Отправлено")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка: {e}")
+    elif announce_type == 'all_channels':
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT channel_id FROM autopost_channels WHERE enabled = TRUE")
+            channels = cur.fetchall()
+        finally:
+            cur.close()
+            conn.close()
+        if not channels:
+            bot.reply_to(message, "❌ Нет активных каналов.")
+            return
+        sent = 0
+        for (ch_id,) in channels:
+            try:
+                if message.photo:
+                    bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption)
+                elif message.video:
+                    bot.send_video(ch_id, message.video.file_id, caption=caption)
+                elif message.document:
+                    bot.send_document(ch_id, message.document.file_id, caption=caption)
+                else:
+                    bot.send_message(ch_id, text)
+                sent += 1
+                time.sleep(0.3)
+            except:
+                pass
+        bot.reply_to(message, f"✅ Отправлено в {sent} каналов")
+
+# ==================== ОБРАБОТЧИК ПРИВАТНЫХ СООБЩЕНИЙ (В САМОМ КОНЦЕ) ====================
+
+@bot.message_handler(func=lambda m: m.chat.type == 'private')
+def handle_private_messages(message):
+    user_id = message.from_user.id
+    text = message.text or ''
+
+    if message.from_user.username:
+        update_user_username(user_id, message.from_user.username)
+
+    if text.startswith('/'):
+        return
+
+    # Если это кнопка меню — пропускаем, её обработает специфичный хендлер
+    if text in MENU_BUTTONS:
+        return
+
+    if user_id in proxy_url_loading:
+        handle_proxy_url_input(message)
+        return
+
+    if user_id in announce_data:
+        admin_announce_text(message)
+        return
+
+    if user_id in autopost_loading:
+        handle_autopost_load_keys(message)
+        return
+
+    if user_id in decrypt_results and decrypt_results[user_id].get('waiting'):
+        if message.document:
+            try:
+                file = bot.get_file(message.document.file_id)
+                data = bot.download_file(file.file_path)
+                _do_decrypt(message, user_id, file_bytes=data, file_name=message.document.file_name)
+            except Exception as e:
+                bot.reply_to(message, f"❌ Ошибка: {e}")
+            return
+        if text:
+            _do_decrypt(message, user_id, text=text)
+        return
+
+    if user_id in search_cache:
+        action = search_cache.get(user_id, {}).get('action', '')
+        if action == 'autopost_set_channel':
+            handle_autopost_set_channel(message)
+            return
+        if action == 'autopost_set_interval':
+            handle_autopost_set_interval(message)
+            return
+        if action == 'add_admin':
+            handle_add_admin_input(message)
+            return
+
+    if text:
+        bot.reply_to(message, "Используйте кнопки меню или /cancel для отмены текущего режима.", reply_markup=main_menu())
 
 # ==================== ОСТАЛЬНЫЕ CALLBACK-ХЕНДЛЕРЫ ====================
 
@@ -2659,206 +3189,6 @@ def callback_admin_keys_proxy_finish(call):
     t.daemon = True
     t.start()
 
-# ==================== ОБРАБОТЧИКИ ХЕНДЛЕРОВ ДЛЯ РЕЖИМОВ ====================
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in autopost_loading and (m.text or '') not in MENU_BUTTONS)
-def handle_autopost_load_keys(message):
-    user_id = message.from_user.id
-    if user_id not in autopost_loading:
-        return
-    raw = message.text or message.caption or ''
-    keys = load_keys_from_text(raw) if raw else []
-    if not keys and message.document:
-        try:
-            file = bot.get_file(message.document.file_id)
-            data = bot.download_file(file.file_path)
-            keys = load_keys_from_text(data.decode('utf-8', errors='ignore'))
-        except:
-            pass
-    if keys:
-        autopost_loading[user_id]['keys'].extend(keys)
-        autopost_loading[user_id]['keys'] = _dedup(autopost_loading[user_id]['keys'])
-        bot.reply_to(message, f"✅ Загружено {len(keys)}. Всего: {len(autopost_loading[user_id]['keys'])}")
-    else:
-        bot.reply_to(message, "❌ Не найдено ключей")
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel' and (m.text or '') not in MENU_BUTTONS)
-def handle_autopost_set_channel(message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-    channel_id = None
-    topic_id = 0
-    if 't.me/' in text:
-        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
-        if match:
-            try:
-                chat = bot.get_chat(f"@{match.group(1)}")
-                channel_id = chat.id
-            except:
-                pass
-    if not channel_id:
-        try:
-            channel_id = int(text)
-        except:
-            pass
-    if 'thread_id=' in text:
-        match = re.search(r'thread_id=(\d+)', text)
-        if match:
-            topic_id = int(match.group(1))
-    if not channel_id:
-        bot.reply_to(message, "❌ Не удалось распознать")
-        return
-    config = get_autopost_config()
-    config['channel_id'] = channel_id
-    config['topic_id'] = topic_id
-    save_autopost_config(config)
-    del search_cache[user_id]
-    bot.reply_to(message, f"✅ Канал установлен: {channel_id}")
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval' and (m.text or '') not in MENU_BUTTONS)
-def handle_autopost_set_interval(message):
-    user_id = message.from_user.id
-    try:
-        minutes = int(message.text.strip())
-        if minutes < 5 or minutes > 1440:
-            bot.reply_to(message, "❌ 5-1440 минут")
-            return
-        config = get_autopost_config()
-        config['interval'] = minutes * 60
-        save_autopost_config(config)
-        del search_cache[user_id]
-        bot.reply_to(message, f"✅ Интервал: {minutes} мин")
-    except:
-        bot.reply_to(message, "❌ Введите число")
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'add_admin' and (m.text or '') not in MENU_BUTTONS)
-def handle_add_admin_input(message):
-    user_id = message.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        return
-    target_id = get_user_id_from_input(message.text.strip())
-    if not target_id:
-        bot.reply_to(message, "❌ Неверный ID или юзернейм.")
-        return
-    if target_id == ADMIN_ID:
-        bot.reply_to(message, "❌ Это владелец бота.")
-        return
-    if is_admin(target_id):
-        bot.reply_to(message, "❌ Пользователь уже является админом.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
-        user_exists = cur.fetchone()
-    finally:
-        cur.close()
-        conn.close()
-    if not user_exists:
-        bot.reply_to(message, "❌ Пользователь не зарегистрирован в боте.")
-        return
-    role = search_cache[user_id].get('role', 'junior')
-    perms = ROLE_PRESETS[role]['permissions'].copy()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
-            (target_id, role, json.dumps(perms), user_id, int(time.time()))
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        conn.close()
-    del search_cache[user_id]
-    name = get_user_display_name(target_id)
-    bot.reply_to(message, f"✅ {name} (`{target_id}`) назначен {ROLE_PRESETS[role]['name']}!")
-    try:
-        bot.send_message(target_id, f"👑 Вам назначена роль {ROLE_PRESETS[role]['name']}!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
-    except:
-        pass
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data and (m.text or '') not in MENU_BUTTONS)
-def admin_announce_text(message):
-    user_id = message.from_user.id
-    if user_id not in announce_data:
-        return
-    data = announce_data[user_id]
-    del announce_data[user_id]
-    announce_type = data.get('type', 'dm')
-    text = message.text
-    caption = message.caption or ''
-    
-    if announce_type == 'dm':
-        if not text and not message.photo and not message.video and not message.document:
-            bot.reply_to(message, "❌ Отправьте текст или медиа.")
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT user_id FROM users")
-            users = cur.fetchall()
-        finally:
-            cur.close()
-            conn.close()
-        sent = 0
-        for (uid,) in users:
-            try:
-                if message.photo:
-                    bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
-                elif message.video:
-                    bot.send_video(uid, message.video.file_id, caption=caption)
-                elif message.document:
-                    bot.send_document(uid, message.document.file_id, caption=caption)
-                else:
-                    bot.send_message(uid, text)
-                sent += 1
-            except:
-                pass
-        bot.reply_to(message, f"✅ Отправлено {sent} пользователям")
-    elif announce_type == 'channel':
-        channel_id = data.get('channel_id')
-        try:
-            if message.photo:
-                bot.send_photo(channel_id, message.photo[-1].file_id, caption=caption)
-            elif message.video:
-                bot.send_video(channel_id, message.video.file_id, caption=caption)
-            elif message.document:
-                bot.send_document(channel_id, message.document.file_id, caption=caption)
-            else:
-                bot.send_message(channel_id, text)
-            bot.reply_to(message, "✅ Отправлено")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка: {e}")
-    elif announce_type == 'all_channels':
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT channel_id FROM autopost_channels WHERE enabled = TRUE")
-            channels = cur.fetchall()
-        finally:
-            cur.close()
-            conn.close()
-        if not channels:
-            bot.reply_to(message, "❌ Нет активных каналов.")
-            return
-        sent = 0
-        for (ch_id,) in channels:
-            try:
-                if message.photo:
-                    bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption)
-                elif message.video:
-                    bot.send_video(ch_id, message.video.file_id, caption=caption)
-                elif message.document:
-                    bot.send_document(ch_id, message.document.file_id, caption=caption)
-                else:
-                    bot.send_message(ch_id, text)
-                sent += 1
-                time.sleep(0.3)
-            except:
-                pass
-        bot.reply_to(message, f"✅ Отправлено в {sent} каналов")
-
 # ==================== НАСТРОЙКА ПРАВ АДМИНОВ ====================
 
 @bot.callback_query_handler(func=lambda call: call.data == "edit_admin_perms")
@@ -3498,80 +3828,6 @@ def callback_announce_all_channels(call):
     bot.send_message(user_id, "📢 *Объявление во все каналы*\n\nОтправьте текст или медиа.", parse_mode="Markdown")
     announce_data[user_id] = {'type': 'all_channels', 'waiting': True}
 
-# ==================== ОБРАБОТЧИК ПРИВАТНЫХ СООБЩЕНИЙ (В САМОМ КОНЦЕ) ====================
-
-@bot.message_handler(func=lambda m: m.chat.type == 'private')
-def handle_private_messages(message):
-    user_id = message.from_user.id
-    text = message.text or ''
-
-    if message.from_user.username:
-        update_user_username(user_id, message.from_user.username)
-
-    if text.startswith('/'):
-        return
-
-    if user_id in proxy_url_loading:
-        if text in MENU_BUTTONS:
-            del proxy_url_loading[user_id]
-        else:
-            handle_proxy_url_input(message)
-            return
-
-    if user_id in announce_data:
-        if text in MENU_BUTTONS:
-            del announce_data[user_id]
-        else:
-            admin_announce_text(message)
-            return
-
-    if user_id in autopost_loading:
-        if text in MENU_BUTTONS:
-            del autopost_loading[user_id]
-        else:
-            handle_autopost_load_keys(message)
-            return
-
-    if user_id in decrypt_results and decrypt_results[user_id].get('waiting'):
-        if text in MENU_BUTTONS:
-            del decrypt_results[user_id]
-        else:
-            if message.document:
-                try:
-                    file = bot.get_file(message.document.file_id)
-                    data = bot.download_file(file.file_path)
-                    _do_decrypt(message, user_id, file_bytes=data, file_name=message.document.file_name)
-                except Exception as e:
-                    bot.reply_to(message, f"❌ Ошибка: {e}")
-                return
-            if text:
-                _do_decrypt(message, user_id, text=text)
-            return
-
-    if user_id in search_cache:
-        action = search_cache.get(user_id, {}).get('action', '')
-        if action == 'autopost_set_channel':
-            if text in MENU_BUTTONS:
-                del search_cache[user_id]
-            else:
-                handle_autopost_set_channel(message)
-            return
-        if action == 'autopost_set_interval':
-            if text in MENU_BUTTONS:
-                del search_cache[user_id]
-            else:
-                handle_autopost_set_interval(message)
-            return
-        if action == 'add_admin':
-            if text in MENU_BUTTONS:
-                del search_cache[user_id]
-            else:
-                handle_add_admin_input(message)
-            return
-
-    if text:
-        bot.reply_to(message, "Используйте кнопки меню или /cancel для отмены текущего режима.", reply_markup=main_menu())
-
 # ==================== PRIORITY COMMAND HANDLER ====================
 
 @bot.message_handler(commands=['admin', 'check', 'user', 'add_days', 'remove_days', 'block', 'unblock', 'cancel', 'ref', 'ref_debug', 'add_admin', 'remove_admin'])
@@ -4063,4 +4319,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Критическая ошибка в polling: {e}")
         sys.exit(1)
-        
+    
