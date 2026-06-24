@@ -1201,8 +1201,6 @@ def admin_menu():
     )
     return kb
 
-# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ show_keys_menu ====================
-
 def show_keys_menu(user_id, chat_id, message_id):
     keys = get_keys_from_db()
     total_issued = int(get_setting('total_keys_issued', '0'))
@@ -1736,7 +1734,6 @@ def my_subscription(message):
         if subscription_end and subscription_end > current_time:
             link = get_subscription_link(user_id)
             yandex_link = f"https://translate.yandex.ru/translate?url={link}"
-            encoded_link = urllib.parse.quote(link, safe='')
 
             text = f"""📡 *Моя подписка*
 
@@ -1774,14 +1771,6 @@ def my_subscription(message):
             kb.add(
                 types.InlineKeyboardButton("📋 Обычная", callback_data=f"copy_link_{user_id}"),
                 types.InlineKeyboardButton("🔄 Белые списки", callback_data=f"copy_yandex_{user_id}")
-            )
-            kb.row(
-                types.InlineKeyboardButton("🍎 Incy iOS", url=f"sing-box://import-remote?url={encoded_link}"),
-                types.InlineKeyboardButton("🤖 Incy Android", url=f"sing-box://import-remote?url={encoded_link}")
-            )
-            kb.row(
-                types.InlineKeyboardButton("📦 v2RayTun", url=f"v2raytun://import/{encoded_link}"),
-                types.InlineKeyboardButton("📥 Happ", url=f"happ://import-remote?url={encoded_link}")
             )
             kb.row(
                 types.InlineKeyboardButton("🍎 Incy для iOS", url="https://apps.apple.com/ru/app/incy/id6756943388"),
@@ -2653,9 +2642,10 @@ def auto_post_keys_to_channel():
     except Exception as e:
         print(f"[autopost] Ошибка: {e}")
 
-# ==================== ADMIN CALLBACKS ====================
+# ==================== ИСПРАВЛЕННЫЙ ADMIN CALLBACK ====================
+# Теперь НЕ перехватывает admin_keys_*
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
+@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') and not call.data.startswith('admin_keys_'))
 def admin_callback(call):
     user_id = call.from_user.id
     if not is_admin(user_id):
