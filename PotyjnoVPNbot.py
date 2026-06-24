@@ -1701,6 +1701,7 @@ def _parse_subscription_any(raw, steps=None):
 
 @bot.message_handler(func=lambda m: m.text == "👤 Личный кабинет")
 def cabinet(message):
+    print(f"[DEBUG] cabinet вызван от {message.from_user.id}, текст: {message.text}")
     update_activity()
     if message.chat.type != 'private':
         return
@@ -1785,6 +1786,7 @@ def cabinet(message):
 
 @bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
 def my_subscription(message):
+    print(f"[DEBUG] my_subscription вызван от {message.from_user.id}, текст: {message.text}")
     update_activity()
     if message.chat.type != 'private':
         return
@@ -1866,6 +1868,7 @@ def my_subscription(message):
 
 @bot.message_handler(func=lambda m: m.text == "👥 Рефералы")
 def referrals(message):
+    print(f"[DEBUG] referrals вызван от {message.from_user.id}, текст: {message.text}")
     update_activity()
     user_id = message.from_user.id
     if is_blocked(user_id):
@@ -1896,6 +1899,7 @@ def referrals(message):
 
 @bot.message_handler(func=lambda m: m.text == "🏆 Топ рефералов")
 def top_referrals(message):
+    print(f"[DEBUG] top_referrals вызван от {message.from_user.id}, текст: {message.text}")
     update_activity()
     user_id = message.from_user.id
     if is_blocked(user_id):
@@ -1922,6 +1926,7 @@ def top_referrals(message):
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Стаж бота")
 def bot_stats_command(message):
+    print(f"[DEBUG] bot_stats_command вызван от {message.from_user.id}, текст: {message.text}")
     update_activity()
     user_id = message.from_user.id
     if is_blocked(user_id):
@@ -1941,6 +1946,7 @@ def bot_stats_command(message):
 
 @bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
 def decrypt_subscription_start(message):
+    print(f"[DEBUG] decrypt_subscription_start вызван от {message.from_user.id}, текст: {message.text}")
     update_activity()
     if message.chat.type != 'private':
         return
@@ -1968,11 +1974,12 @@ def decrypt_subscription_start(message):
 
 @bot.message_handler(func=lambda m: m.text == "❓ Поддержка")
 def support(message):
+    print(f"[DEBUG] support вызван от {message.from_user.id}, текст: {message.text}")
     bot.reply_to(message, f"💬 Поддержка: {SUPPORT}")
 
 # ==================== ОБРАБОТЧИКИ ДЛЯ РЕЖИМОВ ====================
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in autopost_loading and (m.text or '') not in MENU_BUTTONS)
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in autopost_loading and (m.text or '') not in MENU_BUTTONS and not (m.text or '').startswith('/'))
 def handle_autopost_load_keys(message):
     user_id = message.from_user.id
     if user_id not in autopost_loading:
@@ -1993,7 +2000,7 @@ def handle_autopost_load_keys(message):
     else:
         bot.reply_to(message, "❌ Не найдено ключей")
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel' and (m.text or '') not in MENU_BUTTONS)
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_channel' and (m.text or '') not in MENU_BUTTONS and not (m.text or '').startswith('/'))
 def handle_autopost_set_channel(message):
     user_id = message.from_user.id
     text = message.text.strip()
@@ -2026,7 +2033,7 @@ def handle_autopost_set_channel(message):
     del search_cache[user_id]
     bot.reply_to(message, f"✅ Канал установлен: {channel_id}")
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval' and (m.text or '') not in MENU_BUTTONS)
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'autopost_set_interval' and (m.text or '') not in MENU_BUTTONS and not (m.text or '').startswith('/'))
 def handle_autopost_set_interval(message):
     user_id = message.from_user.id
     try:
@@ -2042,7 +2049,7 @@ def handle_autopost_set_interval(message):
     except:
         bot.reply_to(message, "❌ Введите число")
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'add_admin' and (m.text or '') not in MENU_BUTTONS)
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in search_cache and search_cache.get(m.from_user.id, {}).get('action') == 'add_admin' and (m.text or '') not in MENU_BUTTONS and not (m.text or '').startswith('/'))
 def handle_add_admin_input(message):
     user_id = message.from_user.id
     if not has_permission(user_id, 'manage_admins'):
@@ -2089,7 +2096,7 @@ def handle_add_admin_input(message):
     except:
         pass
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data and (m.text or '') not in MENU_BUTTONS)
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and m.from_user.id in announce_data and (m.text or '') not in MENU_BUTTONS and not (m.text or '').startswith('/'))
 def admin_announce_text(message):
     user_id = message.from_user.id
     if user_id not in announce_data:
@@ -2170,18 +2177,17 @@ def admin_announce_text(message):
                 pass
         bot.reply_to(message, f"✅ Отправлено в {sent} каналов")
 
-# ==================== ОБРАБОТЧИК ПРИВАТНЫХ СООБЩЕНИЙ (В САМОМ КОНЦЕ) ====================
+# ==================== ОБРАБОТЧИК ПРИВАТНЫХ СООБЩЕНИЙ ====================
+# ВАЖНО: Этот хендлер НЕ должен перехватывать команды (/start, /admin и т.д.)
+# и кнопки меню обрабатываются отдельными хендлерами выше
 
-@bot.message_handler(func=lambda m: m.chat.type == 'private')
+@bot.message_handler(func=lambda m: m.chat.type == 'private' and not (m.text or '').startswith('/'))
 def handle_private_messages(message):
     user_id = message.from_user.id
     text = message.text or ''
 
     if message.from_user.username:
         update_user_username(user_id, message.from_user.username)
-
-    if text.startswith('/'):
-        return
 
     # Если это кнопка меню — пропускаем, её обработает специфичный хендлер
     if text in MENU_BUTTONS:
@@ -2381,6 +2387,7 @@ def _register_user(user_id, referrer_id=None):
 
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
+    print(f"[DEBUG] cmd_start вызван от {message.from_user.id}")
     update_activity()
     if message.chat.type != 'private':
         bot.reply_to(message, "⚠️ Бот работает только в личных сообщениях.")
@@ -4319,4 +4326,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"❌ Критическая ошибка в polling: {e}")
         sys.exit(1)
-    
+            
