@@ -45,17 +45,13 @@ MENU_BUTTONS = {
 
 # ==================== KEEP ALIVE ====================
 
-# ИСПРАВЛЕНО #11 - динамический URL
-def get_bot_url():
+def keep_alive_ping():
     url = os.getenv('RENDER_EXTERNAL_URL', '')
     if not url:
         url = os.getenv('PUBLIC_URL', '')
     if not url:
         url = 'https://potyjnovpnbot.onrender.com'
-    return url.rstrip('/')
-
-def keep_alive_ping():
-    url = get_bot_url()
+    url = url.rstrip('/')
     print(f"[keep_alive] Запущен пинг-механизм для {url}")
     ping_count = 0
     while True:
@@ -79,7 +75,7 @@ def auto_restart_monitor():
             if idle_time > max_idle_time:
                 print(f"[auto_restart] Длительное бездействие, выполняем мягкий перезапуск...")
                 try:
-                    url = get_bot_url()
+                    url = os.getenv('RENDER_EXTERNAL_URL', 'https://potyjnovpnbot.onrender.com')
                     for _ in range(3):
                         requests.get(f"{url}/ping", timeout=5)
                         time.sleep(1)
@@ -137,7 +133,7 @@ def return_db_connection(conn):
 
 # Активные словари
 search_cache = {}
-exchange_cache = {}  # отдельный словарь для обмена баллов
+exchange_cache = {}
 decrypt_results = {}
 announce_data = {}
 manage_cache = {}
@@ -1997,7 +1993,7 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка Notion: {e}")
 
-    # BELKA.NETWORK - ИСПРАВЛЕНО #4 - не возвращаем ссылки, а идём дальше
+    # BELKA.NETWORK
     if 'belka.network' in text:
         steps.append(f"🔗 Обнаружена ссылка Belka VPN")
         try:
@@ -2045,7 +2041,6 @@ def _parse_subscription_any(raw, steps=None):
                         except:
                             pass
                     steps.append(f"📋 Найдены ссылки, но ключи не извлечены")
-                    # ИСПРАВЛЕНО: возвращаем пустой список вместо ссылок
                     return [], steps
                 steps.append(f"❌ Не найдена ссылка на подписку на странице Belka")
                 return [], steps
@@ -2686,18 +2681,32 @@ def callback_exchange_action(call):
     _show_exchange_panel(call, user_id, days, max_days, points)
     bot.answer_callback_query(call.id)
 
-        @bot.message_handler(commands=['decrypt'])
+# ==================== КОМАНДА /DECRYPT ДЛЯ ЧАТОВ ====================
+@bot.message_handler(commands=['decrypt'])
 def cmd_decrypt(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
     
-    # Проверка на блокировку
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
     
     # Получаем текст команды
     text = message.text.strip()
+    
+    # Если команда с упоминанием: /decrypt@Potyjno_vpn_bot https://...
+    if ' ' in text:
+        parts = text.split(maxsplit=1)
+        command_part = parts[0]
+        
+        # Если команда с @, удаляем упоминание
+        if '@' in command_part:
+            command_part = command_part.split('@')[0]
+            if len(parts) > 1:
+                text = command_part + ' ' + parts[1]
+            else:
+                text = command_part
+    
     parts = text.split(maxsplit=1)
     
     if len(parts) < 2:
@@ -2711,10 +2720,18 @@ def cmd_decrypt(message):
     
     url = parts[1].strip()
     
-    # Отправляем сообщение о начале обработки
+    # Проверяем, что это ссылка
+    if not url.startswith('http'):
+        bot.reply_to(
+            message,
+            "❌ Это не ссылка! Отправьте ссылку на подписку.\n\n"
+            "Пример: `/decrypt https://example.com/sub`",
+            parse_mode="Markdown"
+        )
+        return
+    
     wait_msg = bot.reply_to(message, "⏳ Расшифровываю подписку...")
     
-    # Запускаем расшифровку в отдельном потоке
     def process_decrypt():
         try:
             keys, steps = _parse_subscription_any(url, [])
@@ -2728,7 +2745,6 @@ def cmd_decrypt(message):
                 bot.edit_message_text(err_text, chat_id, wait_msg.message_id)
                 return
             
-            # Считаем протоколы
             proto_stats = {}
             for k in keys:
                 m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
@@ -2741,25 +2757,40 @@ def cmd_decrypt(message):
                 for p, c in sorted(proto_stats.items(), key=lambda x: -x[1])
             )
             
-            # Формируем результат
+            # Берём первые 3 ключа для показа
+            keys_preview = '\n'.join([f"`{k}`" for k in keys[:5]])
+            
             result_text = (
                 f"✅ *Расшифровка завершена!*\n\n"
                 f"📊 Найдено ключей: {len(keys)}\n"
                 f"📋 По протоколам:\n{stats_text}\n\n"
-                f"🔑 *Ключи:*\n"
-                f"`{keys[0]}`"
+                f"🔑 *Ключи:*\n{keys_preview}"
             )
             
-            if len(keys) > 1:
-                result_text += f"\n\n_... и ещё {len(keys)-1} ключей_"
+            if len(keys) > 5:
+                result_text += f"\n\n_... и ещё {len(keys)-5} ключей_"
             
-            # Отправляем результат
+            kb = None
+            if len(keys) > 5:
+                kb = types.InlineKeyboardMarkup()
+                kb.add(types.InlineKeyboardButton(
+                    f"📋 Показать все ({len(keys)} ключей)",
+                    callback_data=f"decrypt_show_all_{user_id}_{chat_id}_{wait_msg.message_id}"
+                ))
+                decrypt_results[user_id] = {
+                    'keys': keys,
+                    'chat_id': chat_id,
+                    'message_id': wait_msg.message_id,
+                    'timestamp': int(time.time())
+                }
+            
             try:
                 bot.edit_message_text(
                     result_text,
                     chat_id,
                     wait_msg.message_id,
-                    parse_mode="Markdown"
+                    parse_mode="Markdown",
+                    reply_markup=kb
                 )
             except:
                 bot.send_message(chat_id, result_text, parse_mode="Markdown")
@@ -2777,7 +2808,69 @@ def cmd_decrypt(message):
     t = threading.Thread(target=process_decrypt)
     t.daemon = True
     t.start()
+
+
+# ==================== ОБРАБОТЧИК КНОПКИ "ПОКАЗАТЬ ВСЕ" ====================
+@bot.callback_query_handler(func=lambda call: call.data.startswith('decrypt_show_all_'))
+def callback_decrypt_show_all(call):
+    data_parts = call.data.split('_')
+    user_id = int(data_parts[3])
+    chat_id = int(data_parts[4])
+    message_id = int(data_parts[5])
     
+    # Проверяем, что пользователь тот же
+    if call.from_user.id != user_id:
+        bot.answer_callback_query(call.id, "❌ Это не ваша расшифровка")
+        return
+    
+    # Получаем сохранённые ключи
+    cached = decrypt_results.get(user_id, {})
+    keys = cached.get('keys', [])
+    
+    if not keys:
+        bot.answer_callback_query(call.id, "❌ Ключи не найдены или истекли")
+        return
+    
+    # Формируем полный список ключей
+    keys_text = '\n'.join([f"`{k}`" for k in keys])
+    text = (
+        f"📋 *Все ключи ({len(keys)}):*\n\n"
+        f"{keys_text}"
+    )
+    
+    # Если текст слишком длинный, разбиваем на части
+    if len(text) > 4000:
+        parts = []
+        current = "📋 *Все ключи:*\n\n"
+        for k in keys:
+            line = f"`{k}`\n"
+            if len(current) + len(line) > 3900:
+                parts.append(current)
+                current = ""
+            current += line
+        if current:
+            parts.append(current)
+        
+        bot.answer_callback_query(call.id, f"✅ Показано {len(keys)} ключей")
+        for i, part in enumerate(parts):
+            if i == 0:
+                bot.send_message(chat_id, part, parse_mode="Markdown")
+            else:
+                bot.send_message(chat_id, part, parse_mode="Markdown")
+    else:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id,
+                message_id,
+                parse_mode="Markdown"
+            )
+        except:
+            bot.send_message(chat_id, text, parse_mode="Markdown")
+    
+    bot.answer_callback_query(call.id, "✅ Показаны все ключи")
+
+
 # ==================== "МОЯ ПОДПИСКА" С ЗАМОРОЗКОЙ ====================
 
 @bot.message_handler(func=lambda m: m.text == "📡 Моя подписка")
@@ -3095,7 +3188,6 @@ def auto_post_keys_to_channel():
     
     key = working[0]
     
-    # ИСПРАВЛЕНО #12 - вычисляем реальную задержку
     latency = 0
     match = re.search(r'@([\d\.]+):(\d+)', key)
     if match:
@@ -3627,14 +3719,11 @@ def _show_auto_update_menu(chat_id, message_id, user_id):
 
 # ==================== ОБРАБОТЧИКИ ГРУППОВЫХ СООБЩЕНИЙ ====================
 
-# ИСПРАВЛЕНО #3 - больше не отправляем сообщения для проверки блокировки
-# Флаг блокировки проверяется через кэш
 _user_blocked_cache = {}
 _user_blocked_cache_lock = Lock()
-USER_BLOCKED_CACHE_TTL = 3600  # 1 час
+USER_BLOCKED_CACHE_TTL = 3600
 
 def is_user_blocked_bot(user_id):
-    """Проверяет, заблокировал ли пользователь бота с кэшированием"""
     current_time = int(time.time())
     
     with _user_blocked_cache_lock:
@@ -3643,7 +3732,6 @@ def is_user_blocked_bot(user_id):
             return cached.get('blocked', False)
     
     try:
-        # Используем send_chat_action вместо send_message - меньше спама
         bot.send_chat_action(user_id, 'typing')
         blocked = False
     except Exception as e:
@@ -3687,7 +3775,6 @@ def handle_group_message(message):
         if not user or user[1] == 1:
             return
         
-        # Используем кэшированную проверку
         if is_user_blocked_bot(user_id):
             return
         
@@ -3831,7 +3918,6 @@ def cmd_top_chat(message):
                 LIMIT 10
             """)
             rows = cur.fetchall()
-            # ИСПРАВЛЕНО #7 - для лички только 2 колонки
             medals = ['🥇', '🥈', '🥉']
             text = "🏆 *Топ по баллам (все пользователи)*\n\n"
             
@@ -3911,7 +3997,7 @@ def cmd_top_chat(message):
         return_db_connection(conn)
 
 @bot.message_handler(commands=['rank'])
-        def cmd_rank(message):
+def cmd_rank(message):
     user_id = message.from_user.id
     chat_id = message.chat.id
 
@@ -6213,7 +6299,6 @@ def ping():
 def health():
     return "OK", 200
 
-# ИСПРАВЛЕНО #10 - обновляем активность при обращении к подписке
 @app.route('/sub/<token>')
 def subscription(token):
     if not token:
@@ -6230,7 +6315,6 @@ def subscription(token):
         if is_blocked:
             return "User blocked", 403
         
-        # ИСПРАВЛЕНО #10 - обновляем активность
         cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (int(time.time()), user_id))
         conn.commit()
         
