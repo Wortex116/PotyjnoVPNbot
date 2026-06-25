@@ -2480,9 +2480,10 @@ def auto_update_keys_scheduler():
             time.sleep(600)
 
 def _do_auto_update_keys():
-    if not _auto_update_event.set():
+    if _auto_update_event.is_set():
         print("[auto_update] Уже запущен, пропускаем")
         return
+    _auto_update_event.set()
     try:
         proxy_urls = get_setting('proxy_sub_urls', '')
         if not proxy_urls:
@@ -3600,9 +3601,13 @@ def auto_post_keys_to_channel():
     except Exception as e:
         print(f"[autopost] Ошибка: {e}")
 
-# ==================== ADMIN CALLBACK ====================
+# ==================== ADMIN CALLBACK (ОБЪЕДИНЁННЫЙ) ====================
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_') and not call.data.startswith('admin_keys_'))
+@bot.callback_query_handler(func=lambda call: (
+    call.data.startswith('admin_') or 
+    call.data.startswith('add_admin_') or
+    call.data == 'edit_admin_perms'
+) and not call.data.startswith('admin_keys_'))
 def admin_callback(call):
     user_id = call.from_user.id
     if not is_admin(user_id):
@@ -3610,11 +3615,7 @@ def admin_callback(call):
         return
     data = call.data
 
-    if data in ['admin_points_system', 'admin_points_chats', 'admin_points_log', 
-                'admin_points_top', 'admin_points_add_chat'] or \
-       data.startswith('admin_points_toggle_') or data.startswith('admin_points_del_'):
-        return
-
+    # ========== НАВИГАЦИЯ ==========
     if data == "admin_back":
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -3630,10 +3631,15 @@ def admin_callback(call):
         except:
             pass
         role_name = get_admin_role_name(user_id)
-        bot.send_message(user_id, f"🏛️ Админ панель\n\n👤 Ваша роль: {role_name}", reply_markup=admin_menu())
+        bot.send_message(
+            user_id,
+            f"🏛️ Админ панель\n\n👤 Ваша роль: {role_name}",
+            reply_markup=admin_menu()
+        )
         bot.answer_callback_query(call.id)
         return
 
+    # ========== РАССЫЛКА ==========
     if data == "admin_announce":
         if not has_permission(user_id, 'announce'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3646,11 +3652,17 @@ def admin_callback(call):
             types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
         )
         try:
-            bot.edit_message_text("📢 *Рассылка*\n\nВыберите куда:", call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+            bot.edit_message_text(
+                "📢 *Рассылка*\n\nВыберите куда:",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=kb
+            )
         except:
-            bot.send_message(user_id, "📢 *Рассылка*\n\nВыберите куда:", parse_mode="Markdown", reply_markup=kb)
+            bot.send_message(user_id, "📢 *Рассылка*\n\nВыберите куда:",
+                           parse_mode="Markdown", reply_markup=kb)
         return
 
+    # ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==========
     if data == "admin_manage_users":
         if not has_permission(user_id, 'manage_users'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3666,18 +3678,24 @@ def admin_callback(call):
             return_db_connection(conn)
         if not users:
             try:
-                bot.edit_message_text("📭 Нет пользователей.", call.message.chat.id, call.message.message_id)
+                bot.edit_message_text("📭 Нет пользователей.",
+                                     call.message.chat.id, call.message.message_id)
             except:
                 bot.send_message(user_id, "📭 Нет пользователей.")
             return
         manage_cache[user_id] = {'users': users, 'filter': 'all'}
         kb = build_user_list_keyboard(users, 0, 'all')
         try:
-            bot.edit_message_text(f"👥 Пользователи ({len(users)}):", call.message.chat.id, call.message.message_id, reply_markup=kb)
+            bot.edit_message_text(
+                f"👥 Пользователи ({len(users)}):",
+                call.message.chat.id, call.message.message_id,
+                reply_markup=kb
+            )
         except:
             bot.send_message(user_id, f"👥 Пользователи ({len(users)}):", reply_markup=kb)
         return
 
+    # ========== УПРАВЛЕНИЕ КЛЮЧАМИ ==========
     if data == "admin_keys":
         if not has_permission(user_id, 'manage_keys'):
             bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление ключами.")
@@ -3686,6 +3704,7 @@ def admin_callback(call):
         show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
         return
 
+    # ========== АВТОПОСТИНГ ==========
     if data == "admin_autopost":
         if not has_permission(user_id, 'autopost'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3708,11 +3727,13 @@ def admin_callback(call):
             types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
         )
         try:
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                 parse_mode="Markdown", reply_markup=kb)
         except:
             bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
         return
 
+    # ========== УПРАВЛЕНИЕ АДМИНАМИ ==========
     if data == "admin_manage_admins":
         if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
@@ -3721,127 +3742,84 @@ def admin_callback(call):
         _show_admin_list_for_call(call)
         return
 
-    if data == "admin_view_logs":
-        if not has_permission(user_id, 'view_logs'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав на просмотр логов")
-            return
-        bot.answer_callback_query(call.id)
-        _show_admin_logs(call)
-        return
-
-    # ========== АВТООБНОВЛЕНИЕ ==========
-    if data == "admin_keys_auto_update":
-        if not has_permission(user_id, 'manage_keys'):
+    if data == "edit_admin_perms":
+        if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
         bot.answer_callback_query(call.id)
-        _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT user_id, role FROM admins WHERE user_id != %s", (ADMIN_ID,))
+            admins = cur.fetchall()
+        finally:
+            cur.close()
+            return_db_connection(conn)
+        if not admins:
+            bot.send_message(user_id, "❌ Нет других админов для настройки.")
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for admin_id_item, role in admins:
+            name = get_user_display_name_cached(admin_id_item)
+            kb.add(types.InlineKeyboardButton(
+                f"{name} ({role})",
+                callback_data=f"edit_admin_{admin_id_item}"
+            ))
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_manage_admins"))
+        try:
+            bot.edit_message_text(
+                "⚙️ *Выберите админа для настройки прав:*",
+                call.message.chat.id, call.message.message_id,
+                parse_mode="Markdown", reply_markup=kb
+            )
+        except:
+            bot.send_message(user_id, "⚙️ *Выберите админа для настройки прав:*",
+                           parse_mode="Markdown", reply_markup=kb)
         return
 
-    if data == "admin_auto_update_toggle":
-        if not has_permission(user_id, 'manage_keys'):
+    if data.startswith("add_admin_role_"):
+        if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
-        current = get_setting('auto_update_enabled', 'false') == 'true'
-        new_val = 'false' if current else 'true'
-        set_setting('auto_update_enabled', new_val)
-        log_admin_action(user_id, f"Автообновление {'включено' if new_val == 'true' else 'выключено'}")
-        bot.answer_callback_query(call.id, "✅ ВКЛ" if new_val == 'true' else "❌ ВЫКЛ")
-        _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+        if user_id in search_cache:
+            del search_cache[user_id]
+        role = data.split('_')[3]
+        search_cache[user_id] = {
+            'action': 'add_admin',
+            'role': role,
+            'timestamp': int(time.time())
+        }
+        bot.answer_callback_query(call.id, f"✅ Выбрана роль: {ROLE_PRESETS[role]['name']}")
+        bot.send_message(
+            user_id,
+            f"👑 Выбрана роль: {ROLE_PRESETS[role]['name']}\n\n"
+            "Отправьте ID или @username пользователя.",
+            parse_mode="Markdown"
+        )
         return
 
-    if data == "admin_auto_update_notify":
-        if not has_permission(user_id, 'manage_keys'):
+    if data == "add_admin_start":
+        if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
-        current = get_setting('auto_update_notify', 'true') == 'true'
-        new_val = 'false' if current else 'true'
-        set_setting('auto_update_notify', new_val)
-        log_admin_action(user_id, f"Уведомления автообновления {'включены' if new_val == 'true' else 'выключены'}")
-        bot.answer_callback_query(call.id, "🔔 ВКЛ" if new_val == 'true' else "🔕 ВЫКЛ")
-        _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+        bot.answer_callback_query(call.id)
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("⭐ Старший админ", callback_data="add_admin_role_senior"),
+            types.InlineKeyboardButton("🔹 Младший админ", callback_data="add_admin_role_junior"),
+            types.InlineKeyboardButton("🟢 Поддержка", callback_data="add_admin_role_support")
+        )
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_manage_admins"))
+        bot.send_message(
+            user_id,
+            "👑 *Добавление админа*\n\n"
+            "Выберите роль для нового админа, затем отправьте ID или @username пользователя.",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
         return
 
-    if data == "admin_auto_update_now":
-        if not has_permission(user_id, 'manage_keys'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав")
-            return
-        proxy_urls = get_setting('proxy_sub_urls', '')
-        proxy_url = get_setting('proxy_sub_url', '')
-        if not proxy_urls and not proxy_url:
-            bot.answer_callback_query(call.id, "❌ Нет прокси ссылок")
-            return
-        bot.answer_callback_query(call.id, "⏳ Запускаю обновление...")
-        log_admin_action(user_id, "Запущено ручное автообновление ключей")
-        
-        def run():
-            _do_auto_update_keys()
-            try:
-                _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
-            except:
-                pass
-        
-        t = threading.Thread(target=run)
-        t.daemon = True
-        t.start()
-        return
-
-# ==================== ПРОСМОТР ЛОГОВ АДМИНОВ ====================
-
-def _show_admin_logs(call):
-    user_id = call.from_user.id
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT admin_name, action, target_name, details, created_at
-            FROM admin_logs
-            ORDER BY created_at DESC
-            LIMIT 20
-        """)
-        logs = cur.fetchall()
-    finally:
-        cur.close()
-        return_db_connection(conn)
-    
-    if not logs:
-        text = "📋 *Логи админов*\n\nПусто"
-    else:
-        text = "📋 *Последние 20 действий:*\n\n"
-        for admin_name, action, target_name, details, created_at in logs:
-            time_str = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
-            target = f" → {target_name}" if target_name else ""
-            text += f"🕐 {time_str} | *{admin_name}* {action}{target}\n"
-            if details:
-                text += f"  📎 {details}\n"
-            text += "\n"
-    
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_logs"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
-    )
-    
-    try:
-        if len(text) > 4000:
-            text = text[:3950] + "\n…"
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
-    except:
-        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
-
-# ==================== НОВЫЙ ОБРАБОТЧИК ДЛЯ СИСТЕМЫ БАЛЛОВ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data in [
-    'admin_points_system', 'admin_points_chats', 'admin_points_log',
-    'admin_points_top', 'admin_points_add_chat'
-] or call.data.startswith('admin_points_toggle_') or call.data.startswith('admin_points_del_'))
-def admin_points_callback(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    data = call.data
-
+    # ========== СИСТЕМА БАЛЛОВ ==========
     if data == "admin_points_system":
         if not has_permission(user_id, 'points_system'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3893,9 +3871,8 @@ def admin_points_callback(call):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
         try:
-            parts = data.split('_')
-            chat_id = int('_'.join(parts[3:]))
-        except (IndexError, ValueError):
+            chat_id_pts = int(data.replace("admin_points_toggle_", ""))
+        except ValueError:
             bot.answer_callback_query(call.id, "❌ Ошибка формата")
             return
         conn = get_db_connection()
@@ -3903,11 +3880,14 @@ def admin_points_callback(call):
         try:
             cur.execute(
                 "UPDATE points_chats SET enabled = NOT enabled WHERE chat_id = %s RETURNING enabled",
-                (chat_id,)
+                (chat_id_pts,)
             )
             new_state = cur.fetchone()[0]
             conn.commit()
-            log_admin_action(user_id, f"Переключил чат {chat_id} на {'вкл' if new_state else 'выкл'}")
+            log_admin_action(
+                user_id,
+                f"Переключил чат {chat_id_pts} на {'вкл' if new_state else 'выкл'}"
+            )
         finally:
             cur.close()
             return_db_connection(conn)
@@ -3920,23 +3900,139 @@ def admin_points_callback(call):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
         try:
-            parts = data.split('_')
-            chat_id = int('_'.join(parts[3:]))
-        except (IndexError, ValueError):
+            chat_id_pts = int(data.replace("admin_points_del_", ""))
+        except ValueError:
             bot.answer_callback_query(call.id, "❌ Ошибка формата")
             return
         conn = get_db_connection()
         cur = conn.cursor()
         try:
-            cur.execute("DELETE FROM points_chats WHERE chat_id = %s", (chat_id,))
+            cur.execute("DELETE FROM points_chats WHERE chat_id = %s", (chat_id_pts,))
             conn.commit()
-            log_admin_action(user_id, f"Удалил чат {chat_id} из системы баллов")
+            log_admin_action(user_id, f"Удалил чат {chat_id_pts} из системы баллов")
         finally:
             cur.close()
             return_db_connection(conn)
         bot.answer_callback_query(call.id, "🗑 Удалено")
         _show_admin_points_chats(call)
         return
+
+    # ========== АВТООБНОВЛЕНИЕ КЛЮЧЕЙ ==========
+    if data == "admin_keys_auto_update":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+        return
+
+    if data == "admin_auto_update_toggle":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        current = get_setting('auto_update_enabled', 'false') == 'true'
+        new_val = 'false' if current else 'true'
+        set_setting('auto_update_enabled', new_val)
+        log_admin_action(
+            user_id,
+            f"Автообновление {'включено' if new_val == 'true' else 'выключено'}"
+        )
+        bot.answer_callback_query(call.id, "✅ ВКЛ" if new_val == 'true' else "❌ ВЫКЛ")
+        _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+        return
+
+    if data == "admin_auto_update_notify":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        current = get_setting('auto_update_notify', 'true') == 'true'
+        new_val = 'false' if current else 'true'
+        set_setting('auto_update_notify', new_val)
+        log_admin_action(
+            user_id,
+            f"Уведомления автообновления {'включены' if new_val == 'true' else 'выключены'}"
+        )
+        bot.answer_callback_query(call.id, "🔔 ВКЛ" if new_val == 'true' else "🔕 ВЫКЛ")
+        _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+        return
+
+    if data == "admin_auto_update_now":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        proxy_urls = get_setting('proxy_sub_urls', '')
+        proxy_url = get_setting('proxy_sub_url', '')
+        if not proxy_urls and not proxy_url:
+            bot.answer_callback_query(call.id, "❌ Нет прокси ссылок")
+            return
+        bot.answer_callback_query(call.id, "⏳ Запускаю обновление...")
+        log_admin_action(user_id, "Запущено ручное автообновление ключей")
+
+        def run():
+            _do_auto_update_keys()
+            try:
+                _show_auto_update_menu(call.message.chat.id, call.message.message_id, user_id)
+            except:
+                pass
+
+        t = threading.Thread(target=run)
+        t.daemon = True
+        t.start()
+        return
+
+    # ========== ЛОГИ ==========
+    if data == "admin_view_logs":
+        if not has_permission(user_id, 'view_logs'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав на просмотр логов")
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_logs(call)
+        return
+
+    bot.answer_callback_query(call.id)
+
+# ==================== ПРОСМОТР ЛОГОВ АДМИНОВ ====================
+
+def _show_admin_logs(call):
+    user_id = call.from_user.id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT admin_name, action, target_name, details, created_at
+            FROM admin_logs
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        logs = cur.fetchall()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+    
+    if not logs:
+        text = "📋 *Логи админов*\n\nПусто"
+    else:
+        text = "📋 *Последние 20 действий:*\n\n"
+        for admin_name, action, target_name, details, created_at in logs:
+            time_str = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M")
+            target = f" → {target_name}" if target_name else ""
+            text += f"🕐 {time_str} | *{admin_name}* {action}{target}\n"
+            if details:
+                text += f"  📎 {details}\n"
+            text += "\n"
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="admin_view_logs"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
+    )
+    
+    try:
+        if len(text) > 4000:
+            text = text[:3950] + "\n…"
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
 
 # ==================== СИСТЕМА БАЛЛОВ - АДМИНКА ====================
 
@@ -4172,6 +4268,10 @@ def is_user_blocked_bot(user_id):
 
 @bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'])
 def handle_group_message(message):
+    # Игнорируем команды — их обрабатывают отдельные хэндлеры
+    if message.text and message.text.startswith('/'):
+        return
+    
     user_id = message.from_user.id
     chat_id = message.chat.id
     current_time = int(time.time())
@@ -4530,26 +4630,40 @@ def parse_duration(text):
     return value * multipliers[unit]
 
 def is_chat_admin(user_id, chat_id):
+    # Владелец бота и его админы с доступом к панели — имеют доступ везде
     if user_id == ADMIN_ID:
         return True
+    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
+        return True
+    # Владелец или администратор чата в Telegram
     try:
         member = bot.get_chat_member(chat_id, user_id)
         if member.status in ['administrator', 'creator']:
             return True
     except:
         pass
+    # Назначен через /chatadmin
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT user_id FROM chat_admins WHERE user_id = %s AND chat_id = %s", (user_id, chat_id))
+        cur.execute(
+            "SELECT user_id FROM chat_admins WHERE user_id = %s AND chat_id = %s",
+            (user_id, chat_id)
+        )
         return cur.fetchone() is not None
     finally:
         cur.close()
         return_db_connection(conn)
 
+
 def is_chat_owner(user_id, chat_id):
+    # Владелец бота — владелец всего
     if user_id == ADMIN_ID:
         return True
+    # Админ бота с доступом к панели
+    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
+        return True
+    # Реальный владелец чата в Telegram
     try:
         member = bot.get_chat_member(chat_id, user_id)
         return member.status == 'creator'
@@ -5030,13 +5144,19 @@ def cmd_modhelp(message):
         "`/ban @user 7d причина` — забанить\n"
         "`/unban @user` — разбанить\n"
         "_Время: `1h`, `7d`, `permanent`_\n\n"
+        "*Чат-администраторы (только владелец чата):*\n"
+        "`/chatadmin @user` — назначить чат-админа\n"
+        "`/chatdeadmin @user` — снять чат-админа\n"
+        "`/chatadmins` — список чат-админов\n\n"
+        "ℹ️ Владелец чата определяется автоматически при добавлении бота.\n"
+        "👑 Владелец и админы бота имеют доступ ко всем командам во всех чатах.\n\n"
         "*Приветствие:*\n"
         "`/welcome` — посмотреть текущее\n"
         "`/setwelcome текст` — задать приветствие\n"
         "`/welcomeoff` — отключить\n"
         "`/welcomeon` — включить\n"
         "_Переменные: `{name}`, `{chat}`, `{id}`_\n\n"
-        "*Топ:*\n"
+        "*Топ и баллы:*\n"
         "`/top` — топ активных участников\n"
         "`/rank` — ваш ранг и баллы\n"
         "`/bonus` — ежедневный бонус\n\n"
@@ -5044,6 +5164,166 @@ def cmd_modhelp(message):
         "👑 Владелец бота защищён от всех санкций"
     )
     bot.reply_to(message, text, parse_mode="Markdown")
+
+# ==================== НОВЫЕ КОМАНДЫ ДЛЯ ЧАТ-АДМИНОВ ====================
+
+@bot.message_handler(commands=['chatadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_chatadmin(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_owner(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для владельца чата.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(
+            message,
+            "❌ Укажите пользователя: `/chatadmin @user` или ответьте на сообщение",
+            parse_mode="Markdown"
+        )
+        return
+
+    if target_id == user_id:
+        bot.reply_to(message, "❌ Нельзя назначить самого себя.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_admins (user_id, chat_id, role, added_by, added_at)
+            VALUES (%s, %s, 'admin', %s, %s)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET role = 'admin', added_by = %s
+        """, (target_id, chat_id, user_id, int(time.time()), user_id))
+        conn.commit()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"✅ *{name}* назначен чат-администратором.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['chatdeadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_chatdeadmin(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_owner(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для владельца чата.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Укажите пользователя.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Не даём снять роль 'owner'
+        cur.execute(
+            "SELECT role FROM chat_admins WHERE user_id = %s AND chat_id = %s",
+            (target_id, chat_id)
+        )
+        row = cur.fetchone()
+        if row and row[0] == 'owner':
+            bot.reply_to(message, "⛔️ Нельзя снять владельца чата.")
+            return
+
+        cur.execute(
+            "DELETE FROM chat_admins WHERE user_id = %s AND chat_id = %s",
+            (target_id, chat_id)
+        )
+        conn.commit()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"✅ У *{name}* сняты права чат-администратора.", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['chatadmins'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_chatadmins(message):
+    chat_id = message.chat.id
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, role FROM chat_admins WHERE chat_id = %s ORDER BY role DESC",
+            (chat_id,)
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
+    if not rows:
+        bot.reply_to(message, "📭 Чат-администраторов нет.")
+        return
+
+    text = "👑 *Администраторы чата (в боте):*\n\n"
+    for uid, role in rows:
+        name = get_user_display_name_cached(uid)
+        icon = "👑" if role == 'owner' else "🔹"
+        text += f"{icon} {name} (`{uid}`) — {role}\n"
+
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+# ==================== ОБРАБОТЧИК ВХОДА БОТА В ЧАТ ====================
+
+@bot.my_chat_member_handler()
+def handle_bot_added_to_chat(update):
+    """Срабатывает когда бот добавляется в чат или его статус меняется"""
+    chat = update.chat
+    new_status = update.new_chat_member.status
+
+    # Бот добавлен в группу
+    if new_status in ('member', 'administrator') and chat.type in ('group', 'supergroup'):
+        chat_id = chat.id
+        _register_chat_owner(chat_id)
+
+
+def _register_chat_owner(chat_id):
+    """Находит владельца чата и регистрирует его в chat_admins"""
+    try:
+        admins = bot.get_chat_administrators(chat_id)
+        for member in admins:
+            if member.status == 'creator':
+                owner_id = member.user.id
+                conn = get_db_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        INSERT INTO chat_admins (user_id, chat_id, role, added_by, added_at)
+                        VALUES (%s, %s, 'owner', %s, %s)
+                        ON CONFLICT (user_id, chat_id) DO UPDATE SET role = 'owner'
+                    """, (owner_id, chat_id, owner_id, int(time.time())))
+                    conn.commit()
+                    print(f"[chat_owner] Зарегистрирован владелец {owner_id} для чата {chat_id}")
+                    
+                    try:
+                        chat_info = bot.get_chat(chat_id)
+                        bot.send_message(
+                            owner_id,
+                            f"👋 Привет! Я добавлен в чат *{chat_info.title or 'чат'}*.\n\n"
+                            f"Ты автоматически назначен владельцем чата в боте.\n"
+                            f"Теперь ты можешь назначать чат-админов через `/chatadmin`.\n\n"
+                            f"📋 Список команд: `/modhelp`",
+                            parse_mode="Markdown"
+                        )
+                    except:
+                        pass
+                finally:
+                    cur.close()
+                    return_db_connection(conn)
+                break
+    except Exception as e:
+        print(f"[chat_owner] Ошибка регистрации владельца чата {chat_id}: {e}")
 
 # ==================== ОБРАБОТЧИК edit_admin_ ====================
 
@@ -5129,7 +5409,108 @@ def callback_user_msg_history(call):
         bot.send_message(call.from_user.id, text, parse_mode="Markdown", reply_markup=kb)
     bot.answer_callback_query(call.id)
 
-# ==================== ОБРАБОТЧИК callback_user_detail ====================
+# ==================== ОБРАБОТЧИК callback_user_detail (С КНОПКАМИ БАЛЛОВ) ====================
+
+def _refresh_user_card(call, target_id, admin_id):
+    """Обновляет карточку пользователя после изменения"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT subscription_end, is_blocked, points FROM users WHERE user_id = %s", (target_id,))
+            row = cur.fetchone()
+        finally:
+            cur.close()
+            return_db_connection(conn)
+
+        if not row:
+            return
+
+        subscription_end, blk, pts_val = row
+        pts_val = pts_val or 0
+        current_time = int(time.time())
+        
+        if blk:
+            status = "🚫 Заблокирован"
+        elif subscription_end and subscription_end > current_time:
+            days_left = (subscription_end - current_time) // 86400
+            status = f"🟢 Активен ({days_left} дн)"
+        else:
+            status = "🔴 Неактивен"
+
+        is_admin_user = is_admin(target_id)
+        admin_text = "✅ Да" if is_admin_user else "❌ Нет"
+        name = get_user_display_name_cached(target_id)
+        rank_info = get_rank(pts_val)
+        
+        try:
+            chat = bot.get_chat(target_id)
+            username = f"@{chat.username}" if chat.username else "❌ Нет юзернейма"
+        except:
+            username = "❌ Не найден"
+
+        text = f"""👤 *{name}*
+
+🆔 ID: `{target_id}`
+👤 Юзернейм: {username}
+📊 Статус: {status}
+👑 Админ: {admin_text}
+🪙 Баллов: `{pts_val:,}` — {rank_info['name']}"""
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        if has_permission(admin_id, 'add_days'):
+            kb.add(types.InlineKeyboardButton("✅ Выдать подписку", callback_data=f"give_sub_{target_id}"))
+        if has_permission(admin_id, 'add_days'):
+            kb.add(types.InlineKeyboardButton("📅 +30 дн", callback_data=f"prolong_{target_id}_30"))
+        if has_permission(admin_id, 'remove_days'):
+            kb.add(types.InlineKeyboardButton("📅 -30 дн", callback_data=f"remove_days_{target_id}_30"))
+        if has_permission(admin_id, 'add_days') or has_permission(admin_id, 'remove_days'):
+            kb.add(types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{target_id}"))
+        if has_permission(admin_id, 'block_user'):
+            if blk:
+                kb.add(types.InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock_{target_id}"))
+            else:
+                kb.add(types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{target_id}"))
+        if has_permission(admin_id, 'manage_admins'):
+            if is_admin_user and target_id != ADMIN_ID:
+                kb.add(types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{target_id}"))
+            elif not is_admin_user:
+                kb.add(types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"grant_admin_{target_id}"))
+        
+        # --- БАЛЛЫ ---
+        if has_permission(admin_id, 'points_system'):
+            kb.row(
+                types.InlineKeyboardButton(f"🪙 +100", callback_data=f"pts_add_{target_id}_100"),
+                types.InlineKeyboardButton(f"🪙 +500", callback_data=f"pts_add_{target_id}_500"),
+                types.InlineKeyboardButton(f"🪙 +1000", callback_data=f"pts_add_{target_id}_1000"),
+            )
+            kb.row(
+                types.InlineKeyboardButton(f"➖ -100", callback_data=f"pts_sub_{target_id}_100"),
+                types.InlineKeyboardButton(f"➖ -500", callback_data=f"pts_sub_{target_id}_500"),
+                types.InlineKeyboardButton(f"🗑 Обнулить", callback_data=f"pts_zero_{target_id}"),
+            )
+            kb.add(
+                types.InlineKeyboardButton(
+                    f"✏️ Установить баллы (сейчас: {pts_val:,})",
+                    callback_data=f"pts_set_{target_id}"
+                )
+            )
+        
+        kb.add(types.InlineKeyboardButton("💬 История сообщений", callback_data=f"user_msg_history_{target_id}"))
+        kb.row(
+            types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
+            types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
+        )
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    except Exception as e:
+        print(f"[refresh_card] Ошибка обновления карточки: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('user_') and len(call.data.split('_')) == 2)
 def callback_user_detail(call):
@@ -5141,85 +5522,181 @@ def callback_user_detail(call):
     if not has_permission(user_id, 'manage_users'):
         bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление пользователями.")
         return
+    
+    _refresh_user_card(call, target_id, user_id)
+    bot.answer_callback_query(call.id)
+
+# ==================== КНОПКИ УПРАВЛЕНИЯ БАЛЛАМИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('pts_add_', 'pts_sub_', 'pts_zero_', 'pts_set_', 'pts_set_confirm_')))
+def callback_points_manage(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id) or not has_permission(user_id, 'points_system'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    data = call.data
+
+    # Установить вручную — ждём ввода
+    if data.startswith('pts_set_') and not data.startswith('pts_set_confirm_'):
+        target_id = int(data.split('_')[2])
+        search_cache[user_id] = {
+            'action': 'set_points',
+            'target_id': target_id,
+            'timestamp': int(time.time())
+        }
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            user_id,
+            f"✏️ Введите новое количество баллов для пользователя:\n\n"
+            f"Например: `1000`\n\n"
+            f"Или /cancel для отмены.",
+            parse_mode="Markdown"
+        )
+        return
+
+    parts = data.split('_')
+
+    if data.startswith('pts_zero_'):
+        target_id = int(parts[2])
+        amount = None
+        action = 'zero'
+    elif data.startswith('pts_add_'):
+        target_id = int(parts[2])
+        amount = int(parts[3])
+        action = 'add'
+    elif data.startswith('pts_sub_'):
+        target_id = int(parts[2])
+        amount = int(parts[3])
+        action = 'sub'
+    else:
+        bot.answer_callback_query(call.id)
+        return
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT subscription_end, is_blocked FROM users WHERE user_id = %s", (target_id,))
+        cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
         result = cur.fetchone()
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден")
+            return
+
+        old_points = result[0] or 0
+
+        if action == 'zero':
+            new_points = 0
+            detail = f"Обнулил баллы (было {old_points})"
+        elif action == 'add':
+            new_points = old_points + amount
+            detail = f"+{amount} баллов ({old_points} → {new_points})"
+        else:  # sub
+            new_points = max(0, old_points - amount)
+            detail = f"-{amount} баллов ({old_points} → {new_points})"
+
+        cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
+        conn.commit()
     finally:
         cur.close()
         return_db_connection(conn)
-    if not result:
-        bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
-        return
-    subscription_end, blk = result
-    current_time = int(time.time())
-    if blk:
-        status = "🚫 Заблокирован"
-    elif subscription_end and subscription_end > current_time:
-        days_left = (subscription_end - current_time) // (24 * 60 * 60)
-        hours_left = ((subscription_end - current_time) // 3600) % 24
-        status = f"🟢 Активен ({days_left} дн {hours_left} ч)"
-    else:
-        status = "🔴 Неактивен"
-    is_admin_user = is_admin(target_id)
-    admin_text = "✅ Да" if is_admin_user else "❌ Нет"
-    name = get_user_display_name_cached(target_id)
-    username = ""
-    try:
-        chat = bot.get_chat(target_id)
-        if chat.username:
-            username = f"@{chat.username}"
-        else:
-            username = "❌ Нет юзернейма"
-    except:
-        username = "❌ Не найден"
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    if has_permission(user_id, 'add_days'):
-        kb.add(types.InlineKeyboardButton("✅ Выдать подписку", callback_data=f"give_sub_{target_id}"))
-    if has_permission(user_id, 'add_days'):
-        kb.add(types.InlineKeyboardButton("📅 +30 дн", callback_data=f"prolong_{target_id}_30"))
-    if has_permission(user_id, 'remove_days'):
-        kb.add(types.InlineKeyboardButton("📅 -30 дн", callback_data=f"remove_days_{target_id}_30"))
-    if has_permission(user_id, 'add_days') or has_permission(user_id, 'remove_days'):
-        kb.add(types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{target_id}"))
-    if has_permission(user_id, 'block_user'):
-        if blk:
-            kb.add(types.InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock_{target_id}"))
-        else:
-            kb.add(types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{target_id}"))
-    if has_permission(user_id, 'manage_admins'):
-        if is_admin_user and target_id != ADMIN_ID:
-            kb.add(types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{target_id}"))
-        elif not is_admin_user:
-            kb.add(types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"grant_admin_{target_id}"))
-    kb.add(types.InlineKeyboardButton("💬 История сообщений", callback_data=f"user_msg_history_{target_id}"))
-    kb.row(
-        types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
-        types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
-    )
-    text = f"""👤 *{name}*
 
-🆔 ID: `{target_id}`
-👤 Юзернейм: {username}
-📊 Статус: {status}
-👑 Админ: {admin_text}"""
-    bot.answer_callback_query(call.id)
+    log_admin_action(user_id, f"Изменил баллы {target_id}", target_id=target_id, details=detail)
+    bot.answer_callback_query(call.id, f"✅ {detail}")
+
+    # Уведомляем пользователя
     try:
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=kb
+        bot.send_message(
+            target_id,
+            f"🪙 Администратор изменил ваши баллы.\n\n"
+            f"📊 Было: {old_points:,}\n"
+            f"📊 Стало: {new_points:,}\n"
+            f"{get_rank(new_points)['name']}"
         )
     except:
-        bot.send_message(
-            call.message.chat.id,
-            text,
-            parse_mode="Markdown",
-            reply_markup=kb
+        pass
+
+    # Обновляем карточку
+    _refresh_user_card(call, target_id, user_id)
+
+# ==================== GRANT/REMOVE ADMIN С ОБНОВЛЕНИЕМ КАРТОЧКИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('grant_admin_'))
+def callback_grant_admin(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
+        return
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Это владелец бота.")
+        return
+    if is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Пользователь уже является админом.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
+        user_exists = cur.fetchone()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+    if not user_exists:
+        bot.answer_callback_query(call.id, "❌ Пользователь не зарегистрирован в боте.")
+        return
+    role = 'junior'
+    perms = ROLE_PRESETS[role]['permissions'].copy()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
+            (target_id, role, json.dumps(perms), user_id, int(time.time()))
         )
+        conn.commit()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Назначил админом {target_id}", target_id=target_id, details=f"Роль: {role}")
+    bot.answer_callback_query(call.id, f"✅ {get_user_display_name_cached(target_id)} назначен админом!")
+    try:
+        bot.send_message(target_id, "👑 Вам назначена роль администратора!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
+    except:
+        pass
+
+    # Обновляем карточку
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
+def callback_remove_admin(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
+        return
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя удалить владельца.")
+        return
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Пользователь не является админом.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
+        conn.commit()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Удалил админа {target_id}", target_id=target_id)
+    bot.answer_callback_query(call.id, "✅ Админ удален!")
+    try:
+        bot.send_message(target_id, "❌ Ваши права администратора были отозваны.")
+    except:
+        pass
+    
+    # Обновляем карточку
+    _refresh_user_card(call, target_id, user_id)
 
 # ==================== ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ====================
 
@@ -6107,312 +6584,6 @@ def callback_admin_keys_proxy_finish(call):
     t.daemon = True
     t.start()
 
-# ==================== НАСТРОЙКА ПРАВ АДМИНОВ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data == "edit_admin_perms")
-def callback_edit_admin_perms(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id, role FROM admins WHERE user_id != %s", (ADMIN_ID,))
-        admins = cur.fetchall()
-    finally:
-        cur.close()
-        return_db_connection(conn)
-    if not admins:
-        bot.send_message(user_id, "❌ Нет других админов для настройки.")
-        return
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for admin_id, role in admins:
-        name = get_user_display_name_cached(admin_id)
-        kb.add(types.InlineKeyboardButton(f"{name} ({role})", callback_data=f"edit_admin_{admin_id}"))
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_manage_admins"))
-    try:
-        bot.edit_message_text(
-            "⚙️ *Выберите админа для настройки прав:*",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    except:
-        bot.send_message(
-            user_id,
-            "⚙️ *Выберите админа для настройки прав:*",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_perm_'))
-def callback_toggle_perm(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    parts = call.data.split('_')
-    target_id = int(parts[2])
-    perm_key = '_'.join(parts[3:])
-    
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя менять права владельца.")
-        return
-    if not is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Админ не найден.")
-        return
-    
-    current_perms = get_admin_permissions(target_id)
-    current_perms[perm_key] = not current_perms.get(perm_key, False)
-    update_admin_permissions(target_id, current_perms)
-    
-    perm_name = PERMISSIONS.get(perm_key, perm_key)
-    log_admin_action(user_id, f"Изменил право {perm_name} для {target_id}", 
-                     target_id=target_id,
-                     details=f"{perm_name}: {'вкл' if current_perms[perm_key] else 'выкл'}")
-    bot.answer_callback_query(call.id, f"✅ {'Включено' if current_perms[perm_key] else 'Отключено'} для {perm_name}")
-    _redraw_admin_perms(call, target_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('reset_perm_'))
-def callback_reset_perm(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    target_id = int(call.data.split('_')[2])
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя сбросить права владельца.")
-        return
-    if not is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Админ не найден.")
-        return
-    
-    role = get_admin_role(target_id) or 'junior'
-    new_perms = ROLE_PRESETS[role]['permissions'].copy()
-    update_admin_permissions(target_id, new_perms)
-    log_admin_action(user_id, f"Сбросил права {target_id} к роли {role}", target_id=target_id)
-    bot.answer_callback_query(call.id, "✅ Права сброшены к настройкам роли!")
-    _redraw_admin_perms(call, target_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "add_admin_start")
-def callback_add_admin_start(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id)
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("⭐ Старший админ", callback_data="add_admin_role_senior"),
-        types.InlineKeyboardButton("🔹 Младший админ", callback_data="add_admin_role_junior"),
-        types.InlineKeyboardButton("🟢 Поддержка", callback_data="add_admin_role_support")
-    )
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_manage_admins"))
-    bot.send_message(
-        user_id,
-        "👑 *Добавление админа*\n\n"
-        "Выберите роль для нового админа, затем отправьте ID или @username пользователя.",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('add_admin_role_'))
-def callback_add_admin_role(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    if user_id in search_cache:
-        del search_cache[user_id]
-    role = call.data.split('_')[3]
-    search_cache[user_id] = {'action': 'add_admin', 'role': role, 'timestamp': int(time.time())}
-    bot.answer_callback_query(call.id, f"✅ Выбрана роль: {ROLE_PRESETS[role]['name']}")
-    bot.send_message(
-        user_id,
-        f"👑 Выбрана роль: {ROLE_PRESETS[role]['name']}\n\n"
-        "Отправьте ID или @username пользователя.",
-        parse_mode="Markdown"
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('grant_admin_'))
-def callback_grant_admin(call):
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[2])
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
-        return
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Это владелец бота.")
-        return
-    if is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Пользователь уже является админом.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
-        user_exists = cur.fetchone()
-    finally:
-        cur.close()
-        return_db_connection(conn)
-    if not user_exists:
-        bot.answer_callback_query(call.id, "❌ Пользователь не зарегистрирован в боте.")
-        return
-    role = 'junior'
-    perms = ROLE_PRESETS[role]['permissions'].copy()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
-            (target_id, role, json.dumps(perms), user_id, int(time.time()))
-        )
-        conn.commit()
-    finally:
-        cur.close()
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Назначил админом {target_id}", target_id=target_id, details=f"Роль: {role}")
-    bot.answer_callback_query(call.id, f"✅ {get_user_display_name_cached(target_id)} назначен админом!")
-    try:
-        bot.send_message(target_id, "👑 Вам назначена роль администратора!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
-    except:
-        pass
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
-def callback_remove_admin(call):
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[2])
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
-        return
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя удалить владельца.")
-        return
-    if not is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Пользователь не является админом.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
-        conn.commit()
-    finally:
-        cur.close()
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Удалил админа {target_id}", target_id=target_id)
-    bot.answer_callback_query(call.id, "✅ Админ удален!")
-    try:
-        bot.send_message(target_id, "❌ Ваши права администратора были отозваны.")
-    except:
-        pass
-    try:
-        _show_admin_list_for_call(call)
-    except Exception as e:
-        print(f"[remove_admin] Ошибка обновления: {e}")
-
-# ==================== ОБРАБОТЧИКИ ФИЛЬТРОВ ПОЛЬЗОВАТЕЛЕЙ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_') or call.data.startswith('page_') or call.data in ['close_manage', 'back_to_list'])
-def callback_manage_filters(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Нет доступа.")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_users'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление пользователями.")
-        return
-    admin_id = call.from_user.id
-    current_time = int(time.time())
-    data = call.data
-
-    if data == 'close_manage':
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        bot.answer_callback_query(call.id)
-        return
-
-    if data == 'back_to_list':
-        cached = manage_cache.get(admin_id, {})
-        users = cached.get('users', [])
-        filter_type = cached.get('filter', 'all')
-        if not users:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            try:
-                cur.execute("SELECT user_id FROM users ORDER BY user_id")
-                users = [row[0] for row in cur.fetchall()]
-            finally:
-                cur.close()
-                return_db_connection(conn)
-        kb = build_user_list_keyboard(users, 0, filter_type)
-        bot.answer_callback_query(call.id)
-        try:
-            bot.edit_message_text(
-                f"👥 Пользователи ({len(users)}):",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=kb
-            )
-        except:
-            pass
-        return
-
-    if data.startswith('page_'):
-        parts = data.split('_')
-        page = int(parts[1])
-        filter_type = parts[2] if len(parts) > 2 else 'all'
-        cached = manage_cache.get(admin_id, {})
-        users = cached.get('users', [])
-        kb = build_user_list_keyboard(users, page, filter_type)
-        bot.answer_callback_query(call.id)
-        try:
-            bot.edit_message_text(
-                f"👥 Пользователи ({len(users)}):",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=kb
-            )
-        except:
-            pass
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        if data == 'filter_active':
-            cur.execute("SELECT user_id FROM users WHERE is_blocked = 0 AND subscription_end > %s ORDER BY user_id", (current_time,))
-            filter_type = 'active'
-        elif data == 'filter_inactive':
-            cur.execute("SELECT user_id FROM users WHERE is_blocked = 0 AND subscription_end < %s ORDER BY user_id", (current_time,))
-            filter_type = 'inactive'
-        elif data == 'filter_admins':
-            cur.execute("SELECT user_id FROM admins ORDER BY user_id")
-            filter_type = 'admins'
-        else:
-            cur.execute("SELECT user_id FROM users ORDER BY user_id")
-            filter_type = 'all'
-        users = [row[0] for row in cur.fetchall()]
-    finally:
-        cur.close()
-        return_db_connection(conn)
-    manage_cache[admin_id] = {'users': users, 'filter': filter_type}
-    kb = build_user_list_keyboard(users, 0, filter_type)
-    bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text(
-            f"👥 Пользователи ({len(users)}):",
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=kb
-        )
-    except:
-        pass
-
 # ==================== УПРАВЛЕНИЕ ПОДПИСКОЙ ====================
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('give_sub_'))
@@ -6446,6 +6617,8 @@ def callback_give_sub(call):
         bot.send_message(target_id, f"🎉 Администратор выдал вам подписку на 30 дней!")
     except:
         pass
+    
+    _refresh_user_card(call, target_id, user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
 def callback_prolong(call):
@@ -6481,6 +6654,8 @@ def callback_prolong(call):
         bot.send_message(target_id, f"🎉 Ваша подписка продлена на {days} дней администратором!")
     except:
         pass
+    
+    _refresh_user_card(call, target_id, user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_days_'))
 def callback_remove_days(call):
@@ -6518,6 +6693,8 @@ def callback_remove_days(call):
         bot.send_message(target_id, f"⚠️ Администратор забрал {days} дней подписки!")
     except:
         pass
+    
+    _refresh_user_card(call, target_id, user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
 def callback_remove_sub(call):
@@ -6544,6 +6721,8 @@ def callback_remove_sub(call):
         bot.send_message(target_id, "❌ Ваша подписка была удалена администратором.")
     except:
         pass
+    
+    _refresh_user_card(call, target_id, user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('block_'))
 def callback_block(call):
@@ -6572,6 +6751,8 @@ def callback_block(call):
         bot.send_message(target_id, f"🚫 Вы заблокированы администратором.\n\nОбратитесь в поддержку: {SUPPORT}")
     except:
         pass
+    
+    _refresh_user_card(call, target_id, user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
 def callback_unblock(call):
@@ -6597,6 +6778,8 @@ def callback_unblock(call):
         bot.send_message(target_id, "✅ Вы разблокированы! Теперь вы можете пользоваться ботом.")
     except:
         pass
+    
+    _refresh_user_card(call, target_id, user_id)
 
 # ==================== РАССЫЛКА ====================
 
@@ -6938,13 +7121,70 @@ def handle_private_messages(message):
             except:
                 bot.reply_to(message, "❌ Неверный ID чата")
             return
+        elif action == 'set_points':
+            target_id = search_cache[user_id].get('target_id')
+            if not target_id:
+                del search_cache[user_id]
+                return
+            try:
+                new_points = int(message.text.strip())
+                if new_points < 0:
+                    raise ValueError
+            except ValueError:
+                bot.reply_to(message, "❌ Введите целое неотрицательное число.")
+                return
+
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
+                result = cur.fetchone()
+                if not result:
+                    bot.reply_to(message, "❌ Пользователь не найден.")
+                    del search_cache[user_id]
+                    return
+                old_points = result[0] or 0
+                cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
+                conn.commit()
+            finally:
+                cur.close()
+                return_db_connection(conn)
+
+            del search_cache[user_id]
+            name = get_user_display_name_cached(target_id)
+            rank_info = get_rank(new_points)
+            log_admin_action(
+                user_id, f"Установил баллы {target_id}",
+                target_id=target_id,
+                details=f"{old_points} → {new_points}"
+            )
+            bot.reply_to(
+                message,
+                f"✅ *{name}*\n\n"
+                f"🪙 Было: `{old_points:,}`\n"
+                f"🪙 Установлено: `{new_points:,}`\n"
+                f"{rank_info['name']}",
+                parse_mode="Markdown"
+            )
+            try:
+                bot.send_message(
+                    target_id,
+                    f"🪙 Администратор установил ваши баллы.\n\n"
+                    f"💰 Новый баланс: {new_points:,}\n"
+                    f"{rank_info['name']}"
+                )
+            except:
+                pass
+            return
 
     if text:
         bot.reply_to(message, "Используйте кнопки меню или /cancel для отмены текущего режима.", reply_markup=main_menu())
 
 # ==================== PRIORITY COMMAND HANDLER ====================
 
-@bot.message_handler(commands=['admin', 'check', 'user', 'add_days', 'remove_days', 'block', 'unblock', 'cancel', 'ref', 'ref_debug', 'add_admin', 'remove_admin', 'logs'])
+@bot.message_handler(commands=['admin', 'check', 'user', 'add_days', 'remove_days', 
+                                'block', 'unblock', 'cancel', 'ref', 'ref_debug', 
+                                'add_admin', 'remove_admin', 'logs', 'points', 'set_points'])
 def cmd_priority_handler(message):
     user_id = message.from_user.id
     command = message.text.split()[0].lower() if message.text else ''
@@ -6984,6 +7224,10 @@ def cmd_priority_handler(message):
         cmd_remove_admin(message)
     elif command == '/logs':
         cmd_view_logs(message)
+    elif command == '/points':
+        cmd_points(message)
+    elif command == '/set_points':
+        cmd_set_points(message)
 
 # ==================== ADMINS COMMANDS ====================
 
@@ -7425,6 +7669,191 @@ def cmd_view_logs(message):
     
     bot.reply_to(message, text, parse_mode="Markdown")
 
+# ==================== НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ БАЛЛАМИ ====================
+
+def cmd_points(message):
+    """/points [ID или @username] [+/-число] — добавить/убрать баллы"""
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if not is_admin(user_id) or not has_permission(user_id, 'points_system'):
+        bot.reply_to(message, "⛔️ Нет прав.")
+        return
+
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "❌ Использование:\n"
+            "`/points @user +500` — добавить 500\n"
+            "`/points @user -200` — убрать 200\n"
+            "`/points @user 0` — обнулить",
+            parse_mode="Markdown"
+        )
+        return
+
+    args = parts[1].strip().split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Укажите пользователя и количество баллов.")
+        return
+
+    target_id = get_user_id_from_input(args[0])
+    if not target_id:
+        bot.reply_to(message, f"❌ Неверный ID или юзернейм: `{args[0]}`", parse_mode="Markdown")
+        return
+
+    raw = args[1].strip()
+    try:
+        amount = int(raw)
+    except ValueError:
+        bot.reply_to(message, "❌ Количество баллов должно быть числом. Пример: `+500`, `-200`, `0`", parse_mode="Markdown")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.reply_to(message, "❌ Пользователь не найден.")
+            return
+
+        old_points = result[0] or 0
+
+        # Если передано просто число без знака — это абсолютное значение (обнуление = 0)
+        if raw.startswith('+') or raw.startswith('-'):
+            new_points = max(0, old_points + amount)
+            action_text = f"{'добавлено' if amount > 0 else 'убрано'} {abs(amount)}"
+        else:
+            # Абсолютное значение
+            new_points = max(0, amount)
+            action_text = f"установлено {new_points}"
+
+        cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
+        conn.commit()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    rank = get_rank(new_points)
+    log_admin_action(
+        user_id,
+        f"Изменил баллы {target_id}",
+        target_id=target_id,
+        details=f"Было: {old_points} → Стало: {new_points} ({action_text})"
+    )
+
+    bot.reply_to(
+        message,
+        f"✅ *{name}*\n\n"
+        f"🪙 Было: `{old_points:,}`\n"
+        f"🪙 Стало: `{new_points:,}`\n"
+        f"{rank['name']}\n"
+        f"📝 Действие: {action_text}",
+        parse_mode="Markdown"
+    )
+
+    # Уведомляем пользователя
+    try:
+        if amount > 0 or (not raw.startswith('-') and new_points > old_points):
+            bot.send_message(
+                target_id,
+                f"🎁 Администратор начислил вам баллы!\n\n"
+                f"🪙 +{new_points - old_points} баллов\n"
+                f"💰 Итого: {new_points:,} баллов"
+            )
+        elif new_points < old_points:
+            bot.send_message(
+                target_id,
+                f"⚠️ Администратор изменил ваши баллы.\n\n"
+                f"🪙 Было: {old_points:,}\n"
+                f"🪙 Стало: {new_points:,} баллов"
+            )
+    except:
+        pass
+
+
+def cmd_set_points(message):
+    """Алиас: /set_points @user 1000 — устанавливает точное значение"""
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if not is_admin(user_id) or not has_permission(user_id, 'points_system'):
+        bot.reply_to(message, "⛔️ Нет прав.")
+        return
+
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "❌ Использование: `/set_points @user 1000`\n\nУстанавливает точное количество баллов.",
+            parse_mode="Markdown"
+        )
+        return
+
+    args = parts[1].strip().split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Укажите пользователя и количество.")
+        return
+
+    target_id = get_user_id_from_input(args[0])
+    if not target_id:
+        bot.reply_to(message, f"❌ Неверный ID: `{args[0]}`", parse_mode="Markdown")
+        return
+
+    try:
+        new_points = int(args[1])
+        if new_points < 0:
+            raise ValueError
+    except ValueError:
+        bot.reply_to(message, "❌ Введите целое неотрицательное число.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.reply_to(message, "❌ Пользователь не найден.")
+            return
+        old_points = result[0] or 0
+        cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
+        conn.commit()
+    finally:
+        cur.close()
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    rank = get_rank(new_points)
+    log_admin_action(
+        user_id,
+        f"Установил баллы {target_id}",
+        target_id=target_id,
+        details=f"{old_points} → {new_points}"
+    )
+
+    bot.reply_to(
+        message,
+        f"✅ *{name}*\n\n"
+        f"🪙 Было: `{old_points:,}`\n"
+        f"🪙 Установлено: `{new_points:,}`\n"
+        f"{rank['name']}",
+        parse_mode="Markdown"
+    )
+    try:
+        bot.send_message(
+            target_id,
+            f"🪙 Ваш баланс баллов обновлён администратором.\n\n"
+            f"💰 Новый баланс: {new_points:,} баллов\n"
+            f"{rank['name']}"
+        )
+    except:
+        pass
+
 # ==================== FLASK APP ====================
 
 @app.route('/')
@@ -7497,7 +7926,7 @@ def subscription(token):
         cur.close()
         return_db_connection(conn)
 
-# ==================== MAIN ====================
+# ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
     if not BOT_TOKEN:
@@ -7521,6 +7950,20 @@ if __name__ == "__main__":
     ensure_bot_start_time()
     print("✅ Время запуска сохранено")
     
+    # Устанавливаем команды бота
+    try:
+        bot.set_my_commands([
+            types.BotCommand("start", "Запустить бота"),
+            types.BotCommand("bonus", "Получить ежедневный бонус"),
+            types.BotCommand("top", "Топ активных участников"),
+            types.BotCommand("rank", "Ваш ранг и баллы"),
+            types.BotCommand("decrypt", "Расшифровать подписку"),
+            types.BotCommand("modhelp", "Помощь по модерации"),
+        ])
+        print("✅ Команды бота установлены")
+    except Exception as e:
+        print(f"[set_commands] Ошибка: {e}")
+    
     Thread(target=autopost_scheduler, daemon=True).start()
     Thread(target=auto_update_keys_scheduler, daemon=True).start()
     Thread(target=cleanup_sessions_scheduler, daemon=True).start()
@@ -7535,23 +7978,28 @@ if __name__ == "__main__":
     
     print("🤖 Бот запущен и готов к работе!")
     
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-        print("✅ Webhook сброшен")
-    except Exception as e:
-        print(f"[webhook] Ошибка: {e}")
-    
-    time.sleep(2)
-    
+    # Основной цикл polling с защитой от 409
     while True:
         try:
-            bot.infinity_polling(timeout=30, long_polling_timeout=30)
-        except Exception as e:
-            print(f"❌ Ошибка в polling: {e}")
-            print("🔄 Переподключение через 10 секунд...")
-            time.sleep(10)
-            try:
-                bot.delete_webhook(drop_pending_updates=True)
-            except:
-                pass
+            # Сбрасываем webhook перед запуском polling
+            bot.delete_webhook(drop_pending_updates=True)
+            time.sleep(1)
             
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=30,
+                allowed_updates=['message', 'callback_query', 'my_chat_member']
+            )
+        except Exception as e:
+            err = str(e)
+            if '409' in err:
+                print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
+                time.sleep(30)
+            else:
+                print(f"❌ Ошибка в polling: {e}")
+                print("🔄 Переподключение через 10 секунд...")
+                time.sleep(10)
+                try:
+                    bot.delete_webhook(drop_pending_updates=True)
+                except:
+                    pass
