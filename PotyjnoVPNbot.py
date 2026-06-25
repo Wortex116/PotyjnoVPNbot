@@ -156,8 +156,6 @@ captcha_sessions = {}
 autopost_loading = {}
 keys_loading = {}
 proxy_url_loading = {}
-autopost_active = {}
-autopost_history = {}
 
 # ==================== ОЧИСТКА СЕССИЙ ====================
 SESSION_TIMEOUT = 3600
@@ -229,6 +227,14 @@ def cleanup_expired_sessions():
     for user_id in to_remove:
         del autopost_loading[user_id]
     
+    # Очистка manage_cache
+    to_remove = []
+    for user_id, data in manage_cache.items():
+        if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT:
+            to_remove.append(user_id)
+    for user_id in to_remove:
+        del manage_cache[user_id]
+    
     # Очистка _user_blocked_cache
     with _user_blocked_cache_lock:
         to_remove = [
@@ -286,7 +292,10 @@ def _notify_expiring_subscriptions():
         conn.rollback()
     finally:
         if cur:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
         return_db_connection(conn)
 
 KEY_TEMPLATE = """\
@@ -415,7 +424,10 @@ def log_admin_action(admin_id, action, target_id=None, details=None, target_name
             ))
             conn.commit()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     except Exception as e:
         print(f"[log_admin_action] Ошибка: {e}")
@@ -514,7 +526,10 @@ def init_points_system():
     except Exception as e:
         print(f"[init] Ошибка инициализации системы баллов: {e}")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def init_db():
@@ -637,7 +652,10 @@ def init_db():
         
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     init_autopost_tables()
     init_points_system()
@@ -651,7 +669,10 @@ def get_setting(key, default='0'):
         result = cur.fetchone()
         return result[0] if result else default
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def set_setting(key, value):
@@ -664,7 +685,10 @@ def set_setting(key, value):
         )
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def increment_setting(key, by=1):
@@ -681,7 +705,10 @@ def increment_setting(key, by=1):
         conn.commit()
         return int(new_value)
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def get_keys_from_db():
@@ -694,21 +721,9 @@ def save_keys_to_db(keys):
     set_setting('vless_keys', '|||'.join(keys))
 
 def generate_subscription_token():
+    """Генерирует случайный токен. Уникальность обеспечивается UNIQUE constraint в БД"""
     chars = string.ascii_letters + string.digits
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        max_attempts = 100
-        for _ in range(max_attempts):
-            token = ''.join(random.choices(chars, k=12))
-            cur.execute("SELECT user_id FROM users WHERE token = %s", (token,))
-            if not cur.fetchone():
-                return token
-        token = ''.join(random.choices(chars, k=16))
-        return token
-    finally:
-        cur.close()
-        return_db_connection(conn)
+    return ''.join(random.choices(chars, k=12))
 
 def get_next_file_number():
     conn = get_db_connection()
@@ -724,7 +739,10 @@ def get_next_file_number():
         conn.commit()
         return int(new_value)
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def ensure_bot_start_time():
@@ -769,7 +787,10 @@ def init_autopost_tables():
         """)
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     add_default_channel()
 
@@ -786,7 +807,10 @@ def add_default_channel():
             """, (AUTO_POST_CHANNEL, "Ciorsa VPN", AUTO_POST_TOPIC_ID, ADMIN_ID, int(time.time())))
             conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 # ==================== AUTO POSTING FUNCTIONS ====================
@@ -1476,8 +1500,14 @@ def get_subscription_link(user_id):
         cur.execute("UPDATE users SET token = %s WHERE user_id = %s", (token, user_id))
         conn.commit()
         return f"{BOT_BASE_URL}/sub/{token}"
+    except Exception as e:
+        print(f"[get_subscription_link] Ошибка: {e}")
+        return None
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def is_blocked(user_id):
@@ -1489,7 +1519,10 @@ def is_blocked(user_id):
             result = cur.fetchone()
             return result[0] == 1 if result else False
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     except:
         return False
@@ -1507,7 +1540,10 @@ def update_user_username(user_id, username):
             cur.execute("UPDATE users SET username = %s WHERE user_id = %s", (username, user_id))
             conn.commit()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     except Exception as e:
         print(f"[update_user_username] Ошибка: {e}")
@@ -1523,7 +1559,10 @@ def _find_user_by_username_in_db(username):
             if result:
                 return result[0]
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     except Exception as e:
         print(f"[_find_user_by_username_in_db] Ошибка: {e}")
@@ -1713,7 +1752,10 @@ def process_referral(referrer_id, referred_id):
                 return True, "Реферал добавлен, начислено +3 дня"
         return True, "Реферал сохранен"
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 # ==================== ADMIN FUNCTIONS ====================
@@ -1732,7 +1774,10 @@ def get_admin_permissions(user_id):
             except:
                 pass
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     return {p: False for p in PERMISSIONS}
 
@@ -1749,7 +1794,10 @@ def update_admin_permissions(user_id, permissions_dict):
         cur.execute("UPDATE admins SET permissions = %s WHERE user_id = %s", (json.dumps(permissions_dict), user_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def get_admin_role(user_id):
@@ -1762,7 +1810,10 @@ def get_admin_role(user_id):
         result = cur.fetchone()
         return result[0] if result else None
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def get_admin_role_name(user_id):
@@ -1784,7 +1835,10 @@ def is_admin(user_id):
             result = cur.fetchone()
             return result is not None
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     except:
         return False
@@ -1807,11 +1861,14 @@ def build_user_list_keyboard(users, page, filter_type='all'):
             placeholders = ','.join(['%s'] * len(page_users))
             cur.execute(
                 f"SELECT user_id, subscription_end, is_blocked FROM users WHERE user_id IN ({placeholders})",
-                page_users
+                tuple(page_users)
             )
             user_data = {row[0]: row for row in cur.fetchall()}
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
 
     for uid in page_users:
@@ -1941,7 +1998,10 @@ def _show_admin_list_for_call(call):
         cur.execute("SELECT user_id, role FROM admins ORDER BY user_id")
         admins = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     text = "👑 *Управление админами*\n\n"
@@ -1976,7 +2036,10 @@ def _redraw_admin_perms(call, target_id):
         cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
         result = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     if not result:
@@ -2656,7 +2719,10 @@ def cabinet(message):
         bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
         
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.callback_query_handler(func=lambda call: call.data == "refresh_cabinet")
@@ -2747,7 +2813,10 @@ def callback_refresh_cabinet(call):
         bot.answer_callback_query(call.id, "✅ Обновлено!")
         
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.callback_query_handler(func=lambda call: call.data == "points_info")
@@ -2760,7 +2829,10 @@ def callback_points_info(call):
         result = cur.fetchone()
         points = result[0] if result else 0
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     rank = get_rank(points)
@@ -2825,7 +2897,10 @@ def callback_exchange_points(call):
         bot.answer_callback_query(call.id)
         
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def _show_exchange_panel(call, user_id, selected_days, max_days, points):
@@ -2954,7 +3029,10 @@ def callback_exchange_action(call):
                 bot.send_message(user_id, text, parse_mode="Markdown")
             
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         return
     
@@ -2983,7 +3061,10 @@ def callback_exchange_action(call):
                     'timestamp': int(time.time())
                 }
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     
     cached = exchange_cache.get(user_id, {})
@@ -3288,7 +3369,10 @@ def my_subscription(message):
         
         bot.reply_to(message, text, parse_mode="Markdown", reply_markup=kb)
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.callback_query_handler(func=lambda call: call.data == "freeze_sub")
@@ -3312,7 +3396,10 @@ def callback_freeze_sub(call):
         days_left = max(0, (sub_end - current_time) // (24 * 60 * 60))
         
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     text = (
@@ -3370,7 +3457,10 @@ def callback_freeze_confirm(call):
         """, (days_left, int(time.time()), user_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     bot.answer_callback_query(call.id, "❄️ Подписка заморожена!")
@@ -3428,7 +3518,10 @@ def callback_unfreeze_sub(call):
         new_link = f"{BOT_BASE_URL}/sub/{new_token}"
         
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     bot.answer_callback_query(call.id, "🔥 Подписка разморожена!")
@@ -3496,15 +3589,18 @@ def auto_post_keys_to_channel():
     keys_to_check = keys[:20]
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(_check_key, k): k for k in keys_to_check}
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                working.append(result)
-            if len(working) >= 5:
-                for f in futures:
-                    if not f.done():
-                        f.cancel()
-                break
+        try:
+            for future in as_completed(futures, timeout=15):
+                result = future.result()
+                if result:
+                    working.append(result)
+                if len(working) >= 5:
+                    for f in futures:
+                        if not f.done():
+                            f.cancel()
+                    break
+        except TimeoutError:
+            print("[autopost] Таймаут проверки ключей")
 
     if not working:
         key_to_post = keys_to_check[0] if keys_to_check else None
@@ -3596,7 +3692,10 @@ def auto_post_keys_to_channel():
                 save_keys_to_db(current_keys)
                 increment_setting('total_keys_issued', 1)
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
     except Exception as e:
         print(f"[autopost] Ошибка: {e}")
@@ -3674,7 +3773,10 @@ def admin_callback(call):
             cur.execute("SELECT user_id FROM users ORDER BY user_id")
             users = [row[0] for row in cur.fetchall()]
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         if not users:
             try:
@@ -3683,7 +3785,11 @@ def admin_callback(call):
             except:
                 bot.send_message(user_id, "📭 Нет пользователей.")
             return
-        manage_cache[user_id] = {'users': users, 'filter': 'all'}
+        manage_cache[user_id] = {
+            'users': users, 
+            'filter': 'all',
+            'timestamp': int(time.time())
+        }
         kb = build_user_list_keyboard(users, 0, 'all')
         try:
             bot.edit_message_text(
@@ -3753,7 +3859,10 @@ def admin_callback(call):
             cur.execute("SELECT user_id, role FROM admins WHERE user_id != %s", (ADMIN_ID,))
             admins = cur.fetchall()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         if not admins:
             bot.send_message(user_id, "❌ Нет других админов для настройки.")
@@ -3889,7 +3998,10 @@ def admin_callback(call):
                 f"Переключил чат {chat_id_pts} на {'вкл' if new_state else 'выкл'}"
             )
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         bot.answer_callback_query(call.id, "✅ ВКЛ" if new_state else "❌ ВЫКЛ")
         _show_admin_points_chats(call)
@@ -3911,7 +4023,10 @@ def admin_callback(call):
             conn.commit()
             log_admin_action(user_id, f"Удалил чат {chat_id_pts} из системы баллов")
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         bot.answer_callback_query(call.id, "🗑 Удалено")
         _show_admin_points_chats(call)
@@ -4006,7 +4121,10 @@ def _show_admin_logs(call):
         """)
         logs = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     if not logs:
@@ -4052,7 +4170,10 @@ def _show_admin_points_system(call):
         total_logs = cur.fetchone()[0] or 0
         
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     text = (
@@ -4086,7 +4207,10 @@ def _show_admin_points_chats(call):
         cur.execute("SELECT chat_id, chat_name, enabled FROM points_chats")
         chats = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     text = "💬 *Чаты для баллов*\n\n"
@@ -4133,7 +4257,10 @@ def _show_admin_points_log(call):
         """)
         logs = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     text = "📋 *Последние сообщения:*\n\n"
@@ -4170,7 +4297,10 @@ def _show_admin_points_top(call):
         """)
         top = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     text = "🏆 *Топ по баллам:*\n\n"
@@ -4350,12 +4480,21 @@ def handle_group_message(message):
     except Exception as e:
         print(f"[group_message] Ошибка: {e}")
         if conn:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except:
+                pass
     finally:
         if cur:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
         if conn:
-            conn.autocommit = True
+            try:
+                conn.autocommit = True
+            except:
+                pass
             return_db_connection(conn)
 
 # ==================== КОМАНДЫ БОНУС, ТОП, РАНГ ====================
@@ -4448,7 +4587,10 @@ def cmd_bonus(message):
         )
 
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.message_handler(commands=['top'])
@@ -4542,7 +4684,10 @@ def cmd_top_chat(message):
             bot.reply_to(message, text, parse_mode="Markdown")
 
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.message_handler(commands=['rank'])
@@ -4614,7 +4759,10 @@ def cmd_rank(message):
         bot.reply_to(message, text, parse_mode="Markdown")
 
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ МОДЕРАЦИИ ====================
@@ -4652,7 +4800,10 @@ def is_chat_admin(user_id, chat_id):
         )
         return cur.fetchone() is not None
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 
@@ -4702,7 +4853,10 @@ def cmd_welcome_info(message):
         cur.execute("SELECT welcome_text, welcome_enabled FROM chat_settings WHERE chat_id = %s", (chat_id,))
         result = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     if not result or not result[0]:
@@ -4765,7 +4919,10 @@ def cmd_setwelcome(message):
         """, (chat_id, welcome_text, welcome_text))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     preview = welcome_text.format(
@@ -4801,7 +4958,10 @@ def cmd_welcomeoff(message):
         """, (chat_id,))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     bot.reply_to(message, "✅ Приветствие отключено.")
 
@@ -4827,7 +4987,10 @@ def cmd_welcomeon(message):
         """, (chat_id,))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     bot.reply_to(message, "✅ Приветствие включено.")
 
@@ -4866,7 +5029,10 @@ def cmd_warn(message):
         cur.execute("SELECT COUNT(*) FROM chat_warns WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
         warn_count = cur.fetchone()[0]
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -4916,7 +5082,10 @@ def cmd_unwarn(message):
         cur.execute("SELECT COUNT(*) FROM chat_warns WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
         remaining = cur.fetchone()[0]
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -4940,7 +5109,10 @@ def cmd_warns(message):
         """, (target_id, chat_id))
         warns = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -5010,7 +5182,10 @@ def cmd_mute(message):
         """, (target_id, chat_id, until, reason, until, reason))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -5054,7 +5229,10 @@ def cmd_unmute(message):
         cur.execute("DELETE FROM chat_mutes WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -5199,7 +5377,10 @@ def cmd_chatadmin(message):
         """, (target_id, chat_id, user_id, int(time.time()), user_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -5239,7 +5420,10 @@ def cmd_chatdeadmin(message):
         )
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -5259,7 +5443,10 @@ def cmd_chatadmins(message):
         )
         rows = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     if not rows:
@@ -5319,7 +5506,10 @@ def _register_chat_owner(chat_id):
                     except:
                         pass
                 finally:
-                    cur.close()
+                    try:
+                        cur.close()
+                    except:
+                        pass
                     return_db_connection(conn)
                 break
     except Exception as e:
@@ -5343,7 +5533,10 @@ def callback_edit_admin(call):
         cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
         result = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     if not result:
         bot.answer_callback_query(call.id, "❌ Админ не найден.")
@@ -5371,7 +5564,10 @@ def callback_user_msg_history(call):
         """, (target_id,))
         logs = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -5420,7 +5616,10 @@ def _refresh_user_card(call, target_id, admin_id):
             cur.execute("SELECT subscription_end, is_blocked, points FROM users WHERE user_id = %s", (target_id,))
             row = cur.fetchone()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
 
         if not row:
@@ -5597,7 +5796,10 @@ def callback_points_manage(call):
         cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     log_admin_action(user_id, f"Изменил баллы {target_id}", target_id=target_id, details=detail)
@@ -5639,7 +5841,10 @@ def callback_grant_admin(call):
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
         user_exists = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     if not user_exists:
         bot.answer_callback_query(call.id, "❌ Пользователь не зарегистрирован в боте.")
@@ -5655,7 +5860,10 @@ def callback_grant_admin(call):
         )
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Назначил админом {target_id}", target_id=target_id, details=f"Роль: {role}")
     bot.answer_callback_query(call.id, f"✅ {get_user_display_name_cached(target_id)} назначен админом!")
@@ -5686,7 +5894,10 @@ def callback_remove_admin(call):
         cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Удалил админа {target_id}", target_id=target_id)
     bot.answer_callback_query(call.id, "✅ Админ удален!")
@@ -5727,7 +5938,10 @@ def referrals(message):
         text = f"👥 *Рефералы*\n\n📊 Всего: {total}\n📅 Сегодня: {today} / 10\n\n🔗 Ссылка: `{ref_link}`\n\n📌 За каждого друга +3 дня."
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.message_handler(func=lambda m: m.text == "🏆 Топ рефералов")
@@ -5753,7 +5967,10 @@ def top_referrals(message):
             text += f"{icon} {name} — {count} реф.\n"
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.message_handler(func=lambda m: m.text == "ℹ️ Стаж бота")
@@ -5779,7 +5996,10 @@ def bot_stats_command(message):
         )
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 @bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
@@ -5891,7 +6111,10 @@ def callback_check_sub(call):
             )
             pending = cur.fetchone()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         if pending:
             referrer_id = pending[0]
@@ -5911,7 +6134,10 @@ def callback_check_sub(call):
                         except:
                             pass
                 finally:
-                    cur.close()
+                    try:
+                        cur.close()
+                    except:
+                        pass
                     return_db_connection(conn)
         conn = get_db_connection()
         cur = conn.cursor()
@@ -5919,7 +6145,10 @@ def callback_check_sub(call):
             cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
             user_exists = cur.fetchone()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         if not user_exists:
             _register_user(user_id, None)
@@ -5958,8 +6187,13 @@ def _register_user(user_id, referrer_id=None):
                 update_user_username(user_id, chat.username)
         except:
             pass
+    except Exception as e:
+        print(f"[_register_user] Ошибка: {e}")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     if referrer_id:
@@ -5995,7 +6229,10 @@ def cmd_start(message):
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
         existing_user = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     if existing_user:
@@ -6015,7 +6252,10 @@ def cmd_start(message):
                 conn.commit()
                 bot.reply_to(message, welcome_text)
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
         return
@@ -6101,7 +6341,10 @@ def callback_captcha_verify(call):
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
         already_registered = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     if already_registered:
@@ -6609,7 +6852,10 @@ def callback_give_sub(call):
         cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Выдал подписку {target_id}", target_id=target_id, details="30 дней")
     bot.answer_callback_query(call.id, "✅ Выдана подписка на 30 дней!")
@@ -6646,7 +6892,10 @@ def callback_prolong(call):
         cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Продлил подписку {target_id}", target_id=target_id, details=f"+{days} дней")
     bot.answer_callback_query(call.id, f"✅ Продлено на {days} дней!")
@@ -6685,7 +6934,10 @@ def callback_remove_days(call):
         cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Забрал дни у {target_id}", target_id=target_id, details=f"-{days} дней")
     bot.answer_callback_query(call.id, f"✅ Убавлено {days} дней!")
@@ -6713,7 +6965,10 @@ def callback_remove_sub(call):
         cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (current_time - 1, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Удалил подписку у {target_id}", target_id=target_id)
     bot.answer_callback_query(call.id, "✅ Подписка удалена!")
@@ -6743,7 +6998,10 @@ def callback_block(call):
         cur.execute("UPDATE users SET is_blocked = 1 WHERE user_id = %s", (target_id,))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Заблокировал {target_id}", target_id=target_id)
     bot.answer_callback_query(call.id, "✅ Пользователь заблокирован!")
@@ -6770,7 +7028,10 @@ def callback_unblock(call):
         cur.execute("UPDATE users SET is_blocked = 0 WHERE user_id = %s", (target_id,))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     log_admin_action(user_id, f"Разблокировал {target_id}", target_id=target_id)
     bot.answer_callback_query(call.id, "✅ Пользователь разблокирован!")
@@ -6806,7 +7067,10 @@ def callback_announce_channels(call):
         cur.execute("SELECT channel_id, channel_name FROM autopost_channels WHERE enabled = TRUE")
         channels = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     if not channels:
         bot.send_message(user_id, "❌ Нет каналов")
@@ -6931,7 +7195,10 @@ def handle_add_admin_input(message):
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
         user_exists = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     if not user_exists:
         bot.reply_to(message, "❌ Пользователь не зарегистрирован в боте.")
@@ -6947,7 +7214,10 @@ def handle_add_admin_input(message):
         )
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     del search_cache[user_id]
     name = get_user_display_name_cached(target_id)
@@ -6978,7 +7248,10 @@ def admin_announce_text(message):
             cur.execute("SELECT user_id FROM users")
             users = cur.fetchall()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         sent = 0
         for (uid,) in users:
@@ -7021,7 +7294,10 @@ def admin_announce_text(message):
             cur.execute("SELECT channel_id FROM autopost_channels WHERE enabled = TRUE")
             channels = cur.fetchall()
         finally:
-            cur.close()
+            try:
+                cur.close()
+            except:
+                pass
             return_db_connection(conn)
         if not channels:
             bot.reply_to(message, "❌ Нет активных каналов.")
@@ -7112,7 +7388,10 @@ def handle_private_messages(message):
                     """, (new_chat_id, chat_name, user_id, int(time.time()), chat_name))
                     conn.commit()
                 finally:
-                    cur.close()
+                    try:
+                        cur.close()
+                    except:
+                        pass
                     return_db_connection(conn)
                 
                 del search_cache[user_id]
@@ -7147,7 +7426,10 @@ def handle_private_messages(message):
                 cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
                 conn.commit()
             finally:
-                cur.close()
+                try:
+                    cur.close()
+                except:
+                    pass
                 return_db_connection(conn)
 
             del search_cache[user_id]
@@ -7275,7 +7557,10 @@ def cmd_check_user(message):
         log_admin_action(user_id, f"Проверил пользователя {target_id}", target_id=target_id)
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_user_info(message):
@@ -7319,7 +7604,10 @@ def cmd_user_info(message):
         log_admin_action(user_id, f"Посмотрел инфо о {target_id}", target_id=target_id)
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_add_days(message):
@@ -7363,7 +7651,10 @@ def cmd_add_days(message):
         log_admin_action(user_id, f"Выдал {days} дней {target_id}", target_id=target_id)
         bot.reply_to(message, f"✅ +{days} дней")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_remove_days(message):
@@ -7409,7 +7700,10 @@ def cmd_remove_days(message):
         log_admin_action(user_id, f"Забрал {days} дней у {target_id}", target_id=target_id)
         bot.reply_to(message, f"✅ -{days} дней")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_block_user(message):
@@ -7437,7 +7731,10 @@ def cmd_block_user(message):
         log_admin_action(user_id, f"Заблокировал {target_id}", target_id=target_id)
         bot.reply_to(message, f"🚫 Заблокирован {target_id}")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_unblock_user(message):
@@ -7462,7 +7759,10 @@ def cmd_unblock_user(message):
         log_admin_action(user_id, f"Разблокировал {target_id}", target_id=target_id)
         bot.reply_to(message, f"✅ Разблокирован {target_id}")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_cancel(message):
@@ -7513,7 +7813,10 @@ def cmd_ref_debug(message):
             text += f"{'✅' if rew else '⏳'} {get_user_display_name_cached(refd)} → {get_user_display_name_cached(refr)}\n"
         bot.reply_to(message, text, parse_mode="Markdown")
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 def cmd_add_admin(message):
@@ -7545,7 +7848,10 @@ def cmd_add_admin(message):
         cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
         user_exists = cur.fetchone()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     if not user_exists:
         bot.reply_to(message, f"❌ Пользователь `{target_id}` не зарегистрирован в боте.", parse_mode="Markdown")
@@ -7565,7 +7871,10 @@ def cmd_add_admin(message):
         bot.reply_to(message, f"❌ Ошибка БД: {e}")
         return
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     name = get_user_display_name_cached(target_id)
     log_admin_action(user_id, f"Добавил админа {target_id}", target_id=target_id, details=f"Роль: {role}")
@@ -7608,7 +7917,10 @@ def cmd_remove_admin(message):
         bot.reply_to(message, f"❌ Ошибка БД: {e}")
         return
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     name = get_user_display_name_cached(target_id)
     log_admin_action(user_id, f"Удалил админа {target_id}", target_id=target_id)
@@ -7648,7 +7960,10 @@ def cmd_view_logs(message):
         """, (limit,))
         logs = cur.fetchall()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
     
     if not logs:
@@ -7733,7 +8048,10 @@ def cmd_points(message):
         cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -7824,7 +8142,10 @@ def cmd_set_points(message):
         cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
         conn.commit()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
@@ -7870,13 +8191,25 @@ def health():
 
 # Rate limiting для /sub
 _rate_limit = defaultdict(list)
+_RATE_LIMIT_LAST_CLEAN = time.time()
 
 def rate_limit(limit=10, window=60):
     def decorator(f):
         @wraps(f)
         def decorated(*args, **kwargs):
+            global _RATE_LIMIT_LAST_CLEAN
             ip = request.remote_addr
             now = time.time()
+            
+            # Чистим старые записи
+            if now - _RATE_LIMIT_LAST_CLEAN > 3600:
+                cutoff = now - 3600
+                dead = [k for k, v in _rate_limit.items() 
+                        if not any(t > cutoff for t in v)]
+                for k in dead:
+                    del _rate_limit[k]
+                _RATE_LIMIT_LAST_CLEAN = now
+            
             _rate_limit[ip] = [t for t in _rate_limit[ip] if now - t < window]
             if len(_rate_limit[ip]) >= limit:
                 return "Too many requests", 429
@@ -7923,7 +8256,10 @@ def subscription(token):
         content = KEY_TEMPLATE.format(expire=expire_timestamp, keys='\n'.join(keys))
         return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except:
+            pass
         return_db_connection(conn)
 
 # ==================== ЗАПУСК ====================
@@ -7964,6 +8300,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[set_commands] Ошибка: {e}")
     
+    # Запускаем фоновые задачи
     Thread(target=autopost_scheduler, daemon=True).start()
     Thread(target=auto_update_keys_scheduler, daemon=True).start()
     Thread(target=cleanup_sessions_scheduler, daemon=True).start()
@@ -7973,33 +8310,36 @@ if __name__ == "__main__":
         Thread(target=keep_alive_ping, daemon=True).start()
         Thread(target=auto_restart_monitor, daemon=True).start()
     
-    print("📡 Запускаем Flask сервер...")
-    Thread(target=lambda: serve(app, host='0.0.0.0', port=int(os.getenv('PORT', 5000))), daemon=True).start()
-    
     print("🤖 Бот запущен и готов к работе!")
     
-    # Основной цикл polling с защитой от 409
-    while True:
-        try:
-            # Сбрасываем webhook перед запуском polling
-            bot.delete_webhook(drop_pending_updates=True)
-            time.sleep(1)
-            
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=30,
-                allowed_updates=['message', 'callback_query', 'my_chat_member']
-            )
-        except Exception as e:
-            err = str(e)
-            if '409' in err:
-                print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
-                time.sleep(30)
-            else:
-                print(f"❌ Ошибка в polling: {e}")
-                print("🔄 Переподключение через 10 секунд...")
-                time.sleep(10)
-                try:
-                    bot.delete_webhook(drop_pending_updates=True)
-                except:
-                    pass
+    # ===== POLLING В ФОНОВОМ ПОТОКЕ =====
+    def run_polling():
+        while True:
+            try:
+                bot.delete_webhook(drop_pending_updates=True)
+                time.sleep(1)
+                bot.infinity_polling(
+                    timeout=30,
+                    long_polling_timeout=30,
+                    allowed_updates=['message', 'callback_query', 'my_chat_member']
+                )
+            except Exception as e:
+                err = str(e)
+                if '409' in err:
+                    print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
+                    time.sleep(30)
+                else:
+                    print(f"❌ Ошибка в polling: {e}")
+                    print("🔄 Переподключение через 10 секунд...")
+                    time.sleep(10)
+                    try:
+                        bot.delete_webhook(drop_pending_updates=True)
+                    except:
+                        pass
+    
+    Thread(target=run_polling, daemon=True).start()
+    
+    # ===== FLASK В ГЛАВНОМ ПОТОКЕ =====
+    print("📡 Запускаем Flask сервер на порту " + str(int(os.getenv('PORT', 5000))) + "...")
+    serve(app, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
+        
