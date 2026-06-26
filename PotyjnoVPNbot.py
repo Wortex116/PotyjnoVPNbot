@@ -178,7 +178,7 @@ USER_NAME_CACHE_TTL = 3600
 # Кэш для ключей
 _keys_cache = None
 _keys_cache_time = 0
-KEYS_CACHE_TTL = 5
+KEYS_CACHE_TTL = 60  # Увеличено с 5 до 60 секунд
 
 # Кэш для бота
 _bot_username = None
@@ -1563,7 +1563,7 @@ def _parse_keys_from_content(content, depth=0, visited_urls=None):
     
     url_counter = 0
     MAX_URLS_PER_PARSE = 5
-    MAX_URL_LOAD_TIME = 60  # общий таймаут на загрузку всех URL
+    MAX_URL_LOAD_TIME = 60
     
     url_start_time = time.time()
     
@@ -2337,6 +2337,14 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
                 pass
             return
     
+    # Проверяем семафор с таймаутом
+    if not _decrypt_thread_semaphore.acquire(timeout=300):
+        try:
+            bot.reply_to(message, "❌ Сервер перегружен. Попробуйте позже.")
+        except:
+            pass
+        return
+    
     task_id = str(uuid.uuid4())
     with _cache_lock:
         decrypt_results[user_id] = {
@@ -2352,90 +2360,90 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
         wait_msg = None
 
     def process():
-        with _decrypt_thread_semaphore:
+        try:
+            if file_bytes is not None:
+                raw = file_bytes.decode('utf-8', errors='ignore')
+                keys, steps = _parse_subscription_any(raw, [])
+            else:
+                keys, steps = _parse_subscription_any(text, [])
+            if wait_msg:
+                try:
+                    bot.delete_message(message.chat.id, wait_msg.message_id)
+                except:
+                    pass
+            if not keys:
+                info = '\n'.join(steps) if steps else '—'
+                err_text = (
+                    "❌ Не удалось найти VPN ключи\n\n"
+                    f"Шаги:\n{info}\n\n"
+                    "Убедитесь что источник содержит ключи."
+                )
+                try:
+                    bot.reply_to(message, err_text)
+                except:
+                    try:
+                        bot.send_message(message.chat.id, err_text)
+                    except:
+                        pass
+                return
             try:
-                if file_bytes is not None:
-                    raw = file_bytes.decode('utf-8', errors='ignore')
-                    keys, steps = _parse_subscription_any(raw, [])
-                else:
-                    keys, steps = _parse_subscription_any(text, [])
-                if wait_msg:
-                    try:
-                        bot.delete_message(message.chat.id, wait_msg.message_id)
-                    except:
-                        pass
-                if not keys:
-                    info = '\n'.join(steps) if steps else '—'
-                    err_text = (
-                        "❌ Не удалось найти VPN ключи\n\n"
-                        f"Шаги:\n{info}\n\n"
-                        "Убедитесь что источник содержит ключи."
-                    )
-                    try:
-                        bot.reply_to(message, err_text)
-                    except:
-                        try:
-                            bot.send_message(message.chat.id, err_text)
-                        except:
-                            pass
-                    return
+                increment_setting('total_decryptions_success', 1)
+            except:
+                pass
+            try:
+                file_number = get_next_file_number()
+            except:
+                file_number = 0
+            filename = f"{file_number:06d}_{datetime.now().strftime('%d.%m.%Y')}.txt"
+            now = datetime.now().strftime("%Y-%m-%d %H:%M")
+            src = text[:80] if text else (file_name or 'файл')
+            file_content = (
+                f"# VPN подписка расшифрована\n"
+                f"# Номер файла: {file_number:06d}\n"
+                f"# Дата: {now}\n"
+                f"# Ключей: {len(keys)}\n"
+                f"# Источник: {src}\n"
+                f"# {'='*48}\n\n"
+            )
+            file_content += '\n'.join(keys) + '\n'
+            proto_stats = {}
+            for k in keys:
+                m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+                if m:
+                    p = m.group(1).lower()
+                    proto_stats[p] = proto_stats.get(p, 0) + 1
+            stats_text = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+            steps_text = '\n'.join(steps) if steps else '—'
+            caption = (
+                f"✅ Расшифровка завершена!\n\n"
+                f"📊 Найдено ключей: {len(keys)}\n"
+                f"📁 Файл №{file_number:06d}\n\n"
+                f"📋 По протоколам:\n{stats_text}\n\n"
+                f"🔍 Шаги:\n{steps_text}"
+            )
+            if len(caption) > 1024:
+                caption = caption[:1000].rstrip() + "\n…"
+            buf = io.BytesIO(file_content.encode('utf-8'))
+            buf.name = filename
+            try:
+                bot.send_document(message.chat.id, buf, caption=caption, visible_file_name=filename)
+            except:
                 try:
-                    increment_setting('total_decryptions_success', 1)
+                    buf.seek(0)
+                    bot.send_document(message.chat.id, buf, caption=f"✅ Найдено ключей: {len(keys)}\n📁 Файл №{file_number:06d}", visible_file_name=filename)
                 except:
                     pass
-                try:
-                    file_number = get_next_file_number()
-                except:
-                    file_number = 0
-                filename = f"{file_number:06d}_{datetime.now().strftime('%d.%m.%Y')}.txt"
-                now = datetime.now().strftime("%Y-%m-%d %H:%M")
-                src = text[:80] if text else (file_name or 'файл')
-                file_content = (
-                    f"# VPN подписка расшифрована\n"
-                    f"# Номер файла: {file_number:06d}\n"
-                    f"# Дата: {now}\n"
-                    f"# Ключей: {len(keys)}\n"
-                    f"# Источник: {src}\n"
-                    f"# {'='*48}\n\n"
-                )
-                file_content += '\n'.join(keys) + '\n'
-                proto_stats = {}
-                for k in keys:
-                    m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
-                    if m:
-                        p = m.group(1).lower()
-                        proto_stats[p] = proto_stats.get(p, 0) + 1
-                stats_text = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
-                steps_text = '\n'.join(steps) if steps else '—'
-                caption = (
-                    f"✅ Расшифровка завершена!\n\n"
-                    f"📊 Найдено ключей: {len(keys)}\n"
-                    f"📁 Файл №{file_number:06d}\n\n"
-                    f"📋 По протоколам:\n{stats_text}\n\n"
-                    f"🔍 Шаги:\n{steps_text}"
-                )
-                if len(caption) > 1024:
-                    caption = caption[:1000].rstrip() + "\n…"
-                buf = io.BytesIO(file_content.encode('utf-8'))
-                buf.name = filename
-                try:
-                    bot.send_document(message.chat.id, buf, caption=caption, visible_file_name=filename)
-                except:
-                    try:
-                        buf.seek(0)
-                        bot.send_document(message.chat.id, buf, caption=f"✅ Найдено ключей: {len(keys)}\n📁 Файл №{file_number:06d}", visible_file_name=filename)
-                    except:
-                        pass
-            except Exception as outer_e:
-                print(f"[decrypt] ошибка: {outer_e}")
-                try:
-                    bot.send_message(message.chat.id, "❌ Произошла ошибка при обработке подписки.")
-                except:
-                    pass
-            finally:
-                with _cache_lock:
-                    if decrypt_results.get(user_id, {}).get('task_id') == task_id:
-                        del decrypt_results[user_id]
+        except Exception as outer_e:
+            print(f"[decrypt] ошибка: {outer_e}")
+            try:
+                bot.send_message(message.chat.id, "❌ Произошла ошибка при обработке подписки.")
+            except:
+                pass
+        finally:
+            with _cache_lock:
+                if decrypt_results.get(user_id, {}).get('task_id') == task_id:
+                    del decrypt_results[user_id]
+            _decrypt_thread_semaphore.release()
     
     t = threading.Thread(target=process)
     t.daemon = True
@@ -2832,7 +2840,8 @@ def autopost_scheduler():
                 current_time = int(time.time())
                 if current_time - last_post >= config['interval']:
                     print(f"[autopost_scheduler] Запуск автопостинга (интервал: {config['interval']}с)")
-                    auto_post_keys_to_channel()
+                    # Запускаем в отдельном потоке, чтобы не блокировать
+                    Thread(target=auto_post_keys_to_channel, daemon=True).start()
                     set_setting('autopost_last_post', str(current_time))
             time.sleep(30)
         except Exception as e:
@@ -2967,7 +2976,6 @@ def auto_post_keys_to_channel():
             else:
                 bot.send_message(channel_id, formatted, parse_mode="Markdown")
             
-            # Удаляем ключ атомарно
             with _keys_lock:
                 current_keys = get_keys_from_db()
                 if key_to_post in current_keys:
@@ -3321,7 +3329,6 @@ def callback_exchange_action(call):
         conn = get_db_connection()
         cur = conn.cursor()
         try:
-            # Атомарное списание с проверкой
             cur.execute(
                 "SELECT points, subscription_end, is_frozen FROM users WHERE user_id = %s FOR UPDATE",
                 (user_id,)
@@ -5524,6 +5531,11 @@ def callback_block(call):
     except:
         pass
     
+    # Очищаем кэш заблокированного пользователя
+    with _user_blocked_cache_lock:
+        if target_id in _user_blocked_cache:
+            del _user_blocked_cache[target_id]
+    
     _refresh_user_card(call, target_id, user_id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
@@ -5553,6 +5565,11 @@ def callback_unblock(call):
         bot.send_message(target_id, "✅ Вы разблокированы! Теперь вы можете пользоваться ботом.")
     except:
         pass
+    
+    # Очищаем кэш разблокированного пользователя
+    with _user_blocked_cache_lock:
+        if target_id in _user_blocked_cache:
+            del _user_blocked_cache[target_id]
     
     _refresh_user_card(call, target_id, user_id)
 
@@ -5864,7 +5881,8 @@ def callback_autopost_start(call):
     config['enabled'] = True
     save_autopost_config(config)
     bot.answer_callback_query(call.id, "🚀 Запущен!")
-    auto_post_keys_to_channel()
+    # Запускаем автопостинг в отдельном потоке
+    Thread(target=auto_post_keys_to_channel, daemon=True).start()
     set_setting('autopost_last_post', str(int(time.time())))
     callback_autopost_back(call)
 
@@ -8343,6 +8361,10 @@ def cmd_block_user(message):
         conn.commit()
         log_admin_action(user_id, f"Заблокировал {target_id}", target_id=target_id)
         bot.reply_to(message, f"🚫 Заблокирован {target_id}")
+        # Очищаем кэш
+        with _user_blocked_cache_lock:
+            if target_id in _user_blocked_cache:
+                del _user_blocked_cache[target_id]
     finally:
         try:
             cur.close()
@@ -8371,6 +8393,10 @@ def cmd_unblock_user(message):
         conn.commit()
         log_admin_action(user_id, f"Разблокировал {target_id}", target_id=target_id)
         bot.reply_to(message, f"✅ Разблокирован {target_id}")
+        # Очищаем кэш
+        with _user_blocked_cache_lock:
+            if target_id in _user_blocked_cache:
+                del _user_blocked_cache[target_id]
     finally:
         try:
             cur.close()
@@ -8851,7 +8877,6 @@ def subscription(token):
         if is_blocked:
             return "User blocked", 403
         
-        # Сначала проверяем подписку, потом обновляем активность
         current_time = int(time.time())
         
         if is_frozen:
@@ -8864,7 +8889,6 @@ def subscription(token):
         if not sub_end or sub_end < current_time:
             return "Subscription expired", 403
         
-        # Обновляем активность только если подписка активна
         try:
             cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (int(time.time()), user_id))
             conn.commit()
@@ -8925,6 +8949,7 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[set_commands] Ошибка: {e}")
     
+    # Запускаем фоновые задачи
     Thread(target=autopost_scheduler, daemon=True).start()
     Thread(target=auto_update_keys_scheduler, daemon=True).start()
     Thread(target=cleanup_sessions_scheduler, daemon=True).start()
@@ -8936,42 +8961,40 @@ if __name__ == "__main__":
     
     print("🤖 Бот готов к запуску!")
     
-    # ===== FLASK ЗАПУСКАЕТСЯ ПЕРВЫМ В ОТДЕЛЬНОМ ПОТОКЕ =====
+    # ===== ПОЛЛИНГ В ОТДЕЛЬНОМ ПОТОКЕ =====
+    print("🔄 Запускаем polling...")
+    
+    def run_polling():
+        while True:
+            try:
+                bot.delete_webhook(drop_pending_updates=True)
+                time.sleep(1)
+                bot.infinity_polling(
+                    timeout=30,
+                    long_polling_timeout=30,
+                    skip_pending=True,
+                    allowed_updates=['message', 'callback_query', 'my_chat_member', 'chat_member']
+                )
+            except Exception as e:
+                err = str(e)
+                if '409' in err:
+                    print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
+                    time.sleep(30)
+                else:
+                    print(f"❌ Ошибка в polling: {e}")
+                    print("🔄 Переподключение через 10 секунд...")
+                    time.sleep(10)
+                    try:
+                        bot.delete_webhook(drop_pending_updates=True)
+                    except:
+                        pass
+    
+    polling_thread = Thread(target=run_polling, daemon=True)
+    polling_thread.start()
+    
+    # ===== FLASK В ГЛАВНОМ ПОТОКЕ =====
     port = int(os.getenv('PORT', 5000))
     print(f"📡 Запускаем Flask сервер на порту {port}...")
     
-    flask_thread = Thread(
-        target=lambda: serve(app, host='0.0.0.0', port=port),
-        daemon=False
-    )
-    flask_thread.start()
-    
-    print("⏳ Ожидаем 3 секунды для запуска Flask...")
-    time.sleep(3)
-    print("✅ Flask сервер запущен и готов принимать запросы")
-    
-    # ===== POLLING В ГЛАВНОМ ПОТОКЕ =====
-    print("🔄 Запускаем polling...")
-    while True:
-        try:
-            bot.delete_webhook(drop_pending_updates=True)
-            time.sleep(1)
-            bot.infinity_polling(
-                timeout=30,
-                long_polling_timeout=30,
-                skip_pending=True,
-                allowed_updates=['message', 'callback_query', 'my_chat_member', 'chat_member']
-            )
-        except Exception as e:
-            err = str(e)
-            if '409' in err:
-                print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
-                time.sleep(30)
-            else:
-                print(f"❌ Ошибка в polling: {e}")
-                print("🔄 Переподключение через 10 секунд...")
-                time.sleep(10)
-                try:
-                    bot.delete_webhook(drop_pending_updates=True)
-                except:
-                    pass
+    # Flask в главном потоке — Render сразу видит порт
+    serve(app, host='0.0.0.0', port=port)
