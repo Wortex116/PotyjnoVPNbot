@@ -178,7 +178,7 @@ USER_NAME_CACHE_TTL = 3600
 # Кэш для ключей
 _keys_cache = None
 _keys_cache_time = 0
-KEYS_CACHE_TTL = 60  # Увеличено с 5 до 60 секунд
+KEYS_CACHE_TTL = 60
 
 # Кэш для бота
 _bot_username = None
@@ -218,25 +218,21 @@ def cleanup_expired_sessions():
     current_time = int(time.time())
     
     with _cache_lock:
-        # captcha_sessions
         to_remove = [uid for uid, session in captcha_sessions.items() 
                      if current_time - session.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del captcha_sessions[uid]
         
-        # search_cache
         to_remove = [uid for uid, cache in search_cache.items() 
                      if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del search_cache[uid]
         
-        # exchange_cache
         to_remove = [uid for uid, cache in exchange_cache.items() 
                      if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del exchange_cache[uid]
         
-        # decrypt_results - проверяем только числовые ключи для лички
         to_remove = []
         for key, session in decrypt_results.items():
             if isinstance(key, int) and current_time - session.get('timestamp', 0) > SESSION_TIMEOUT:
@@ -246,37 +242,31 @@ def cleanup_expired_sessions():
         for key in to_remove:
             del decrypt_results[key]
         
-        # announce_data
         to_remove = [uid for uid, data in announce_data.items() 
                      if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del announce_data[uid]
         
-        # keys_loading
         to_remove = [uid for uid, data in keys_loading.items() 
                      if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del keys_loading[uid]
         
-        # proxy_url_loading
         to_remove = [uid for uid, data in proxy_url_loading.items() 
                      if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del proxy_url_loading[uid]
         
-        # autopost_loading
         to_remove = [uid for uid, data in autopost_loading.items() 
                      if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del autopost_loading[uid]
         
-        # manage_cache
         to_remove = [uid for uid, data in manage_cache.items() 
                      if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
         for uid in to_remove:
             del manage_cache[uid]
     
-    # Очистка _user_name_cache
     with _user_name_cache_lock:
         to_remove = [
             uid for uid, data in _user_name_cache.items()
@@ -285,7 +275,6 @@ def cleanup_expired_sessions():
         for uid in to_remove:
             del _user_name_cache[uid]
     
-    # Очистка _user_blocked_cache
     with _user_blocked_cache_lock:
         to_remove = [
             uid for uid, data in _user_blocked_cache.items()
@@ -717,7 +706,6 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_admin_id ON admin_logs(admin_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created_at ON admin_logs(created_at DESC)")
         
-        # Таблица для согласий пользователей
         cur.execute("""
             CREATE TABLE IF NOT EXISTS user_consents (
                 user_id BIGINT PRIMARY KEY,
@@ -2337,7 +2325,6 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
                 pass
             return
     
-    # Проверяем семафор с таймаутом
     if not _decrypt_thread_semaphore.acquire(timeout=300):
         try:
             bot.reply_to(message, "❌ Сервер перегружен. Попробуйте позже.")
@@ -2840,7 +2827,6 @@ def autopost_scheduler():
                 current_time = int(time.time())
                 if current_time - last_post >= config['interval']:
                     print(f"[autopost_scheduler] Запуск автопостинга (интервал: {config['interval']}с)")
-                    # Запускаем в отдельном потоке, чтобы не блокировать
                     Thread(target=auto_post_keys_to_channel, daemon=True).start()
                     set_setting('autopost_last_post', str(current_time))
             time.sleep(30)
@@ -5531,7 +5517,6 @@ def callback_block(call):
     except:
         pass
     
-    # Очищаем кэш заблокированного пользователя
     with _user_blocked_cache_lock:
         if target_id in _user_blocked_cache:
             del _user_blocked_cache[target_id]
@@ -5566,7 +5551,6 @@ def callback_unblock(call):
     except:
         pass
     
-    # Очищаем кэш разблокированного пользователя
     with _user_blocked_cache_lock:
         if target_id in _user_blocked_cache:
             del _user_blocked_cache[target_id]
@@ -5881,7 +5865,6 @@ def callback_autopost_start(call):
     config['enabled'] = True
     save_autopost_config(config)
     bot.answer_callback_query(call.id, "🚀 Запущен!")
-    # Запускаем автопостинг в отдельном потоке
     Thread(target=auto_post_keys_to_channel, daemon=True).start()
     set_setting('autopost_last_post', str(int(time.time())))
     callback_autopost_back(call)
@@ -6761,7 +6744,6 @@ def handle_group_message(message):
             conn.commit()
             return
         
-        # Включаем ручное управление транзакцией
         conn.autocommit = False
         
         try:
@@ -8361,7 +8343,6 @@ def cmd_block_user(message):
         conn.commit()
         log_admin_action(user_id, f"Заблокировал {target_id}", target_id=target_id)
         bot.reply_to(message, f"🚫 Заблокирован {target_id}")
-        # Очищаем кэш
         with _user_blocked_cache_lock:
             if target_id in _user_blocked_cache:
                 del _user_blocked_cache[target_id]
@@ -8393,7 +8374,6 @@ def cmd_unblock_user(message):
         conn.commit()
         log_admin_action(user_id, f"Разблокировал {target_id}", target_id=target_id)
         bot.reply_to(message, f"✅ Разблокирован {target_id}")
-        # Очищаем кэш
         with _user_blocked_cache_lock:
             if target_id in _user_blocked_cache:
                 del _user_blocked_cache[target_id]
@@ -8913,6 +8893,7 @@ def subscription(token):
         return_db_connection(conn)
 
 # ==================== ЗАПУСК ====================
+
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN не задан!")
@@ -8924,7 +8905,6 @@ if __name__ == "__main__":
     port = int(os.getenv('PORT', 5000))
     
     # ===== FLASK СТАРТУЕТ ПЕРВЫМ В ГЛАВНОМ ПОТОКЕ =====
-    # Render ждёт порт — даём ему порт немедленно
     def delayed_start():
         print("🚀 Запуск бота...")
         init_db_pool()
@@ -8958,7 +8938,6 @@ if __name__ == "__main__":
             Thread(target=keep_alive_ping, daemon=True).start()
             Thread(target=auto_restart_monitor, daemon=True).start()
         
-        # Polling
         while True:
             try:
                 bot.delete_webhook(drop_pending_updates=True)
@@ -8978,11 +8957,8 @@ if __name__ == "__main__":
                     print(f"❌ Polling ошибка: {e}")
                     time.sleep(10)
     
-    # Запускаем всё в фоне
     Thread(target=delayed_start, daemon=True).start()
     
-    # Flask — в главном потоке, порт открывается СРАЗУ
     print(f"📡 Flask на порту {port}...")
     serve(app, host='0.0.0.0', port=port)
     
-if 
