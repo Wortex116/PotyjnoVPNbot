@@ -8913,58 +8913,52 @@ def subscription(token):
         return_db_connection(conn)
 
 # ==================== ЗАПУСК ====================
-
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("❌ BOT_TOKEN не задан в переменных окружения!")
+        print("❌ BOT_TOKEN не задан!")
         sys.exit(1)
     if not DATABASE_URL:
-        print("❌ DATABASE_URL не задан в переменных окружения!")
+        print("❌ DATABASE_URL не задан!")
         sys.exit(1)
     
-    print("🚀 Запуск бота...")
+    port = int(os.getenv('PORT', 5000))
     
-    init_db_pool()
-    
-    try:
-        init_db()
-        print("✅ База данных инициализирована")
-    except Exception as e:
-        print(f"❌ Ошибка инициализации базы данных: {e}")
-        sys.exit(1)
-    
-    ensure_bot_start_time()
-    print("✅ Время запуска сохранено")
-    
-    try:
-        bot.set_my_commands([
-            types.BotCommand("start", "Запустить бота"),
-            types.BotCommand("bonus", "Получить ежедневный бонус"),
-            types.BotCommand("top", "Топ активных участников"),
-            types.BotCommand("rank", "Ваш ранг и баллы"),
-            types.BotCommand("decrypt", "Расшифровать подписку"),
-            types.BotCommand("modhelp", "Помощь по модерации"),
-        ])
-        print("✅ Команды бота установлены")
-    except Exception as e:
-        print(f"[set_commands] Ошибка: {e}")
-    
-    # Запускаем фоновые задачи
-    Thread(target=autopost_scheduler, daemon=True).start()
-    Thread(target=auto_update_keys_scheduler, daemon=True).start()
-    Thread(target=cleanup_sessions_scheduler, daemon=True).start()
-    
-    if os.getenv('RENDER'):
-        print("📡 Запущен на Render, активируем keep-alive")
-        Thread(target=keep_alive_ping, daemon=True).start()
-        Thread(target=auto_restart_monitor, daemon=True).start()
-    
-    print("🤖 Бот готов к запуску!")
-    
-    # ===== ПОЛЛИНГ В ОТДЕЛЬНОМ ПОТОКЕ =====
-    print("🔄 Запускаем polling...")
-    
-    def run_polling():
+    # ===== FLASK СТАРТУЕТ ПЕРВЫМ В ГЛАВНОМ ПОТОКЕ =====
+    # Render ждёт порт — даём ему порт немедленно
+    def delayed_start():
+        print("🚀 Запуск бота...")
+        init_db_pool()
+        
+        try:
+            init_db()
+            print("✅ База данных инициализирована")
+        except Exception as e:
+            print(f"❌ Ошибка БД: {e}")
+            sys.exit(1)
+        
+        ensure_bot_start_time()
+        
+        try:
+            bot.set_my_commands([
+                types.BotCommand("start", "Запустить бота"),
+                types.BotCommand("bonus", "Ежедневный бонус"),
+                types.BotCommand("top", "Топ участников"),
+                types.BotCommand("rank", "Ваш ранг"),
+                types.BotCommand("decrypt", "Расшифровать подписку"),
+                types.BotCommand("modhelp", "Помощь по модерации"),
+            ])
+        except Exception as e:
+            print(f"[set_commands] Ошибка: {e}")
+        
+        Thread(target=autopost_scheduler, daemon=True).start()
+        Thread(target=auto_update_keys_scheduler, daemon=True).start()
+        Thread(target=cleanup_sessions_scheduler, daemon=True).start()
+        
+        if os.getenv('RENDER'):
+            Thread(target=keep_alive_ping, daemon=True).start()
+            Thread(target=auto_restart_monitor, daemon=True).start()
+        
+        # Polling
         while True:
             try:
                 bot.delete_webhook(drop_pending_updates=True)
@@ -8978,23 +8972,17 @@ if __name__ == "__main__":
             except Exception as e:
                 err = str(e)
                 if '409' in err:
-                    print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
+                    print(f"⚠️ Конфликт. Ждём 30 сек...")
                     time.sleep(30)
                 else:
-                    print(f"❌ Ошибка в polling: {e}")
-                    print("🔄 Переподключение через 10 секунд...")
+                    print(f"❌ Polling ошибка: {e}")
                     time.sleep(10)
-                    try:
-                        bot.delete_webhook(drop_pending_updates=True)
-                    except:
-                        pass
     
-    polling_thread = Thread(target=run_polling, daemon=True)
-    polling_thread.start()
+    # Запускаем всё в фоне
+    Thread(target=delayed_start, daemon=True).start()
     
-    # ===== FLASK В ГЛАВНОМ ПОТОКЕ =====
-    port = int(os.getenv('PORT', 5000))
-    print(f"📡 Запускаем Flask сервер на порту {port}...")
-    
-    # Flask в главном потоке — Render сразу видит порт
+    # Flask — в главном потоке, порт открывается СРАЗУ
+    print(f"📡 Flask на порту {port}...")
     serve(app, host='0.0.0.0', port=port)
+    
+if 
