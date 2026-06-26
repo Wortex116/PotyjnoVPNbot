@@ -1,3 +1,4 @@
+```python
 import os
 import sys
 import re
@@ -16,9 +17,10 @@ import urllib3
 from datetime import datetime, timedelta
 from threading import Thread, Lock, Event
 from waitress import serve
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from functools import wraps
 from collections import defaultdict
+import uuid
 
 import telebot
 from telebot import types
@@ -37,6 +39,16 @@ try:
     SOCKS_AVAILABLE = True
 except ImportError:
     SOCKS_AVAILABLE = False
+
+# ==================== ГЛОБАЛЬНЫЕ БЛОКИРОВКИ ====================
+_cache_lock = Lock()
+_subscribe_monitor_lock = Lock()
+_captcha_lock = Lock()
+_keys_lock = Lock()
+_user_name_cache_lock = Lock()
+_last_activity_lock = Lock()
+_autopost_lock = Lock()
+_rate_limit_lock = Lock()
 
 # ==================== MENU BUTTONS ====================
 MENU_BUTTONS = {
@@ -61,10 +73,14 @@ def keep_alive_ping():
         try:
             response = requests.get(f"{url}/ping", timeout=10)
             ping_count += 1
+            if ping_count > 1000000:
+                ping_count = 0
             print(f"[keep_alive] Пинг #{ping_count} в {datetime.now().strftime('%H:%M:%S')}: {response.status_code}")
             requests.get(f"{url}/health", timeout=10)
-        except:
-            pass
+        except SystemExit:
+            break
+        except Exception as e:
+            print(f"[keep_alive] Ошибка пинга: {e}")
         time.sleep(240)
 
 def auto_restart_monitor():
@@ -88,7 +104,6 @@ def auto_restart_monitor():
         except:
             time.sleep(60)
 
-_last_activity_lock = Lock()
 last_activity_time = time.time()
 
 def update_activity():
@@ -108,7 +123,7 @@ AUTO_POST_TOPIC_ID = 461
 AUTO_POST_INTERVAL = 600
 PROXY_LOADING_TIMEOUT = 600
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
 app = Flask(__name__)
 
 # ==================== BASE URL ====================
@@ -120,8 +135,6 @@ def get_bot_base_url():
     if not base_url.startswith(('http://', 'https://')):
         base_url = 'https://' + base_url
     return base_url
-
-BOT_BASE_URL = get_bot_base_url()
 
 # ==================== ПУЛ СОЕДИНЕНИЙ ====================
 db_pool = None
@@ -146,7 +159,7 @@ def return_db_connection(conn):
     elif conn:
         conn.close()
 
-# Активные словари
+# ==================== ПОТОКОБЕЗОПАСНЫЕ СЛОВАРИ ====================
 search_cache = {}
 exchange_cache = {}
 decrypt_results = {}
@@ -156,6 +169,48 @@ captcha_sessions = {}
 autopost_loading = {}
 keys_loading = {}
 proxy_url_loading = {}
+autopost_active = {}
+autopost_history = {}
+
+# Кэш имён пользователей с TTL
+_user_name_cache = {}
+USER_NAME_CACHE_TTL = 3600
+
+# Кэш для ключей
+_keys_cache = None
+_keys_cache_time = 0
+KEYS_CACHE_TTL = 5
+
+# Кэш для бота
+_bot_username = None
+_bot_username_lock = Lock()
+
+# Флаг для автопостинга
+_autopost_running = False
+
+# Кэш заблокированных пользователей
+_user_blocked_cache = {}
+_user_blocked_cache_lock = Lock()
+USER_BLOCKED_CACHE_TTL = 3600
+
+# ==================== ПОТОКОБЕЗОПАСНЫЙ ДОСТУП К КЭШАМ ====================
+
+def safe_get_cache(cache_dict, key, default=None):
+    with _cache_lock:
+        return cache_dict.get(key, default)
+
+def safe_set_cache(cache_dict, key, value):
+    with _cache_lock:
+        cache_dict[key] = value
+
+def safe_del_cache(cache_dict, key):
+    with _cache_lock:
+        if key in cache_dict:
+            del cache_dict[key]
+
+def safe_cache_keys(cache_dict):
+    with _cache_lock:
+        return list(cache_dict.keys())
 
 # ==================== ОЧИСТКА СЕССИЙ ====================
 SESSION_TIMEOUT = 3600
@@ -163,93 +218,93 @@ SESSION_TIMEOUT = 3600
 def cleanup_expired_sessions():
     current_time = int(time.time())
     
-    # Очистка captcha_sessions
-    to_remove = []
-    for user_id, session in captcha_sessions.items():
-        if current_time - session.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del captcha_sessions[user_id]
+    with _cache_lock:
+        # captcha_sessions
+        to_remove = [uid for uid, session in captcha_sessions.items() 
+                     if current_time - session.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del captcha_sessions[uid]
+        
+        # search_cache
+        to_remove = [uid for uid, cache in search_cache.items() 
+                     if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del search_cache[uid]
+        
+        # exchange_cache
+        to_remove = [uid for uid, cache in exchange_cache.items() 
+                     if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del exchange_cache[uid]
+        
+        # decrypt_results - проверяем только числовые ключи для лички
+        to_remove = []
+        for key, session in decrypt_results.items():
+            if isinstance(key, int) and current_time - session.get('timestamp', 0) > SESSION_TIMEOUT:
+                to_remove.append(key)
+            elif isinstance(key, str) and current_time - session.get('timestamp', 0) > SESSION_TIMEOUT:
+                to_remove.append(key)
+        for key in to_remove:
+            del decrypt_results[key]
+        
+        # announce_data
+        to_remove = [uid for uid, data in announce_data.items() 
+                     if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del announce_data[uid]
+        
+        # keys_loading
+        to_remove = [uid for uid, data in keys_loading.items() 
+                     if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del keys_loading[uid]
+        
+        # proxy_url_loading
+        to_remove = [uid for uid, data in proxy_url_loading.items() 
+                     if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del proxy_url_loading[uid]
+        
+        # autopost_loading
+        to_remove = [uid for uid, data in autopost_loading.items() 
+                     if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del autopost_loading[uid]
+        
+        # manage_cache
+        to_remove = [uid for uid, data in manage_cache.items() 
+                     if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT]
+        for uid in to_remove:
+            del manage_cache[uid]
     
-    # Очистка search_cache
-    to_remove = []
-    for user_id, cache in search_cache.items():
-        if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del search_cache[user_id]
-    
-    # Очистка exchange_cache
-    to_remove = []
-    for user_id, cache in exchange_cache.items():
-        if current_time - cache.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del exchange_cache[user_id]
-    
-    # Очистка decrypt_results
-    to_remove = []
-    for user_id, session in decrypt_results.items():
-        if current_time - session.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del decrypt_results[user_id]
-    
-    # Очистка announce_data
-    to_remove = []
-    for user_id, data in announce_data.items():
-        if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del announce_data[user_id]
-    
-    # Очистка keys_loading
-    to_remove = []
-    for user_id, data in keys_loading.items():
-        if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del keys_loading[user_id]
-    
-    # Очистка proxy_url_loading
-    to_remove = []
-    for user_id, data in proxy_url_loading.items():
-        if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del proxy_url_loading[user_id]
-    
-    # Очистка autopost_loading
-    to_remove = []
-    for user_id, data in autopost_loading.items():
-        if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del autopost_loading[user_id]
-    
-    # Очистка manage_cache
-    to_remove = []
-    for user_id, data in manage_cache.items():
-        if current_time - data.get('timestamp', 0) > SESSION_TIMEOUT:
-            to_remove.append(user_id)
-    for user_id in to_remove:
-        del manage_cache[user_id]
+    # Очистка _user_name_cache
+    with _user_name_cache_lock:
+        to_remove = [
+            uid for uid, data in _user_name_cache.items()
+            if current_time - data.get('timestamp', 0) > USER_NAME_CACHE_TTL
+        ]
+        for uid in to_remove:
+            del _user_name_cache[uid]
     
     # Очистка _user_blocked_cache
     with _user_blocked_cache_lock:
         to_remove = [
             uid for uid, data in _user_blocked_cache.items()
-            if current_time - data.get('timestamp', 0) > USER_BLOCKED_CACHE_TTL
+            if current_time - data.get('timestamp', 0) > USER_BLOCKED_CACHE_TTL * 2
         ]
         for uid in to_remove:
             del _user_blocked_cache[uid]
 
 def cleanup_sessions_scheduler():
     print("[cleanup] Запущен планировщик очистки сессий")
+    last_notify = 0
     while True:
         try:
             cleanup_expired_sessions()
-            _notify_expiring_subscriptions()
+            current_time = int(time.time())
+            if current_time - last_notify >= 3600:
+                _notify_expiring_subscriptions()
+                last_notify = current_time
             time.sleep(300)
         except Exception as e:
             print(f"[cleanup] Ошибка: {e}")
@@ -286,10 +341,13 @@ def _notify_expiring_subscriptions():
                 conn.commit()
             except Exception as e:
                 print(f"[notify] Ошибка отправки {user_id}: {e}")
-                conn.rollback()
+                continue
     except Exception as e:
         print(f"[notify] Ошибка: {e}")
-        conn.rollback()
+        try:
+            conn.rollback()
+        except:
+            pass
     finally:
         if cur:
             try:
@@ -399,7 +457,6 @@ ROLE_PRESETS = {
 # ==================== ЛОГИРОВАНИЕ АДМИНОВ ====================
 
 def log_admin_action(admin_id, action, target_id=None, details=None, target_name=None, ip_address=None):
-    """Запись действия админа в лог"""
     try:
         admin_name = get_user_display_name(admin_id)
         if target_id:
@@ -433,12 +490,8 @@ def log_admin_action(admin_id, action, target_id=None, details=None, target_name
         print(f"[log_admin_action] Ошибка: {e}")
 
 # ==================== КЭШ ИМЁН ПОЛЬЗОВАТЕЛЕЙ ====================
-_user_name_cache = {}
-_user_name_cache_lock = Lock()
-USER_NAME_CACHE_TTL = 3600
 
 def get_user_display_name_cached(user_id):
-    """Получение имени пользователя с кэшированием"""
     current_time = int(time.time())
     
     with _user_name_cache_lock:
@@ -466,6 +519,19 @@ def get_user_display_name_cached(user_id):
     
     return name
 
+# ==================== ПОЛУЧЕНИЕ ИМЕНИ БОТА С КЭШЕМ ====================
+
+def get_bot_username():
+    global _bot_username
+    with _bot_username_lock:
+        if not _bot_username:
+            try:
+                _bot_username = bot.get_me().username
+            except Exception as e:
+                print(f"[get_bot_username] Ошибка: {e}")
+                return "potyjnovpnbot"
+        return _bot_username
+
 # ==================== DATABASE ====================
 
 def init_auto_update():
@@ -484,6 +550,8 @@ def init_points_system():
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_frozen INTEGER DEFAULT 0")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS frozen_days_left INTEGER DEFAULT 0")
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS frozen_at BIGINT DEFAULT 0")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS points_today INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS points_today_date INTEGER DEFAULT 0")
         
         cur.execute("""
             CREATE TABLE IF NOT EXISTS points_chats (
@@ -525,6 +593,7 @@ def init_points_system():
         print("[init] ✅ Система баллов инициализирована")
     except Exception as e:
         print(f"[init] Ошибка инициализации системы баллов: {e}")
+        conn.rollback()
     finally:
         try:
             cur.close()
@@ -574,6 +643,7 @@ def init_db():
             print(f"[init] ✅ Создатель {ADMIN_ID} добавлен с ролью Владелец")
         except Exception as e:
             print(f"[init] Ошибка добавления создателя: {e}")
+            conn.rollback()
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS referrals (
@@ -594,7 +664,6 @@ def init_db():
             )
         """)
         
-        # Таблицы для модерации
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chat_settings (
                 chat_id BIGINT PRIMARY KEY,
@@ -633,7 +702,6 @@ def init_db():
             )
         """)
         
-        # Таблица для логов админов
         cur.execute("""
             CREATE TABLE IF NOT EXISTS admin_logs (
                 id SERIAL PRIMARY KEY,
@@ -650,7 +718,23 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_admin_id ON admin_logs(admin_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_admin_logs_created_at ON admin_logs(created_at DESC)")
         
+        # Таблица для согласий пользователей
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_consents (
+                user_id BIGINT PRIMARY KEY,
+                logging_consent BOOLEAN DEFAULT FALSE,
+                consent_given_at BIGINT DEFAULT 0
+            )
+        """)
+        
         conn.commit()
+    except Exception as e:
+        print(f"[init_db] Критическая ошибка: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+        raise
     finally:
         try:
             cur.close()
@@ -711,17 +795,59 @@ def increment_setting(key, by=1):
             pass
         return_db_connection(conn)
 
+# ==================== ПОТОКОБЕЗОПАСНЫЕ КЛЮЧИ ====================
+
 def get_keys_from_db():
-    val = get_setting('vless_keys', '')
-    if not val:
-        return []
-    return [k for k in val.split('|||') if k]
+    global _keys_cache, _keys_cache_time
+    current_time = time.time()
+    
+    with _keys_lock:
+        if _keys_cache is not None and current_time - _keys_cache_time < KEYS_CACHE_TTL:
+            return _keys_cache.copy()
+        
+        val = get_setting('vless_keys', '')
+        if not val:
+            keys = []
+        else:
+            keys = [k for k in val.split('|||') if k]
+        
+        _keys_cache = keys.copy()
+        _keys_cache_time = current_time
+        return keys
 
 def save_keys_to_db(keys):
-    set_setting('vless_keys', '|||'.join(keys))
+    global _keys_cache, _keys_cache_time
+    cleaned = []
+    seen = set()
+    for k in keys:
+        if k and k not in seen:
+            cleaned.append(k)
+            seen.add(k)
+    
+    with _keys_lock:
+        set_setting('vless_keys', '|||'.join(cleaned))
+        _keys_cache = cleaned.copy()
+        _keys_cache_time = time.time()
+
+def add_key_to_db(key):
+    with _keys_lock:
+        keys = get_keys_from_db()
+        if key not in keys:
+            keys.append(key)
+            save_keys_to_db(keys)
+            return True
+    return False
+
+def remove_key_from_db(key):
+    with _keys_lock:
+        keys = get_keys_from_db()
+        if key in keys:
+            keys.remove(key)
+            save_keys_to_db(keys)
+            return True
+    return False
 
 def generate_subscription_token():
-    """Генерирует случайный токен. Уникальность обеспечивается UNIQUE constraint в БД"""
     chars = string.ascii_letters + string.digits
     return ''.join(random.choices(chars, k=12))
 
@@ -815,13 +941,6 @@ def add_default_channel():
 
 # ==================== AUTO POSTING FUNCTIONS ====================
 
-def remove_used_keys(keys_to_remove):
-    current_keys = get_keys_from_db()
-    for key in keys_to_remove:
-        if key in current_keys:
-            current_keys.remove(key)
-    save_keys_to_db(current_keys)
-
 def get_autopost_config():
     return {
         'enabled': get_setting('autopost_enabled', 'true') == 'true',
@@ -912,14 +1031,16 @@ def _resolve_url(raw_url):
     return raw_url
 
 def _safe_request(url, timeout=30, headers=None):
-    session = requests.Session()
+    session = None
     try:
         if headers is None:
             headers = {'User-Agent': 'Mozilla/5.0'}
+        session = requests.Session()
         resp = session.get(url, timeout=timeout, headers=headers, verify=False, allow_redirects=True)
         return resp
     finally:
-        session.close()
+        if session:
+            session.close()
 
 def load_keys_from_url(raw_url):
     url = _resolve_url(raw_url)
@@ -938,6 +1059,7 @@ def load_keys_from_url(raw_url):
     }
     content = None
     for verify in [True, False]:
+        session = None
         try:
             session = requests.Session()
             resp = session.get(
@@ -951,8 +1073,12 @@ def load_keys_from_url(raw_url):
             if resp.status_code == 200:
                 content = resp.text
                 break
-        except:
+        except Exception as e:
+            print(f"[load_keys_from_url] Ошибка (verify={verify}): {e}")
             continue
+        finally:
+            if session:
+                session.close()
     if not content:
         return []
     visited = {url}
@@ -1438,8 +1564,14 @@ def _parse_keys_from_content(content, depth=0, visited_urls=None):
     
     url_counter = 0
     MAX_URLS_PER_PARSE = 5
+    MAX_URL_LOAD_TIME = 60  # общий таймаут на загрузку всех URL
+    
+    url_start_time = time.time()
     
     for line in content.splitlines():
+        if time.time() - url_start_time > MAX_URL_LOAD_TIME:
+            break
+            
         line = line.strip()
         if not line:
             continue
@@ -1456,18 +1588,22 @@ def _parse_keys_from_content(content, depth=0, visited_urls=None):
                     break
                 if url in visited_urls:
                     continue
-                visited_urls.add(url)
                 try:
                     resp = _safe_request(url, timeout=10, headers={'User-Agent': 'v2rayNG/1.8.7'})
+                    final_url = resp.url if hasattr(resp, 'url') else url
+                    if final_url in visited_urls:
+                        continue
+                    visited_urls.add(final_url)
                     if resp.status_code == 200:
                         all_keys.extend(_parse_keys_from_content(resp.text, depth + 1, visited_urls))
                     url_counter += 1
-                except:
+                except Exception as e:
+                    print(f"[_parse_keys_from_content] Ошибка загрузки {url}: {e}")
                     pass
     
     return _dedup(all_keys)
 
-# ==================== CHECKS ====================
+# ==================== ЧЕКИ С ПОДПИСКОЙ ====================
 
 def is_subscribed(user_id):
     try:
@@ -1494,12 +1630,23 @@ def get_subscription_link(user_id):
             return None
         
         if token:
-            return f"{BOT_BASE_URL}/sub/{token}"
+            base_url = get_bot_base_url()
+            return f"{base_url}/sub/{token}"
         
         token = generate_subscription_token()
-        cur.execute("UPDATE users SET token = %s WHERE user_id = %s", (token, user_id))
+        cur.execute("""
+            UPDATE users SET token = %s 
+            WHERE user_id = %s AND token IS NULL
+            RETURNING token
+        """, (token, user_id))
+        result = cur.fetchone()
+        if not result:
+            cur.execute("SELECT token FROM users WHERE user_id = %s", (user_id,))
+            result = cur.fetchone()
+            token = result[0] if result else token
         conn.commit()
-        return f"{BOT_BASE_URL}/sub/{token}"
+        base_url = get_bot_base_url()
+        return f"{base_url}/sub/{token}"
     except Exception as e:
         print(f"[get_subscription_link] Ошибка: {e}")
         return None
@@ -1678,19 +1825,21 @@ SUBSCRIBE_LIMIT = 100
 SUBSCRIBE_BAN_TIME = 3600
 
 def check_subscribe_rate():
-    current_time = int(time.time())
-    SUBSCRIBE_MONITOR['timestamps'] = [t for t in SUBSCRIBE_MONITOR['timestamps'] if current_time - t < 60]
-    count = len(SUBSCRIBE_MONITOR['timestamps'])
-    if current_time < SUBSCRIBE_MONITOR['blocked_until']:
-        remaining = SUBSCRIBE_MONITOR['blocked_until'] - current_time
-        return False, f"⏳ Подписки заблокированы. Осталось {remaining//60} мин."
-    if count > SUBSCRIBE_LIMIT:
-        SUBSCRIBE_MONITOR['blocked_until'] = current_time + SUBSCRIBE_BAN_TIME
-        return False, "⚠️ Слишком много подписок. Попробуйте через час."
-    return True, "OK"
+    with _subscribe_monitor_lock:
+        current_time = int(time.time())
+        SUBSCRIBE_MONITOR['timestamps'] = [t for t in SUBSCRIBE_MONITOR['timestamps'] if current_time - t < 60]
+        count = len(SUBSCRIBE_MONITOR['timestamps'])
+        if current_time < SUBSCRIBE_MONITOR['blocked_until']:
+            remaining = SUBSCRIBE_MONITOR['blocked_until'] - current_time
+            return False, f"⏳ Подписки заблокированы. Осталось {remaining//60} мин."
+        if count > SUBSCRIBE_LIMIT:
+            SUBSCRIBE_MONITOR['blocked_until'] = current_time + SUBSCRIBE_BAN_TIME
+            return False, "⚠️ Слишком много подписок. Попробуйте через час."
+        return True, "OK"
 
 def add_subscribe_record(user_id):
-    SUBSCRIBE_MONITOR['timestamps'].append(int(time.time()))
+    with _subscribe_monitor_lock:
+        SUBSCRIBE_MONITOR['timestamps'].append(int(time.time()))
 
 # ==================== РЕФЕРАЛЬНАЯ СИСТЕМА ====================
 
@@ -1701,16 +1850,23 @@ def process_referral(referrer_id, referred_id):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referred_id,))
-        if not cur.fetchone():
-            return False, "Реферал не зарегистрирован в боте"
-        
-        if not is_subscribed(referred_id):
-            return False, "Реферал не подписан на канал"
-        
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (referrer_id,))
-        if not cur.fetchone():
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (referrer_id,))
+        referrer_exists = cur.fetchone()
+        if not referrer_exists:
             return False, "Реферер не найден"
+        
+        cur.execute("SELECT user_id, is_blocked FROM users WHERE user_id = %s FOR UPDATE", (referred_id,))
+        referred = cur.fetchone()
+        if not referred:
+            return False, "Реферал не зарегистрирован в боте"
+        if referred[1] == 1:
+            return False, "Реферал заблокирован"
+        
+        referrer_subscribed = is_subscribed(referrer_id)
+        referred_subscribed = is_subscribed(referred_id)
+        
+        if not referred_subscribed:
+            return False, "Реферал не подписан на канал"
         
         today_start = int(time.time()) - 24 * 60 * 60
         cur.execute(
@@ -1721,25 +1877,26 @@ def process_referral(referrer_id, referred_id):
         if count >= 10:
             return False, "Лимит рефералов (10 в день) превышен"
         
-        cur.execute(
-            "SELECT * FROM referrals WHERE referrer_id = %s AND referred_id = %s",
-            (referrer_id, referred_id)
-        )
-        if cur.fetchone():
-            return False, "Этот пользователь уже был приглашен"
-        
         current_time = int(time.time())
-        cur.execute(
-            "INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded, referrer_subscribed, referred_subscribed) VALUES (%s, %s, %s, 0, %s, %s)",
-            (referrer_id, referred_id, current_time, 1 if is_subscribed(referrer_id) else 0, 1)
-        )
-        conn.commit()
-        if is_subscribed(referrer_id):
-            cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
+        try:
+            cur.execute("""
+                INSERT INTO referrals (referrer_id, referred_id, reward_date, rewarded, referrer_subscribed, referred_subscribed) 
+                VALUES (%s, %s, %s, 0, %s, %s)
+            """, (referrer_id, referred_id, current_time, 1 if referrer_subscribed else 0, 1))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            if 'unique' in str(e).lower():
+                return False, "Этот пользователь уже был приглашен"
+            raise
+        
+        if referrer_subscribed:
+            cur.execute("SELECT subscription_end FROM users WHERE user_id = %s FOR UPDATE", (referrer_id,))
             ref_result = cur.fetchone()
             if ref_result:
                 new_end = ref_result[0] + 3 * 24 * 60 * 60
-                cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, referrer_id))
+                cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", 
+                           (new_end, referrer_id))
                 cur.execute(
                     "UPDATE referrals SET rewarded = 1 WHERE referrer_id = %s AND referred_id = %s",
                     (referrer_id, referred_id)
@@ -1750,13 +1907,24 @@ def process_referral(referrer_id, referred_id):
                 except:
                     pass
                 return True, "Реферал добавлен, начислено +3 дня"
+        
+        conn.commit()
         return True, "Реферал сохранен"
-    finally:
+    except Exception as e:
+        print(f"[process_referral] Ошибка: {e}")
         try:
-            cur.close()
+            conn.rollback()
         except:
             pass
-        return_db_connection(conn)
+        return False, f"Ошибка: {e}"
+    finally:
+        try:
+            if cur:
+                cur.close()
+        except:
+            pass
+        if conn:
+            return_db_connection(conn)
 
 # ==================== ADMIN FUNCTIONS ====================
 
@@ -1859,10 +2027,8 @@ def build_user_list_keyboard(users, page, filter_type='all'):
         cur = conn.cursor()
         try:
             placeholders = ','.join(['%s'] * len(page_users))
-            cur.execute(
-                f"SELECT user_id, subscription_end, is_blocked FROM users WHERE user_id IN ({placeholders})",
-                tuple(page_users)
-            )
+            query = "SELECT user_id, subscription_end, is_blocked FROM users WHERE user_id IN ({})".format(placeholders)
+            cur.execute(query, tuple(page_users))
             user_data = {row[0]: row for row in cur.fetchall()}
         finally:
             try:
@@ -2111,14 +2277,14 @@ def _show_proxy_menu(chat_id, message_id, user_id):
 
 def handle_proxy_url_input(message):
     user_id = message.from_user.id
-    if user_id not in proxy_url_loading:
-        return
-    
-    session = proxy_url_loading[user_id]
-    if int(time.time()) - session.get('timestamp', 0) > PROXY_LOADING_TIMEOUT:
-        del proxy_url_loading[user_id]
-        bot.reply_to(message, "⏰ Время сессии истекло. Начните заново через меню.")
-        return
+    with _cache_lock:
+        if user_id not in proxy_url_loading:
+            return
+        session = proxy_url_loading.get(user_id, {})
+        if int(time.time()) - session.get('timestamp', 0) > PROXY_LOADING_TIMEOUT:
+            del proxy_url_loading[user_id]
+            bot.reply_to(message, "⏰ Время сессии истекло. Начните заново через меню.")
+            return
     
     text = (message.text or '').strip()
     if not text:
@@ -2140,10 +2306,13 @@ def handle_proxy_url_input(message):
         bot.reply_to(message, "❌ Не найдено ни одной ссылки.")
         return
     
-    proxy_url_loading[user_id]['urls'].extend(all_found)
-    proxy_url_loading[user_id]['urls'] = list(dict.fromkeys(proxy_url_loading[user_id]['urls']))
-    
-    total = len(proxy_url_loading[user_id]['urls'])
+    with _cache_lock:
+        if user_id in proxy_url_loading:
+            proxy_url_loading[user_id]['urls'].extend(all_found)
+            proxy_url_loading[user_id]['urls'] = list(dict.fromkeys(proxy_url_loading[user_id]['urls']))
+            total = len(proxy_url_loading[user_id]['urls'])
+        else:
+            total = 0
     added = len(all_found)
     
     bot.reply_to(
@@ -2160,15 +2329,28 @@ DECRYPT_MAX_THREADS = 10
 _decrypt_thread_semaphore = threading.Semaphore(DECRYPT_MAX_THREADS)
 
 def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
-    if user_id in decrypt_results:
-        del decrypt_results[user_id]
+    with _cache_lock:
+        existing = decrypt_results.get(user_id, {})
+        if existing.get('waiting', False):
+            try:
+                bot.reply_to(message, "⏳ У вас уже выполняется расшифровка. Подождите...")
+            except:
+                pass
+            return
+    
+    task_id = str(uuid.uuid4())
+    with _cache_lock:
+        decrypt_results[user_id] = {
+            'waiting': True,
+            'task_id': task_id,
+            'timestamp': int(time.time())
+        }
+    
     try:
         wait_msg = bot.reply_to(message, "⏳ Обрабатываю подписку...")
     except Exception as e:
         print(f"[decrypt] Не удалось создать wait_msg: {e}")
         wait_msg = None
-
-    decrypt_results[user_id] = {'waiting': True, 'timestamp': int(time.time())}
 
     def process():
         with _decrypt_thread_semaphore:
@@ -2252,8 +2434,9 @@ def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
                 except:
                     pass
             finally:
-                if user_id in decrypt_results:
-                    del decrypt_results[user_id]
+                with _cache_lock:
+                    if decrypt_results.get(user_id, {}).get('task_id') == task_id:
+                        del decrypt_results[user_id]
     
     t = threading.Thread(target=process)
     t.daemon = True
@@ -2266,19 +2449,16 @@ def _parse_subscription_any(raw, steps=None):
         steps = []
     text = raw.strip()
 
-    # GITHUB RAW
     if 'github.com' in text and '/blob/' in text:
         text = text.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
         steps.append(f"🔄 GitHub → raw: {text[:60]}...")
 
-    # PASTEBIN
     if 'pastebin.com' in text and '/raw/' not in text:
         paste_id = re.search(r'pastebin\.com/([a-zA-Z0-9]+)', text)
         if paste_id:
             text = f"https://pastebin.com/raw/{paste_id.group(1)}"
             steps.append(f"🔄 Pastebin → raw: {text}")
 
-    # TELEGRA.PH
     if 'telegra.ph' in text:
         steps.append(f"🔗 Обнаружена ссылка Telegra.ph")
         try:
@@ -2296,7 +2476,6 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка Telegra.ph: {e}")
 
-    # NOTION
     if 'notion.so' in text or 'notion.site' in text:
         steps.append(f"🔗 Обнаружена ссылка Notion")
         try:
@@ -2315,7 +2494,6 @@ def _parse_subscription_any(raw, steps=None):
         except Exception as e:
             steps.append(f"❌ Ошибка Notion: {e}")
 
-    # BELKA.NETWORK
     if 'belka.network' in text:
         steps.append(f"🔗 Обнаружена ссылка Belka VPN")
         try:
@@ -2373,7 +2551,6 @@ def _parse_subscription_any(raw, steps=None):
             steps.append(f"❌ Ошибка: {e}")
             return [], steps
 
-    # СХЕМЫ ПРИЛОЖЕНИЙ
     app_scheme_match = re.match(r'^(?:' + APP_SCHEMES + r')://(?:add|sub|crypt\d*|import|install|update|get|fetch)/+(.+)$', text, re.IGNORECASE)
     if app_scheme_match:
         steps.append("📱 Обнаружена схема приложения")
@@ -2405,7 +2582,6 @@ def _parse_subscription_any(raw, steps=None):
             return _dedup(keys), steps
         return [], steps
 
-    # ========== HTTP URL ==========
     if re.match(r'^https?://', text, re.IGNORECASE):
         steps.append(f"⬇️ Загружаю URL: {text[:80]}...")
         
@@ -2565,14 +2741,20 @@ def _do_auto_update_keys():
         all_new_keys = []
         results = []
         
-        for url in url_list:
-            try:
-                keys = load_keys_from_url(url)
-                results.append((url, len(keys), True))
-                all_new_keys.extend(keys)
-            except Exception as e:
-                results.append((url, 0, False))
-                print(f"[auto_update] Ошибка загрузки {url}: {e}")
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            future_map = {executor.submit(load_keys_from_url, url): url for url in url_list}
+            for future in as_completed(future_map, timeout=120):
+                url = future_map[future]
+                try:
+                    keys = future.result(timeout=5)
+                    results.append((url, len(keys), True))
+                    all_new_keys.extend(keys)
+                except FuturesTimeout:
+                    results.append((url, 0, False))
+                    print(f"[auto_update] Таймаут загрузки {url}")
+                except Exception as e:
+                    results.append((url, 0, False))
+                    print(f"[auto_update] Ошибка загрузки {url}: {e}")
         
         all_new_keys = _dedup(all_new_keys)
         
@@ -2595,14 +2777,20 @@ def _do_auto_update_keys():
                     pass
             return
         
-        current_keys = get_keys_from_db()
-        before_count = len(current_keys)
-        merged = _dedup(current_keys + all_new_keys)
-        after_count = len(merged)
-        added_count = after_count - before_count
-        
-        save_keys_to_db(merged)
-        set_setting('auto_update_last', str(current_time))
+        with _keys_lock:
+            current_keys = get_keys_from_db()
+            before_count = len(current_keys)
+            merged_set = set(current_keys)
+            added_count = 0
+            for key in all_new_keys:
+                if key not in merged_set:
+                    merged_set.add(key)
+                    added_count += 1
+            
+            merged = list(merged_set)
+            after_count = len(merged)
+            save_keys_to_db(merged)
+            set_setting('auto_update_last', str(current_time))
         
         print(f"[auto_update] Добавлено {added_count} новых ключей. Всего: {after_count}")
         
@@ -2632,6 +2820,168 @@ def _do_auto_update_keys():
                 pass
     finally:
         _auto_update_event.clear()
+
+# ==================== АВТОПОСТИНГ ====================
+
+def autopost_scheduler():
+    print("[autopost_scheduler] Запущен планировщик автопостинга")
+    while True:
+        try:
+            config = get_autopost_config()
+            if config['enabled']:
+                last_post = int(get_setting('autopost_last_post', '0'))
+                current_time = int(time.time())
+                if current_time - last_post >= config['interval']:
+                    print(f"[autopost_scheduler] Запуск автопостинга (интервал: {config['interval']}с)")
+                    auto_post_keys_to_channel()
+                    set_setting('autopost_last_post', str(current_time))
+            time.sleep(30)
+        except Exception as e:
+            print(f"[autopost_scheduler] Ошибка: {e}")
+            time.sleep(60)
+
+def auto_post_keys_to_channel():
+    global _autopost_running
+    with _autopost_lock:
+        if _autopost_running:
+            print("[autopost] Уже запущен, пропускаем")
+            return
+        _autopost_running = True
+    
+    try:
+        config = get_autopost_config()
+        if not config['enabled']:
+            return
+        keys = get_keys_from_db()
+        if not keys:
+            return
+        channel_id = config['channel_id']
+        topic_id = config['topic_id']
+        
+        def _check_key(key):
+            match = re.search(r'@([\d\.]+):(\d+)', key)
+            if not match:
+                return None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex((match.group(1), int(match.group(2))))
+                sock.close()
+                return key if result == 0 else None
+            except:
+                return None
+
+        working = []
+        keys_to_check = keys[:20]
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(_check_key, k): k for k in keys_to_check}
+            try:
+                for future in as_completed(futures, timeout=15):
+                    result = future.result()
+                    if result:
+                        working.append(result)
+                    if len(working) >= 5:
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        break
+            except TimeoutError:
+                print("[autopost] Таймаут проверки ключей")
+
+        if not working:
+            key_to_post = keys_to_check[0] if keys_to_check else None
+        else:
+            key_to_post = working[0]
+        
+        current_keys = get_keys_from_db()
+        if key_to_post not in current_keys:
+            key_to_post = current_keys[0] if current_keys else None
+        
+        if not key_to_post:
+            return
+        
+        key = key_to_post
+        
+        latency = 0
+        match = re.search(r'@([\d\.]+):(\d+)', key)
+        if match:
+            try:
+                start = time.time()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect_ex((match.group(1), int(match.group(2))))
+                sock.close()
+                latency = int((time.time() - start) * 1000)
+            except:
+                latency = 0
+        
+        name = "VPN Server"
+        country_emoji = "🌍"
+        country_name = "Unknown"
+        
+        name_match = re.search(r'#([^#\s]+)$', key)
+        if name_match:
+            raw_name = name_match.group(1)
+            try:
+                decoded_name = urllib.parse.unquote(raw_name)
+                decoded_name = re.sub(r'\|.*$', '', decoded_name)
+                decoded_name = re.sub(r'@\w+', '', decoded_name)
+                decoded_name = decoded_name.strip()
+                if decoded_name:
+                    name = decoded_name
+            except:
+                pass
+        
+        ip_match = re.search(r'@([^:]+):(\d+)', key)
+        ip = ip_match.group(1) if ip_match else "Unknown"
+        
+        protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
+        protocol = protocol_match.group(1).upper() if protocol_match else "VLESS"
+        
+        protocol_icons = {
+            'VLESS': '🔹', 'VMESS': '🔸', 'TROJAN': '🟣', 'SS': '🟢',
+            'SSR': '🟡', 'HYSTERIA': '🟠', 'TUIC': '🔵', 'WIREGUARD': '🟩',
+        }
+        proto_icon = protocol_icons.get(protocol, '🔹')
+        
+        speed = "100+ Mbps"
+        
+        moscow_time = datetime.now() + timedelta(hours=3)
+        
+        formatted = (
+            f"🚀 #1 | {country_emoji} {country_name}\n\n"
+            f"┌ 🏷 Название: {name}\n"
+            f"├ 🔗 Протокол: {proto_icon} {protocol}\n"
+            f"├ 📡 Пинг: {latency} ms\n"
+            f"├ ⚡ Скорость: {speed}\n"
+            f"├ 🌍 Город: {country_name}\n"
+            f"└ 🏢 Провайдер: {ip}\n\n"
+            f"🔑 Ключ для подключения:\n"
+            f"`{key}`\n\n"
+            f"⏱ Проверено: {moscow_time.strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot\n"
+            f"🔗 @ciorsa"
+        )
+        
+        try:
+            if topic_id:
+                bot.send_message(channel_id, formatted, parse_mode="Markdown", message_thread_id=topic_id)
+            else:
+                bot.send_message(channel_id, formatted, parse_mode="Markdown")
+            
+            # Удаляем ключ атомарно
+            with _keys_lock:
+                current_keys = get_keys_from_db()
+                if key_to_post in current_keys:
+                    current_keys.remove(key_to_post)
+                    save_keys_to_db(current_keys)
+                    increment_setting('total_keys_issued', 1)
+                    
+        except Exception as e:
+            print(f"[autopost] Ошибка отправки: {e}")
+            
+    finally:
+        with _autopost_lock:
+            _autopost_running = False
 
 # ==================== ОБРАБОТЧИКИ КНОПОК МЕНЮ ====================
 
@@ -2886,12 +3236,13 @@ def callback_exchange_points(call):
             bot.answer_callback_query(call.id, "❌ Недостаточно баллов")
             return
         
-        exchange_cache[user_id] = {
-            'exchange_days': 1,
-            'max_days': days_available,
-            'points': points,
-            'timestamp': int(time.time())
-        }
+        with _cache_lock:
+            exchange_cache[user_id] = {
+                'exchange_days': 1,
+                'max_days': days_available,
+                'points': points,
+                'timestamp': int(time.time())
+            }
         
         _show_exchange_panel(call, user_id, 1, days_available, points)
         bot.answer_callback_query(call.id)
@@ -2971,8 +3322,9 @@ def callback_exchange_action(call):
         conn = get_db_connection()
         cur = conn.cursor()
         try:
+            # Атомарное списание с проверкой
             cur.execute(
-                "SELECT points, subscription_end, is_frozen FROM users WHERE user_id = %s",
+                "SELECT points, subscription_end, is_frozen FROM users WHERE user_id = %s FOR UPDATE",
                 (user_id,)
             )
             result = cur.fetchone()
@@ -3001,8 +3353,16 @@ def callback_exchange_action(call):
             
             cur.execute("""
                 UPDATE users SET points = %s, subscription_end = %s, notified_3days = 0
-                WHERE user_id = %s
-            """, (new_points, new_end, user_id))
+                WHERE user_id = %s AND points = %s
+                RETURNING points
+            """, (new_points, new_end, user_id, points))
+            
+            updated = cur.fetchone()
+            if not updated:
+                conn.rollback()
+                bot.answer_callback_query(call.id, "❌ Баланс изменился. Попробуйте ещё раз.")
+                return
+            
             conn.commit()
             
             bot.answer_callback_query(call.id, f"✅ +{days} дней!")
@@ -3015,10 +3375,11 @@ def callback_exchange_action(call):
                 f"📅 Подписка до: {datetime.fromtimestamp(new_end).strftime('%d.%m.%Y')}"
             )
             
-            if user_id in exchange_cache:
-                exchange_cache[user_id]['points'] = new_points
-                exchange_cache[user_id]['max_days'] = new_points // rank['cost']
-                exchange_cache[user_id]['timestamp'] = int(time.time())
+            with _cache_lock:
+                if user_id in exchange_cache:
+                    exchange_cache[user_id]['points'] = new_points
+                    exchange_cache[user_id]['max_days'] = new_points // rank['cost']
+                    exchange_cache[user_id]['timestamp'] = int(time.time())
             
             try:
                 bot.edit_message_text(
@@ -3028,6 +3389,13 @@ def callback_exchange_action(call):
             except:
                 bot.send_message(user_id, text, parse_mode="Markdown")
             
+        except Exception as e:
+            print(f"[exchange] Ошибка: {e}")
+            try:
+                conn.rollback()
+            except:
+                pass
+            bot.answer_callback_query(call.id, "❌ Ошибка при обмене")
         finally:
             try:
                 cur.close()
@@ -3042,7 +3410,8 @@ def callback_exchange_action(call):
         bot.answer_callback_query(call.id)
         return
     
-    cached = exchange_cache.get(user_id, {})
+    with _cache_lock:
+        cached = exchange_cache.get(user_id, {})
     cache_age = int(time.time()) - cached.get('timestamp', 0)
     
     if cache_age > 60 or not cached.get('points'):
@@ -3054,12 +3423,13 @@ def callback_exchange_action(call):
             if result:
                 points = result[0] or 0
                 max_days = get_days_available(points)
-                exchange_cache[user_id] = {
-                    'exchange_days': days,
-                    'max_days': max_days,
-                    'points': points,
-                    'timestamp': int(time.time())
-                }
+                with _cache_lock:
+                    exchange_cache[user_id] = {
+                        'exchange_days': days,
+                        'max_days': max_days,
+                        'points': points,
+                        'timestamp': int(time.time())
+                    }
         finally:
             try:
                 cur.close()
@@ -3067,13 +3437,16 @@ def callback_exchange_action(call):
                 pass
             return_db_connection(conn)
     
-    cached = exchange_cache.get(user_id, {})
-    max_days = cached.get('max_days', 1)
-    points = cached.get('points', 0)
+    with _cache_lock:
+        cached = exchange_cache.get(user_id, {})
+        max_days = cached.get('max_days', 1)
+        points = cached.get('points', 0)
     
     days = max(1, min(days, max_days))
-    exchange_cache[user_id]['exchange_days'] = days
-    exchange_cache[user_id]['timestamp'] = int(time.time())
+    with _cache_lock:
+        if user_id in exchange_cache:
+            exchange_cache[user_id]['exchange_days'] = days
+            exchange_cache[user_id]['timestamp'] = int(time.time())
     
     _show_exchange_panel(call, user_id, days, max_days, points)
     bot.answer_callback_query(call.id)
@@ -3136,7 +3509,10 @@ def cmd_decrypt(message):
                     "❌ Не удалось найти VPN ключи\n\n"
                     f"Шаги:\n{info}"
                 )
-                bot.edit_message_text(err_text, chat_id, wait_msg.message_id)
+                try:
+                    bot.edit_message_text(err_text, chat_id, wait_msg.message_id)
+                except:
+                    pass
                 return
             
             proto_stats = {}
@@ -3170,12 +3546,13 @@ def cmd_decrypt(message):
                     f"📋 Показать все ({len(keys)} ключей)",
                     callback_data=f"decrypt_show_all_{user_id}_{chat_id}_{wait_msg.message_id}"
                 ))
-                decrypt_results[user_id] = {
-                    'keys': keys,
-                    'chat_id': chat_id,
-                    'message_id': wait_msg.message_id,
-                    'timestamp': int(time.time())
-                }
+                with _cache_lock:
+                    decrypt_results[f"{user_id}_{chat_id}"] = {
+                        'keys': keys,
+                        'chat_id': chat_id,
+                        'message_id': wait_msg.message_id,
+                        'timestamp': int(time.time())
+                    }
             
             try:
                 bot.edit_message_text(
@@ -3189,20 +3566,19 @@ def cmd_decrypt(message):
                 bot.send_message(chat_id, result_text, parse_mode="Markdown")
                 
         except Exception as e:
+            print(f"[decrypt] Ошибка: {e}")
             try:
                 bot.edit_message_text(
-                    f"❌ Ошибка: {e}",
+                    "❌ Произошла ошибка при обработке подписки.",
                     chat_id,
                     wait_msg.message_id
                 )
             except:
-                bot.send_message(chat_id, f"❌ Ошибка: {e}")
+                bot.send_message(chat_id, "❌ Произошла ошибка при обработке подписки.")
     
     t = threading.Thread(target=process_decrypt)
     t.daemon = True
     t.start()
-
-# ==================== ОБРАБОТЧИК КНОПКИ "ПОКАЗАТЬ ВСЕ" ====================
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('decrypt_show_all_'))
 def callback_decrypt_show_all(call):
@@ -3215,8 +3591,10 @@ def callback_decrypt_show_all(call):
         bot.answer_callback_query(call.id, "❌ Это не ваша расшифровка")
         return
     
-    cached = decrypt_results.get(user_id, {})
-    keys = cached.get('keys', [])
+    cache_key = f"{user_id}_{chat_id}"
+    with _cache_lock:
+        cached = decrypt_results.get(cache_key, {})
+        keys = cached.get('keys', [])
     
     if not keys:
         bot.answer_callback_query(call.id, "❌ Ключи не найдены или истекли")
@@ -3515,7 +3893,7 @@ def callback_unfreeze_sub(call):
         """, (new_sub_end, new_token, user_id))
         conn.commit()
         
-        new_link = f"{BOT_BASE_URL}/sub/{new_token}"
+        new_link = f"{get_bot_base_url()}/sub/{new_token}"
         
     finally:
         try:
@@ -3543,162 +3921,518 @@ def callback_unfreeze_sub(call):
     except:
         bot.send_message(user_id, text, parse_mode="Markdown")
 
-# ==================== АВТОПОСТИНГ ====================
+# ==================== ОБРАБОТЧИКИ РЕФЕРАЛОВ ====================
 
-def autopost_scheduler():
-    print("[autopost_scheduler] Запущен планировщик автопостинга")
-    while True:
-        try:
-            config = get_autopost_config()
-            if config['enabled']:
-                last_post = int(get_setting('autopost_last_post', '0'))
-                current_time = int(time.time())
-                if current_time - last_post >= config['interval']:
-                    print(f"[autopost_scheduler] Запуск автопостинга (интервал: {config['interval']}с)")
-                    auto_post_keys_to_channel()
-                    set_setting('autopost_last_post', str(current_time))
-            time.sleep(30)
-        except Exception as e:
-            print(f"[autopost_scheduler] Ошибка: {e}")
-            time.sleep(60)
-
-def auto_post_keys_to_channel():
-    config = get_autopost_config()
-    if not config['enabled']:
+@bot.message_handler(func=lambda m: m.text == "👥 Рефералы")
+def referrals(message):
+    update_activity()
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
         return
-    keys = get_keys_from_db()
-    if not keys:
-        return
-    channel_id = config['channel_id']
-    topic_id = config['topic_id']
-    
-    def _check_key(key):
-        match = re.search(r'@([\d\.]+):(\d+)', key)
-        if not match:
-            return None
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+        if not cur.fetchone():
+            bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
+            return
+        cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
+        total = cur.fetchone()[0]
+        today_start = int(time.time()) - 24 * 60 * 60
+        cur.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_date > %s",
+            (user_id, today_start)
+        )
+        today = cur.fetchone()[0]
+        bot_username = get_bot_username()
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+        text = f"👥 *Рефералы*\n\n📊 Всего: {total}\n📅 Сегодня: {today} / 10\n\n🔗 Ссылка: `{ref_link}`\n\n📌 За каждого друга +3 дня."
+        bot.reply_to(message, text, parse_mode="Markdown")
+    finally:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            result = sock.connect_ex((match.group(1), int(match.group(2))))
-            sock.close()
-            return key if result == 0 else None
-        except:
-            return None
-
-    working = []
-    keys_to_check = keys[:20]
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(_check_key, k): k for k in keys_to_check}
-        try:
-            for future in as_completed(futures, timeout=15):
-                result = future.result()
-                if result:
-                    working.append(result)
-                if len(working) >= 5:
-                    for f in futures:
-                        if not f.done():
-                            f.cancel()
-                    break
-        except TimeoutError:
-            print("[autopost] Таймаут проверки ключей")
-
-    if not working:
-        key_to_post = keys_to_check[0] if keys_to_check else None
-    else:
-        key_to_post = working[0]
-    
-    current_keys = get_keys_from_db()
-    if key_to_post not in current_keys:
-        key_to_post = current_keys[0] if current_keys else None
-    
-    if not key_to_post:
-        return
-    
-    key = key_to_post
-    
-    latency = 0
-    match = re.search(r'@([\d\.]+):(\d+)', key)
-    if match:
-        try:
-            start = time.time()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2)
-            sock.connect_ex((match.group(1), int(match.group(2))))
-            sock.close()
-            latency = int((time.time() - start) * 1000)
-        except:
-            latency = 0
-    
-    name = "VPN Server"
-    country_emoji = "🌍"
-    country_name = "Unknown"
-    
-    name_match = re.search(r'#([^#\s]+)$', key)
-    if name_match:
-        raw_name = name_match.group(1)
-        try:
-            decoded_name = urllib.parse.unquote(raw_name)
-            decoded_name = re.sub(r'\|.*$', '', decoded_name)
-            decoded_name = re.sub(r'@\w+', '', decoded_name)
-            decoded_name = decoded_name.strip()
-            if decoded_name:
-                name = decoded_name
+            cur.close()
         except:
             pass
-    
-    ip_match = re.search(r'@([^:]+):(\d+)', key)
-    ip = ip_match.group(1) if ip_match else "Unknown"
-    
-    protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
-    protocol = protocol_match.group(1).upper() if protocol_match else "VLESS"
-    
-    protocol_icons = {
-        'VLESS': '🔹', 'VMESS': '🔸', 'TROJAN': '🟣', 'SS': '🟢',
-        'SSR': '🟡', 'HYSTERIA': '🟠', 'TUIC': '🔵', 'WIREGUARD': '🟩',
-    }
-    proto_icon = protocol_icons.get(protocol, '🔹')
-    
-    speed = "100+ Mbps"
-    
-    moscow_time = datetime.now() + timedelta(hours=3)
-    
-    formatted = (
-        f"🚀 #1 | {country_emoji} {country_name}\n\n"
-        f"┌ 🏷 Название: {name}\n"
-        f"├ 🔗 Протокол: {proto_icon} {protocol}\n"
-        f"├ 📡 Пинг: {latency} ms\n"
-        f"├ ⚡ Скорость: {speed}\n"
-        f"├ 🌍 Город: {country_name}\n"
-        f"└ 🏢 Провайдер: {ip}\n\n"
-        f"🔑 Ключ для подключения:\n"
-        f"`{key}`\n\n"
-        f"⏱ Проверено: {moscow_time.strftime('%H:%M:%S')} | 🤖 @Potyjno_vpn_bot\n"
-        f"🔗 @ciorsa"
-    )
-    
+        return_db_connection(conn)
+
+@bot.message_handler(func=lambda m: m.text == "🏆 Топ рефералов")
+def top_referrals(message):
+    update_activity()
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        if topic_id:
-            bot.send_message(channel_id, formatted, parse_mode="Markdown", message_thread_id=topic_id)
-        else:
-            bot.send_message(channel_id, formatted, parse_mode="Markdown")
-        
-        # Атомарное удаление после успешной отправки
+        cur.execute("SELECT referrer_id, COUNT(*) FROM referrals GROUP BY referrer_id ORDER BY COUNT(*) DESC LIMIT 10")
+        rows = cur.fetchall()
+        if not rows:
+            bot.reply_to(message, "📭 Нет рефералов.")
+            return
+        text = "🏆 *Топ рефералов:*\n\n"
+        medals = ['🥇', '🥈', '🥉']
+        for i, (ref_id, count) in enumerate(rows):
+            name = get_user_display_name_cached(ref_id)
+            icon = medals[i] if i < 3 else f"{i+1}."
+            text += f"{icon} {name} — {count} реф.\n"
+        bot.reply_to(message, text, parse_mode="Markdown")
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Стаж бота")
+def bot_stats_command(message):
+    update_activity()
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    stats = get_bot_stats()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()[0]
+        text = (
+            f"📊 *Статистика*\n\n"
+            f"⏳ Стаж: {stats['uptime_text']}\n"
+            f"👥 Пользователей: {total_users}\n"
+            f"📦 Ключей: {stats['current_keys']}\n"
+            f"🔑 Проверено: {stats['total_keys_checked']}\n"
+            f"🔓 Расшифровано: {stats['total_decryptions']}"
+        )
+        bot.reply_to(message, text, parse_mode="Markdown")
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
+def decrypt_subscription_start(message):
+    update_activity()
+    if message.chat.type != 'private':
+        return
+    user_id = message.from_user.id
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+    with _cache_lock:
+        if user_id in decrypt_results:
+            del decrypt_results[user_id]
+        decrypt_results[user_id] = {'waiting': True, 'timestamp': int(time.time())}
+    bot.reply_to(
+        message,
+        "🔓 *Расшифровка VPN подписки*\n\n"
+        "Отправьте ссылку, текст или файл подписки.\n\n"
+        "Поддерживаю:\n"
+        "• URL подписки\n"
+        "• Base64 (все уровни)\n"
+        "• HTML/JSON\n"
+        "• Схемы: happ://, incy:// и др.\n"
+        "• Файлы с ключами\n\n"
+        "📄 Получите `.txt` файл со всеми ключами.\n\n"
+        "❗ Чтобы выйти из режима расшифровки - нажмите /cancel",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(func=lambda m: m.text == "❓ Поддержка")
+def support(message):
+    bot.reply_to(message, f"💬 Поддержка: {SUPPORT}")
+
+# ==================== ОБРАБОТЧИКИ КОПИРОВАНИЯ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_link_'))
+def callback_copy_link(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+
+    if user_id != target_id:
+        bot.answer_callback_query(call.id, "❌ Это не ваша ссылка.")
+        return
+
+    link = get_subscription_link(user_id)
+    if not link:
+        bot.answer_callback_query(call.id, "❌ Подписка заморожена или недоступна.")
+        return
+
+    bot.send_message(
+        user_id,
+        f"📋 *Обычная ссылка:*\n\n`{link}`\n\nНажмите на сообщение и скопируйте текст.",
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, "✅ Ссылка отправлена!")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_yandex_'))
+def callback_copy_yandex(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+
+    if user_id != target_id:
+        bot.answer_callback_query(call.id, "❌ Это не ваша ссылка.")
+        return
+
+    link = get_subscription_link(user_id)
+    if not link:
+        bot.answer_callback_query(call.id, "❌ Подписка заморожена или недоступна.")
+        return
+    
+    yandex_link = f"https://translate.yandex.ru/translate?url={link}"
+
+    bot.send_message(
+        user_id,
+        f"🔄 *Ссылка для белых списков:*\n\n`{yandex_link}`\n\nНажмите на сообщение и скопируйте текст.\n\nℹ️ Ссылка автообновляется при белых списках.",
+        parse_mode="Markdown"
+    )
+    bot.answer_callback_query(call.id, "✅ Ссылка для белых списков отправлена!")
+
+# ==================== ОБРАБОТЧИКИ СТАРТА И КАПЧИ ====================
+
+@bot.message_handler(commands=['start'])
+def cmd_start(message):
+    update_activity()
+    if message.chat.type != 'private':
+        bot.reply_to(message, "⚠️ Бот работает только в личных сообщениях.")
+        return
+
+    user_id = message.from_user.id
+    current_time = int(time.time())
+
+    if is_blocked(user_id):
+        bot.reply_to(message, blocked_message())
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+        existing_user = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    if existing_user:
+        if not is_subscribed(user_id):
+            bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
+            return
         conn = get_db_connection()
         cur = conn.cursor()
         try:
-            current_keys = get_keys_from_db()
-            if key_to_post in current_keys:
-                current_keys.remove(key_to_post)
-                save_keys_to_db(current_keys)
-                increment_setting('total_keys_issued', 1)
+            cur.execute("SELECT last_activity FROM users WHERE user_id = %s", (user_id,))
+            result = cur.fetchone()
+            if result:
+                last_activity = result[0] or 0
+                days_since_last = (current_time - last_activity) // (24 * 60 * 60)
+                welcome_text = "👋 С возвращением!" if days_since_last >= 3 else "👋 Добро пожаловать!"
+                cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (current_time, user_id))
+                conn.commit()
+                bot.reply_to(message, welcome_text)
         finally:
             try:
                 cur.close()
             except:
                 pass
             return_db_connection(conn)
+        bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
+        return
+
+    with _captcha_lock:
+        if user_id in captcha_sessions:
+            session = captcha_sessions[user_id]
+            if int(time.time()) - session['timestamp'] < CAPTCHA_TIMEOUT:
+                bot.reply_to(
+                    message,
+                    "⏳ Вы уже проходите капчу. Нажмите кнопку ниже.",
+                    reply_markup=types.InlineKeyboardMarkup().add(
+                        types.InlineKeyboardButton("✅ Я НЕ РОБОТ", callback_data=f"captcha_verify_{user_id}")
+                    )
+                )
+                return
+            else:
+                del captcha_sessions[user_id]
+
+    ok, msg = check_subscribe_rate()
+    if not ok:
+        bot.reply_to(message, f"⚠️ {msg}")
+        return
+
+    add_subscribe_record(user_id)
+
+    referrer_id = None
+    if message.text:
+        parts = message.text.strip().split()
+        if len(parts) > 1:
+            for part in parts:
+                if part.startswith('ref_'):
+                    try:
+                        ref = int(part[4:])
+                        if ref != user_id:
+                            referrer_id = ref
+                        break
+                    except ValueError:
+                        continue
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("✅ Я НЕ РОБОТ", callback_data=f"captcha_verify_{user_id}"))
+
+    msg = bot.reply_to(
+        message,
+        "🤖 *Пожалуйста, подтвердите, что вы не робот*\n\n"
+        "Нажмите кнопку ниже для проверки.\n"
+        f"⏱ У вас {CAPTCHA_TIMEOUT//60} минут.",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+    with _captcha_lock:
+        captcha_sessions[user_id] = {
+            'timestamp': int(time.time()),
+            'message_id': msg.message_id,
+            'referrer_id': referrer_id,
+            'waiting_for_sub': False
+        }
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('captcha_verify_'))
+def callback_captcha_verify(call):
+    user_id = int(call.data.split('_')[2])
+    if call.from_user.id != user_id:
+        bot.answer_callback_query(call.id, "❌ Это не ваша капча.")
+        return
+    
+    with _captcha_lock:
+        if user_id not in captcha_sessions:
+            bot.answer_callback_query(call.id, "❌ Сессия истекла. Нажмите /start")
+            return
+        session = captcha_sessions[user_id]
+        current_time = int(time.time())
+        if current_time - session['timestamp'] > CAPTCHA_TIMEOUT:
+            del captcha_sessions[user_id]
+            bot.answer_callback_query(call.id, "⏰ Время вышло. Нажмите /start")
+            return
+    
+    try:
+        bot.delete_message(call.message.chat.id, session['message_id'])
+    except:
+        pass
+    bot.answer_callback_query(call.id, "✅ Капча пройдена!")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+        already_registered = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    if already_registered:
+        with _captcha_lock:
+            if user_id in captcha_sessions:
+                del captcha_sessions[user_id]
+        bot.send_message(user_id, "👋 Вы уже зарегистрированы!")
+        bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
+        return
+
+    if is_subscribed(user_id):
+        bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
+        with _captcha_lock:
+            referrer_id = captcha_sessions.get(user_id, {}).get('referrer_id')
+            if user_id in captcha_sessions:
+                del captcha_sessions[user_id]
+        _register_user(user_id, referrer_id)
+    else:
+        bot.send_message(
+            user_id,
+            "⚠️ Подпишитесь на канал, чтобы завершить регистрацию.\n\n"
+            "После подписки нажмите кнопку ниже.",
+            reply_markup=subscribe_button()
+        )
+        with _captcha_lock:
+            if user_id in captcha_sessions:
+                captcha_sessions[user_id]['waiting_for_sub'] = True
+
+@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
+def callback_check_sub(call):
+    update_activity()
+    if call.message.chat.type != 'private':
+        bot.answer_callback_query(call.id, "⚠️ Работает только в личных сообщениях.")
+        return
+    user_id = call.from_user.id
+    current_time = int(time.time())
+    if is_blocked(user_id):
+        bot.answer_callback_query(call.id, "🚫 Вы заблокированы.")
+        return
+    if is_subscribed(user_id):
+        bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        
+        with _captcha_lock:
+            if user_id in captcha_sessions and captcha_sessions[user_id].get('waiting_for_sub'):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+                    already_registered = cur.fetchone()
+                finally:
+                    try:
+                        cur.close()
+                    except:
+                        pass
+                    return_db_connection(conn)
+                
+                if already_registered:
+                    del captcha_sessions[user_id]
+                    bot.send_message(user_id, "👋 Вы уже зарегистрированы!")
+                    bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
+                    return
+                
+                session = captcha_sessions[user_id]
+                del captcha_sessions[user_id]
+                bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
+                _register_user(user_id, session.get('referrer_id'))
+                return
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
+                (user_id,)
+            )
+            pending = cur.fetchone()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        if pending:
+            referrer_id = pending[0]
+            if is_subscribed(referrer_id):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT subscription_end FROM users WHERE user_id = %s FOR UPDATE", (referrer_id,))
+                    ref_result = cur.fetchone()
+                    if ref_result:
+                        new_end = ref_result[0] + 3 * 24 * 60 * 60
+                        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", 
+                                   (new_end, referrer_id))
+                        cur.execute("UPDATE referrals SET rewarded = 1 WHERE referred_id = %s", (user_id,))
+                        conn.commit()
+                        try:
+                            bot.send_message(referrer_id, "🎉 Ваш реферал подтвердил подписку! Вам начислено +3 дня.")
+                        except:
+                            pass
+                finally:
+                    try:
+                        cur.close()
+                    except:
+                        pass
+                    return_db_connection(conn)
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+            user_exists = cur.fetchone()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        if not user_exists:
+            _register_user(user_id, None)
+        else:
+            bot.send_message(user_id, "👋 Добро пожаловать!")
+            bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
+    else:
+        bot.answer_callback_query(call.id, "❌ Вы ещё не подписались на канал!")
+
+# ==================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ====================
+
+def _register_user(user_id, referrer_id=None):
+    current_time = int(time.time())
+    registered = False
+    conn = None
+    cur = None
+    
+    for attempt in range(5):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT user_id FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
+            existing = cur.fetchone()
+            
+            if existing:
+                registered = True
+                break
+            
+            token = generate_subscription_token()
+            sub_end = current_time + 7 * 24 * 60 * 60
+            cur.execute("""
+                INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) 
+                VALUES (%s, %s, %s, 0, %s)
+            """, (user_id, sub_end, current_time, token))
+            conn.commit()
+            registered = True
+            break
+        except Exception as e:
+            conn.rollback()
+            if 'unique' in str(e).lower() and 'token' in str(e).lower():
+                print(f"[_register_user] Конфликт токена, попытка {attempt+1}")
+                continue
+            print(f"[_register_user] Ошибка: {e}")
+            break
+        finally:
+            try:
+                if cur:
+                    cur.close()
+            except:
+                pass
+            if conn:
+                return_db_connection(conn)
+    
+    if not registered:
+        print(f"[_register_user] Не удалось зарегистрировать {user_id}")
+        return
+    
+    try:
+        chat = bot.get_chat(user_id)
+        if chat.username:
+            update_user_username(user_id, chat.username)
+    except:
+        pass
+    
+    if referrer_id:
+        success, msg = process_referral(referrer_id, user_id)
+        if success:
+            try:
+                bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {get_user_display_name_cached(user_id)} зарегистрировался по вашей ссылке.")
+            except:
+                pass
+    
+    try:
+        bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
+        bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
     except Exception as e:
-        print(f"[autopost] Ошибка: {e}")
+        print(f"[_register_user] Ошибка отправки приветствия: {e}")
 
 # ==================== ADMIN CALLBACK (ОБЪЕДИНЁННЫЙ) ====================
 
@@ -3714,7 +4448,6 @@ def admin_callback(call):
         return
     data = call.data
 
-    # ========== НАВИГАЦИЯ ==========
     if data == "admin_back":
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -3738,7 +4471,6 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         return
 
-    # ========== РАССЫЛКА ==========
     if data == "admin_announce":
         if not has_permission(user_id, 'announce'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3761,7 +4493,6 @@ def admin_callback(call):
                            parse_mode="Markdown", reply_markup=kb)
         return
 
-    # ========== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ==========
     if data == "admin_manage_users":
         if not has_permission(user_id, 'manage_users'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3785,11 +4516,12 @@ def admin_callback(call):
             except:
                 bot.send_message(user_id, "📭 Нет пользователей.")
             return
-        manage_cache[user_id] = {
-            'users': users, 
-            'filter': 'all',
-            'timestamp': int(time.time())
-        }
+        with _cache_lock:
+            manage_cache[user_id] = {
+                'users': users, 
+                'filter': 'all',
+                'timestamp': int(time.time())
+            }
         kb = build_user_list_keyboard(users, 0, 'all')
         try:
             bot.edit_message_text(
@@ -3801,7 +4533,6 @@ def admin_callback(call):
             bot.send_message(user_id, f"👥 Пользователи ({len(users)}):", reply_markup=kb)
         return
 
-    # ========== УПРАВЛЕНИЕ КЛЮЧАМИ ==========
     if data == "admin_keys":
         if not has_permission(user_id, 'manage_keys'):
             bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление ключами.")
@@ -3810,7 +4541,6 @@ def admin_callback(call):
         show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
         return
 
-    # ========== АВТОПОСТИНГ ==========
     if data == "admin_autopost":
         if not has_permission(user_id, 'autopost'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3839,7 +4569,6 @@ def admin_callback(call):
             bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
         return
 
-    # ========== УПРАВЛЕНИЕ АДМИНАМИ ==========
     if data == "admin_manage_admins":
         if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
@@ -3890,14 +4619,16 @@ def admin_callback(call):
         if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
-        if user_id in search_cache:
-            del search_cache[user_id]
+        with _cache_lock:
+            if user_id in search_cache:
+                del search_cache[user_id]
         role = data.split('_')[3]
-        search_cache[user_id] = {
-            'action': 'add_admin',
-            'role': role,
-            'timestamp': int(time.time())
-        }
+        with _cache_lock:
+            search_cache[user_id] = {
+                'action': 'add_admin',
+                'role': role,
+                'timestamp': int(time.time())
+            }
         bot.answer_callback_query(call.id, f"✅ Выбрана роль: {ROLE_PRESETS[role]['name']}")
         bot.send_message(
             user_id,
@@ -3928,7 +4659,6 @@ def admin_callback(call):
         )
         return
 
-    # ========== СИСТЕМА БАЛЛОВ ==========
     if data == "admin_points_system":
         if not has_permission(user_id, 'points_system'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -3972,7 +4702,8 @@ def admin_callback(call):
             "Узнать ID чата: перешлите любое сообщение из чата боту @userinfobot\n\n"
             "Формат: `-1001234567890`"
         )
-        search_cache[user_id] = {'action': 'add_points_chat', 'timestamp': int(time.time())}
+        with _cache_lock:
+            search_cache[user_id] = {'action': 'add_points_chat', 'timestamp': int(time.time())}
         return
 
     if data.startswith("admin_points_toggle_"):
@@ -4032,7 +4763,6 @@ def admin_callback(call):
         _show_admin_points_chats(call)
         return
 
-    # ========== АВТООБНОВЛЕНИЕ КЛЮЧЕЙ ==========
     if data == "admin_keys_auto_update":
         if not has_permission(user_id, 'manage_keys'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -4095,7 +4825,6 @@ def admin_callback(call):
         t.start()
         return
 
-    # ========== ЛОГИ ==========
     if data == "admin_view_logs":
         if not has_permission(user_id, 'view_logs'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав на просмотр логов")
@@ -4105,6 +4834,1473 @@ def admin_callback(call):
         return
 
     bot.answer_callback_query(call.id)
+
+# ==================== ОБРАБОТЧИКИ ДЛЯ ПРАВ АДМИНОВ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('toggle_perm_'))
+def callback_toggle_perm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    parts = call.data.split('_')
+    if len(parts) < 4:
+        bot.answer_callback_query(call.id, "❌ Ошибка формата")
+        return
+    target_id = int(parts[2])
+    perm_key = '_'.join(parts[3:])
+    
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя редактировать владельца.")
+        return
+    
+    current_perms = get_admin_permissions(target_id)
+    current_perms[perm_key] = not current_perms.get(perm_key, False)
+    update_admin_permissions(target_id, current_perms)
+    
+    log_admin_action(user_id, f"Изменил право {perm_key} у {target_id}", 
+                     target_id=target_id,
+                     details=f"{'вкл' if current_perms[perm_key] else 'выкл'}")
+    
+    bot.answer_callback_query(call.id, 
+        "✅ Включено" if current_perms[perm_key] else "❌ Выключено")
+    _redraw_admin_perms(call, target_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('reset_perm_'))
+def callback_reset_perm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    parts = call.data.split('_')
+    if len(parts) < 3:
+        bot.answer_callback_query(call.id, "❌ Ошибка формата")
+        return
+    target_id = int(parts[2])
+    
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя сбрасывать права владельца.")
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    if not result:
+        bot.answer_callback_query(call.id, "❌ Админ не найден")
+        return
+    
+    role = result[0] or 'junior'
+    default_perms = ROLE_PRESETS.get(role, ROLE_PRESETS['junior'])['permissions'].copy()
+    update_admin_permissions(target_id, default_perms)
+    log_admin_action(user_id, f"Сбросил права {target_id} к роли {role}", target_id=target_id)
+    bot.answer_callback_query(call.id, f"✅ Права сброшены к роли {role}")
+    _redraw_admin_perms(call, target_id)
+
+# ==================== ОБРАБОТЧИКИ ФИЛЬТРОВ И ПАГИНАЦИИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('filter_') or 
+                             call.data.startswith('page_') or
+                             call.data in ('back_to_list', 'close_manage'))
+def callback_user_list_nav(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id) or not has_permission(user_id, 'manage_users'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    data = call.data
+    
+    if data == 'close_manage':
+        bot.answer_callback_query(call.id)
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except:
+            pass
+        return
+    
+    if data == 'back_to_list':
+        bot.answer_callback_query(call.id)
+        with _cache_lock:
+            cached = manage_cache.get(user_id, {})
+            users = cached.get('users', [])
+            filter_type = cached.get('filter', 'all')
+        if not users:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT user_id FROM users ORDER BY user_id")
+                users = [row[0] for row in cur.fetchall()]
+            finally:
+                try:
+                    cur.close()
+                except:
+                    pass
+                return_db_connection(conn)
+            with _cache_lock:
+                manage_cache[user_id] = {
+                    'users': users,
+                    'filter': 'all',
+                    'timestamp': int(time.time())
+                }
+        kb = build_user_list_keyboard(users, 0, filter_type)
+        try:
+            bot.edit_message_text(
+                f"👥 Пользователи ({len(users)}):",
+                call.message.chat.id, call.message.message_id,
+                reply_markup=kb
+            )
+        except:
+            pass
+        return
+    
+    if data.startswith('page_'):
+        parts = data.split('_')
+        if len(parts) < 3:
+            bot.answer_callback_query(call.id, "❌ Ошибка формата")
+            return
+        try:
+            page = int(parts[1])
+        except ValueError:
+            bot.answer_callback_query(call.id, "❌ Ошибка формата")
+            return
+        filter_type = parts[2] if len(parts) > 2 else 'all'
+        with _cache_lock:
+            cached = manage_cache.get(user_id, {})
+            users = cached.get('users', [])
+        if not users:
+            bot.answer_callback_query(call.id, "❌ Список устарел")
+            return
+        kb = build_user_list_keyboard(users, page, filter_type)
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id, call.message.message_id,
+                reply_markup=kb
+            )
+        except:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    current_time = int(time.time())
+    try:
+        if data == 'filter_active':
+            cur.execute("""
+                SELECT user_id FROM users 
+                WHERE is_blocked = 0 AND subscription_end > %s 
+                ORDER BY user_id
+            """, (current_time,))
+            filter_type = 'active'
+        elif data == 'filter_inactive':
+            cur.execute("""
+                SELECT user_id FROM users 
+                WHERE is_blocked = 0 AND (subscription_end IS NULL OR subscription_end <= %s)
+                ORDER BY user_id
+            """, (current_time,))
+            filter_type = 'inactive'
+        elif data == 'filter_admins':
+            cur.execute("""
+                SELECT u.user_id FROM users u
+                INNER JOIN admins a ON u.user_id = a.user_id
+                ORDER BY u.user_id
+            """)
+            filter_type = 'admins'
+        else:
+            cur.execute("SELECT user_id FROM users ORDER BY user_id")
+            filter_type = 'all'
+        
+        users = [row[0] for row in cur.fetchall()]
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    with _cache_lock:
+        manage_cache[user_id] = {
+            'users': users,
+            'filter': filter_type,
+            'timestamp': int(time.time())
+        }
+    
+    kb = build_user_list_keyboard(users, 0, filter_type)
+    try:
+        bot.edit_message_text(
+            f"👥 Пользователи ({len(users)}):",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=kb
+        )
+    except:
+        pass
+    bot.answer_callback_query(call.id)
+
+# ==================== ОБРАБОТЧИКИ УПРАВЛЕНИЯ ПОЛЬЗОВАТЕЛЯМИ ====================
+
+def _refresh_user_card(call, target_id, admin_id):
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT subscription_end, is_blocked, points FROM users WHERE user_id = %s", (target_id,))
+            row = cur.fetchone()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+
+        if not row:
+            return
+
+        subscription_end, blk, pts_val = row
+        pts_val = pts_val or 0
+        current_time = int(time.time())
+        
+        if blk:
+            status = "🚫 Заблокирован"
+        elif subscription_end and subscription_end > current_time:
+            days_left = (subscription_end - current_time) // 86400
+            status = f"🟢 Активен ({days_left} дн)"
+        else:
+            status = "🔴 Неактивен"
+
+        is_admin_user = is_admin(target_id)
+        admin_text = "✅ Да" if is_admin_user else "❌ Нет"
+        name = get_user_display_name_cached(target_id)
+        rank_info = get_rank(pts_val)
+        
+        try:
+            chat = bot.get_chat(target_id)
+            username = f"@{chat.username}" if chat.username else "❌ Нет юзернейма"
+        except:
+            username = "❌ Не найден"
+
+        text = f"""👤 *{name}*
+
+🆔 ID: `{target_id}`
+👤 Юзернейм: {username}
+📊 Статус: {status}
+👑 Админ: {admin_text}
+🪙 Баллов: `{pts_val:,}` — {rank_info['name']}"""
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        if has_permission(admin_id, 'add_days'):
+            kb.add(types.InlineKeyboardButton("✅ Выдать подписку", callback_data=f"give_sub_{target_id}"))
+        if has_permission(admin_id, 'add_days'):
+            kb.add(types.InlineKeyboardButton("📅 +30 дн", callback_data=f"prolong_{target_id}_30"))
+        if has_permission(admin_id, 'remove_days'):
+            kb.add(types.InlineKeyboardButton("📅 -30 дн", callback_data=f"remove_days_{target_id}_30"))
+        if has_permission(admin_id, 'add_days') or has_permission(admin_id, 'remove_days'):
+            kb.add(types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{target_id}"))
+        if has_permission(admin_id, 'block_user'):
+            if blk:
+                kb.add(types.InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock_{target_id}"))
+            else:
+                kb.add(types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{target_id}"))
+        if has_permission(admin_id, 'manage_admins'):
+            if is_admin_user and target_id != ADMIN_ID:
+                kb.add(types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{target_id}"))
+            elif not is_admin_user:
+                kb.add(types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"grant_admin_{target_id}"))
+        
+        if has_permission(admin_id, 'points_system'):
+            kb.row(
+                types.InlineKeyboardButton(f"🪙 +100", callback_data=f"pts_add_{target_id}_100"),
+                types.InlineKeyboardButton(f"🪙 +500", callback_data=f"pts_add_{target_id}_500"),
+                types.InlineKeyboardButton(f"🪙 +1000", callback_data=f"pts_add_{target_id}_1000"),
+            )
+            kb.row(
+                types.InlineKeyboardButton(f"➖ -100", callback_data=f"pts_sub_{target_id}_100"),
+                types.InlineKeyboardButton(f"➖ -500", callback_data=f"pts_sub_{target_id}_500"),
+                types.InlineKeyboardButton(f"🗑 Обнулить", callback_data=f"pts_zero_{target_id}"),
+            )
+            kb.add(
+                types.InlineKeyboardButton(
+                    f"✏️ Установить баллы (сейчас: {pts_val:,})",
+                    callback_data=f"pts_set_{target_id}"
+                )
+            )
+        
+        kb.add(types.InlineKeyboardButton("💬 История сообщений", callback_data=f"user_msg_history_{target_id}"))
+        kb.row(
+            types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
+            types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
+        )
+
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    except Exception as e:
+        print(f"[refresh_card] Ошибка обновления карточки: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('user_') and len(call.data.split('_')) == 2)
+def callback_user_detail(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[1])
+    if not has_permission(user_id, 'manage_users'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление пользователями.")
+        return
+    
+    _refresh_user_card(call, target_id, user_id)
+    bot.answer_callback_query(call.id)
+
+# ==================== ОБРАБОТЧИКИ УПРАВЛЕНИЯ БАЛЛАМИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(('pts_add_', 'pts_sub_', 'pts_zero_', 'pts_set_', 'pts_set_confirm_')))
+def callback_points_manage(call):
+    user_id = call.from_user.id
+    if not is_admin(user_id) or not has_permission(user_id, 'points_system'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+
+    data = call.data
+
+    if data.startswith('pts_set_') and not data.startswith('pts_set_confirm_'):
+        target_id = int(data.split('_')[2])
+        with _cache_lock:
+            search_cache[user_id] = {
+                'action': 'set_points',
+                'target_id': target_id,
+                'timestamp': int(time.time())
+            }
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            user_id,
+            f"✏️ Введите новое количество баллов для пользователя:\n\n"
+            f"Например: `1000`\n\n"
+            f"Или /cancel для отмены.",
+            parse_mode="Markdown"
+        )
+        return
+
+    parts = data.split('_')
+
+    if data.startswith('pts_zero_'):
+        target_id = int(parts[2])
+        amount = None
+        action = 'zero'
+    elif data.startswith('pts_add_'):
+        target_id = int(parts[2])
+        amount = int(parts[3])
+        action = 'add'
+    elif data.startswith('pts_sub_'):
+        target_id = int(parts[2])
+        amount = int(parts[3])
+        action = 'sub'
+    else:
+        bot.answer_callback_query(call.id)
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден")
+            return
+
+        old_points = result[0] or 0
+
+        if action == 'zero':
+            new_points = 0
+            detail = f"Обнулил баллы (было {old_points})"
+        elif action == 'add':
+            new_points = old_points + amount
+            detail = f"+{amount} баллов ({old_points} → {new_points})"
+        else:
+            new_points = max(0, old_points - amount)
+            detail = f"-{amount} баллов ({old_points} → {new_points})"
+
+        cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    log_admin_action(user_id, f"Изменил баллы {target_id}", target_id=target_id, details=detail)
+    bot.answer_callback_query(call.id, f"✅ {detail}")
+
+    try:
+        bot.send_message(
+            target_id,
+            f"🪙 Администратор изменил ваши баллы.\n\n"
+            f"📊 Было: {old_points:,}\n"
+            f"📊 Стало: {new_points:,}\n"
+            f"{get_rank(new_points)['name']}"
+        )
+    except:
+        pass
+
+    _refresh_user_card(call, target_id, user_id)
+
+# ==================== ОБРАБОТЧИКИ GRANT/REMOVE ADMIN ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('grant_admin_'))
+def callback_grant_admin(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
+        return
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Это владелец бота.")
+        return
+    if is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Пользователь уже является админом.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
+        user_exists = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    if not user_exists:
+        bot.answer_callback_query(call.id, "❌ Пользователь не зарегистрирован в боте.")
+        return
+    role = 'junior'
+    perms = ROLE_PRESETS[role]['permissions'].copy()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
+            (target_id, role, json.dumps(perms), user_id, int(time.time()))
+        )
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Назначил админом {target_id}", target_id=target_id, details=f"Роль: {role}")
+    bot.answer_callback_query(call.id, f"✅ {get_user_display_name_cached(target_id)} назначен админом!")
+    try:
+        bot.send_message(target_id, "👑 Вам назначена роль администратора!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
+    except:
+        pass
+
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
+def callback_remove_admin(call):
+    user_id = call.from_user.id
+    target_id = int(call.data.split('_')[2])
+    if not has_permission(user_id, 'manage_admins'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
+        return
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя удалить владельца.")
+        return
+    if not is_admin(target_id):
+        bot.answer_callback_query(call.id, "❌ Пользователь не является админом.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Удалил админа {target_id}", target_id=target_id)
+    bot.answer_callback_query(call.id, "✅ Админ удален!")
+    try:
+        bot.send_message(target_id, "❌ Ваши права администратора были отозваны.")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+# ==================== ОБРАБОТЧИКИ УПРАВЛЕНИЯ ПОДПИСКОЙ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('give_sub_'))
+def callback_give_sub(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'add_days'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на выдачу подписки.")
+        return
+    target_id = int(call.data.split('_')[2])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
+            return
+        current_time = int(time.time())
+        new_end = current_time + 30 * 24 * 60 * 60
+        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Выдал подписку {target_id}", target_id=target_id, details="30 дней")
+    bot.answer_callback_query(call.id, "✅ Выдана подписка на 30 дней!")
+    try:
+        bot.send_message(target_id, f"🎉 Администратор выдал вам подписку на 30 дней!")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
+def callback_prolong(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'add_days'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на выдачу дней.")
+        return
+    parts = call.data.split('_')
+    target_id = int(parts[1])
+    days = int(parts[2])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
+            return
+        current_time = int(time.time())
+        current_end = result[0] if (result[0] and result[0] > current_time) else current_time
+        new_end = current_end + days * 24 * 60 * 60
+        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Продлил подписку {target_id}", target_id=target_id, details=f"+{days} дней")
+    bot.answer_callback_query(call.id, f"✅ Продлено на {days} дней!")
+    try:
+        bot.send_message(target_id, f"🎉 Ваша подписка продлена на {days} дней администратором!")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_days_'))
+def callback_remove_days(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'remove_days'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на забирание дней.")
+        return
+    parts = call.data.split('_')
+    target_id = int(parts[2])
+    days = int(parts[3])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
+        result = cur.fetchone()
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
+            return
+        current_time = int(time.time())
+        current_end = result[0] if (result[0] and result[0] > current_time) else current_time
+        new_end = current_end - days * 24 * 60 * 60
+        if new_end < current_time:
+            new_end = current_time - 1
+        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Забрал дни у {target_id}", target_id=target_id, details=f"-{days} дней")
+    bot.answer_callback_query(call.id, f"✅ Убавлено {days} дней!")
+    try:
+        bot.send_message(target_id, f"⚠️ Администратор забрал {days} дней подписки!")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
+def callback_remove_sub(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'add_days') and not has_permission(user_id, 'remove_days'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на удаление подписки.")
+        return
+    target_id = int(call.data.split('_')[2])
+    current_time = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (current_time - 1, target_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Удалил подписку у {target_id}", target_id=target_id)
+    bot.answer_callback_query(call.id, "✅ Подписка удалена!")
+    try:
+        bot.send_message(target_id, "❌ Ваша подписка была удалена администратором.")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('block_'))
+def callback_block(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'block_user'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на блокировку.")
+        return
+    target_id = int(call.data.split('_')[1])
+    if target_id == ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ Нельзя заблокировать создателя.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET is_blocked = 1 WHERE user_id = %s", (target_id,))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Заблокировал {target_id}", target_id=target_id)
+    bot.answer_callback_query(call.id, "✅ Пользователь заблокирован!")
+    try:
+        bot.send_message(target_id, f"🚫 Вы заблокированы администратором.\n\nОбратитесь в поддержку: {SUPPORT}")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
+def callback_unblock(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'unblock_user'):
+        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на разблокировку.")
+        return
+    target_id = int(call.data.split('_')[1])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("UPDATE users SET is_blocked = 0 WHERE user_id = %s", (target_id,))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    log_admin_action(user_id, f"Разблокировал {target_id}", target_id=target_id)
+    bot.answer_callback_query(call.id, "✅ Пользователь разблокирован!")
+    try:
+        bot.send_message(target_id, "✅ Вы разблокированы! Теперь вы можете пользоваться ботом.")
+    except:
+        pass
+    
+    _refresh_user_card(call, target_id, user_id)
+
+# ==================== ОБРАБОТЧИКИ ИСТОРИИ СООБЩЕНИЙ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('user_msg_history_'))
+def callback_user_msg_history(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    target_id = int(call.data.split('_')[3])
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT l.message_text, l.created_at, l.chat_id
+            FROM chat_messages_log l
+            WHERE l.user_id = %s
+            ORDER BY l.created_at DESC
+            LIMIT 20
+        """, (target_id,))
+        logs = cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    text = f"💬 *История сообщений — {name}*\n\n"
+
+    if not logs:
+        text += "Нет сообщений в логах."
+    else:
+        prev_time = None
+        for msg_text, created_at, chat_id in logs:
+            time_str = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M:%S")
+            if prev_time:
+                delta = created_at - prev_time
+                if delta < 60:
+                    interval = f"{delta}с"
+                elif delta < 3600:
+                    interval = f"{delta // 60}м"
+                else:
+                    interval = f"{delta // 3600}ч {(delta % 3600) // 60}м"
+                text += f"⏱ +{interval}\n"
+            text += f"🕐 {time_str} | чат `{chat_id}`\n"
+            text += f"💬 {msg_text[:100]}{'...' if len(msg_text) > 100 else ''}\n\n"
+            prev_time = created_at
+
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"user_{target_id}"))
+
+    if len(text) > 4000:
+        text = text[:3950] + "\n…"
+
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                              parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(call.from_user.id, text, parse_mode="Markdown", reply_markup=kb)
+    bot.answer_callback_query(call.id)
+
+# ==================== ОБРАБОТЧИКИ РАССЫЛКИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_dm")
+def callback_announce_dm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'announce'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id, "📝 Отправьте текст/медиа")
+    bot.send_message(user_id, "📨 *Рассылка в ЛС*\n\nОтправьте текст или медиа.", parse_mode="Markdown")
+    with _cache_lock:
+        announce_data[user_id] = {'type': 'dm', 'waiting': True, 'timestamp': int(time.time())}
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_channels")
+def callback_announce_channels(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'announce'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id)
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT channel_id, channel_name FROM autopost_channels WHERE enabled = TRUE")
+        channels = cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    if not channels:
+        bot.send_message(user_id, "❌ Нет каналов")
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    for ch_id, ch_name in channels:
+        kb.add(types.InlineKeyboardButton(f"📢 {ch_name}", callback_data=f"announce_to_channel_{ch_id}"))
+    kb.add(types.InlineKeyboardButton("📢 Во все", callback_data="announce_all_channels"))
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel"))
+    bot.send_message(user_id, "📢 *Выберите канал:*", parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('announce_to_channel_'))
+def callback_announce_to_channel(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'announce'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    channel_id = int(call.data.split('_')[3])
+    bot.answer_callback_query(call.id, "📝 Отправьте текст/медиа")
+    bot.send_message(user_id, f"📢 *Объявление в канал*\n\nID: {channel_id}\n\nОтправьте текст или медиа.", parse_mode="Markdown")
+    with _cache_lock:
+        announce_data[user_id] = {'type': 'channel', 'channel_id': channel_id, 'waiting': True, 'timestamp': int(time.time())}
+
+@bot.callback_query_handler(func=lambda call: call.data == "announce_all_channels")
+def callback_announce_all_channels(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'announce'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id, "📝 Отправьте текст/медиа")
+    bot.send_message(user_id, "📢 *Объявление во все каналы*\n\nОтправьте текст или медиа.", parse_mode="Markdown")
+    with _cache_lock:
+        announce_data[user_id] = {'type': 'all_channels', 'waiting': True, 'timestamp': int(time.time())}
+
+def admin_announce_text(message):
+    user_id = message.from_user.id
+    with _cache_lock:
+        if user_id not in announce_data:
+            return
+        data = announce_data.pop(user_id, {})
+    
+    announce_type = data.get('type', 'dm')
+    text = message.text
+    caption = message.caption or ''
+    
+    if announce_type == 'dm':
+        if not text and not message.photo and not message.video and not message.document:
+            bot.reply_to(message, "❌ Отправьте текст или медиа.")
+            return
+        
+        def do_announce():
+            conn = get_db_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT user_id FROM users")
+                users = cur.fetchall()
+            finally:
+                try:
+                    cur.close()
+                except:
+                    pass
+                return_db_connection(conn)
+            sent = 0
+            for (uid,) in users:
+                try:
+                    if is_blocked(uid):
+                        continue
+                    if message.photo:
+                        bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
+                    elif message.video:
+                        bot.send_video(uid, message.video.file_id, caption=caption)
+                    elif message.document:
+                        bot.send_document(uid, message.document.file_id, caption=caption)
+                    else:
+                        bot.send_message(uid, text)
+                    sent += 1
+                    time.sleep(0.05)
+                except:
+                    pass
+            log_admin_action(user_id, f"Сделал рассылку в ЛС", details=f"Отправлено: {sent} пользователей")
+            try:
+                bot.send_message(user_id, f"✅ Отправлено {sent} пользователям")
+            except:
+                pass
+        
+        bot.reply_to(message, "⏳ Рассылка запущена в фоне...")
+        t = Thread(target=do_announce, daemon=True)
+        t.start()
+        
+    elif announce_type == 'channel':
+        channel_id = data.get('channel_id')
+        try:
+            if message.photo:
+                bot.send_photo(channel_id, message.photo[-1].file_id, caption=caption)
+            elif message.video:
+                bot.send_video(channel_id, message.video.file_id, caption=caption)
+            elif message.document:
+                bot.send_document(channel_id, message.document.file_id, caption=caption)
+            else:
+                bot.send_message(channel_id, text)
+            log_admin_action(user_id, f"Отправил объявление в канал {channel_id}")
+            bot.reply_to(message, "✅ Отправлено")
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка: {e}")
+            
+    elif announce_type == 'all_channels':
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT channel_id FROM autopost_channels WHERE enabled = TRUE")
+            channels = cur.fetchall()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        if not channels:
+            bot.reply_to(message, "❌ Нет активных каналов.")
+            return
+        sent = 0
+        for (ch_id,) in channels:
+            try:
+                if message.photo:
+                    bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption)
+                elif message.video:
+                    bot.send_video(ch_id, message.video.file_id, caption=caption)
+                elif message.document:
+                    bot.send_document(ch_id, message.document.file_id, caption=caption)
+                else:
+                    bot.send_message(ch_id, text)
+                sent += 1
+                time.sleep(0.3)
+            except:
+                pass
+        log_admin_action(user_id, f"Сделал рассылку во все каналы", details=f"Отправлено: {sent} каналов")
+        bot.reply_to(message, f"✅ Отправлено в {sent} каналов")
+
+# ==================== ОБРАБОТЧИКИ АВТОПОСТИНГА ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_back")
+def callback_autopost_back(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    
+    config = get_autopost_config()
+    status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
+    text = (
+        f"📡 *АВТОПОСТИНГ*\n\n"
+        f"Статус: {status}\n"
+        f"Интервал: {config['interval'] // 60} мин\n"
+        f"Канал: {config['channel_id']}"
+    )
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="autopost_load_keys"),
+        types.InlineKeyboardButton("🚀 Начать", callback_data="autopost_start"),
+        types.InlineKeyboardButton("⚙️ Канал", callback_data="autopost_channel_settings"),
+        types.InlineKeyboardButton("⏱ Интервал", callback_data="autopost_interval_settings"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
+    )
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_load_keys")
+def callback_autopost_load_keys(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id, "📥 Отправьте ключи")
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Завершить", callback_data="autopost_load_finish"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+    )
+    msg = bot.send_message(user_id, "📥 Отправляйте ключи.\nКогда закончите - нажмите Завершить.", reply_markup=kb)
+    with _cache_lock:
+        autopost_loading[user_id] = {'keys': [], 'message_id': msg.message_id, 'timestamp': int(time.time())}
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_load_finish")
+def callback_autopost_load_finish(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    with _cache_lock:
+        if user_id not in autopost_loading:
+            bot.answer_callback_query(call.id, "❌ Нет загрузки")
+            return
+        keys = autopost_loading[user_id]['keys']
+        del autopost_loading[user_id]
+    if not keys:
+        bot.answer_callback_query(call.id, "❌ Нет ключей")
+        return
+    save_keys_to_db(keys)
+    bot.answer_callback_query(call.id, f"✅ Сохранено {len(keys)}")
+    callback_autopost_back(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_start")
+def callback_autopost_start(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    keys = get_keys_from_db()
+    if not keys:
+        bot.answer_callback_query(call.id, "❌ Нет ключей")
+        return
+    config = get_autopost_config()
+    config['enabled'] = True
+    save_autopost_config(config)
+    bot.answer_callback_query(call.id, "🚀 Запущен!")
+    auto_post_keys_to_channel()
+    set_setting('autopost_last_post', str(int(time.time())))
+    callback_autopost_back(call)
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_channel_settings")
+def callback_autopost_channel_settings(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    config = get_autopost_config()
+    text = (
+        f"⚙️ *Канал*\n\n"
+        f"📢 Текущий: {config['channel_id']}\n"
+        f"📝 Ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}"
+    )
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("📢 Сменить", callback_data="autopost_change_channel"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+    )
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_change_channel")
+def callback_autopost_change_channel(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id, "🔄 Отправьте новый канал")
+    bot.send_message(user_id, "📢 Отправьте ссылку или ID канала.\nПример: `-1001234567890` или `@channel`", parse_mode="Markdown")
+    with _cache_lock:
+        search_cache[user_id] = {'action': 'autopost_set_channel', 'timestamp': int(time.time())}
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_interval_settings")
+def callback_autopost_interval_settings(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    config = get_autopost_config()
+    text = f"⏱ *Интервал*\n\n⏱ Текущий: {config['interval'] // 60} мин"
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("⏱ Изменить", callback_data="autopost_set_interval"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
+    )
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data == "autopost_set_interval")
+def callback_autopost_set_interval(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'autopost'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id, "⏱ Введите минуты")
+    bot.send_message(user_id, "⏱ Введите интервал в минутах (5-1440):", parse_mode="Markdown")
+    with _cache_lock:
+        search_cache[user_id] = {'action': 'autopost_set_interval', 'timestamp': int(time.time())}
+
+# ==================== ОБРАБОТЧИКИ УПРАВЛЕНИЯ КЛЮЧАМИ ====================
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load")
+def callback_admin_keys_load(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id, "📥 Отправьте ключи")
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Завершить", callback_data="admin_keys_load_finish"),
+        types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_load_cancel")
+    )
+    msg = bot.send_message(
+        user_id,
+        "📥 *Загрузка ключей*\n\n"
+        "Отправляйте ключи по одному сообщению.\n"
+        "Поддерживаются:\n"
+        "• Текст с ключами (vless://, vmess:// и др.)\n"
+        "• .txt файл с ключами\n"
+        "• Ссылка на подписку\n\n"
+        "⚠️ *ВНИМАНИЕ:* Новая загрузка ПОЛНОСТЬЮ ЗАМЕНИТ все текущие ключи!\n\n"
+        "Когда закончите - нажмите *✅ Завершить*",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+    with _cache_lock:
+        keys_loading[user_id] = {
+            'keys': [],
+            'message_id': msg.message_id,
+            'timestamp': int(time.time())
+        }
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_finish")
+def callback_admin_keys_load_finish(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    with _cache_lock:
+        if user_id not in keys_loading:
+            bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
+            return
+        keys = keys_loading[user_id]['keys']
+        del keys_loading[user_id]
+    if not keys:
+        bot.answer_callback_query(call.id, "❌ Нет загруженных ключей")
+        return
+    save_keys_to_db(keys)
+    log_admin_action(user_id, f"Загрузил {len(keys)} ключей", details=f"Ключей: {len(keys)}")
+    proto_stats = {}
+    for k in keys:
+        m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+        if m:
+            p = m.group(1).lower()
+            proto_stats[p] = proto_stats.get(p, 0) + 1
+    stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
+    bot.answer_callback_query(call.id, f"✅ Загружено {len(keys)} ключей!")
+    total_in_db = len(get_keys_from_db())
+    try:
+        bot.edit_message_text(
+            f"✅ *Ключи загружены!*\n\n"
+            f"📊 Загружено ключей: {len(keys)}\n"
+            f"📋 По протоколам:\n{stats}\n"
+            f"📦 Всего в базе: {total_in_db}",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+    except:
+        bot.send_message(user_id, 
+            f"✅ *Ключи загружены!*\n\n"
+            f"📊 Загружено ключей: {len(keys)}\n"
+            f"📋 По протоколам:\n{stats}\n"
+            f"📦 Всего в базе: {total_in_db}",
+            parse_mode="Markdown"
+        )
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_cancel")
+def callback_admin_keys_load_cancel(call):
+    user_id = call.from_user.id
+    with _cache_lock:
+        if user_id in keys_loading:
+            del keys_loading[user_id]
+    bot.answer_callback_query(call.id, "❌ Отменено")
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except:
+        pass
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clean_dead")
+def callback_admin_keys_clean_dead(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    keys = get_keys_from_db()
+    if not keys:
+        bot.answer_callback_query(call.id, "❌ Нет ключей для проверки")
+        return
+    bot.answer_callback_query(call.id, "⏳ Проверяю ключи...")
+    alive_keys = []
+    dead_keys = []
+    for key in keys:
+        match = re.search(r'@([\d\.]+):(\d+)', key)
+        if match:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                result = sock.connect_ex((match.group(1), int(match.group(2))))
+                sock.close()
+                if result == 0:
+                    alive_keys.append(key)
+                else:
+                    dead_keys.append(key)
+            except:
+                dead_keys.append(key)
+        else:
+            dead_keys.append(key)
+    save_keys_to_db(alive_keys)
+    log_admin_action(user_id, f"Очистил нерабочие ключи", details=f"Удалено: {len(dead_keys)}, осталось: {len(alive_keys)}")
+    text = (
+        f"🧹 *Очистка нерабочих ключей завершена!*\n\n"
+        f"✅ Оставлено живых: {len(alive_keys)}\n"
+        f"🗑️ Удалено нерабочих: {len(dead_keys)}\n"
+        f"📦 Всего в базе: {len(alive_keys)}"
+    )
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown")
+    time.sleep(2)
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clear_all")
+def callback_admin_keys_clear_all(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id)
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Да, удалить все", callback_data="admin_keys_clear_confirm"),
+        types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_back")
+    )
+    try:
+        bot.edit_message_text(
+            "⚠️ *ВНИМАНИЕ!*\n\n"
+            "Вы уверены, что хотите удалить ВСЕ ключи из базы?\n"
+            "Это действие НЕЛЬЗЯ будет отменить!",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    except:
+        bot.send_message(user_id, "⚠️ Подтвердите удаление всех ключей.", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clear_confirm")
+def callback_admin_keys_clear_confirm(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    count = len(get_keys_from_db())
+    save_keys_to_db([])
+    set_setting('total_keys_issued', '0')
+    log_admin_action(user_id, f"Удалил все ключи", details=f"Удалено: {count} ключей")
+    bot.answer_callback_query(call.id, "🗑️ Все ключи удалены!")
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_back")
+def callback_admin_keys_back(call):
+    user_id = call.from_user.id
+    bot.answer_callback_query(call.id)
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_reset_issued")
+def callback_admin_keys_reset_issued(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    current_issued = int(get_setting('total_keys_issued', '0'))
+    if current_issued == 0:
+        bot.answer_callback_query(call.id, "❌ Выдано 0 ключей, сбрасывать нечего")
+        return
+    set_setting('total_keys_issued', '0')
+    log_admin_action(user_id, f"Сбросил счётчик выданных ключей", details=f"Было: {current_issued}")
+    bot.answer_callback_query(call.id, f"🔄 Сброшено {current_issued} выданных ключей!")
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_menu")
+def callback_admin_keys_proxy_menu(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id)
+    _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_reset")
+def callback_admin_keys_proxy_reset(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    set_setting('proxy_sub_url', '')
+    set_setting('proxy_sub_urls', '')
+    log_admin_action(user_id, "Сбросил прокси ссылки")
+    bot.answer_callback_query(call.id, "✅ Прокси ссылки сброшены!")
+    _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_load")
+def callback_admin_keys_proxy_load(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    bot.answer_callback_query(call.id)
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("✅ Завершить загрузку", callback_data="admin_keys_proxy_finish"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back")
+    )
+    msg = bot.send_message(
+        user_id,
+        "🌐 *Загрузка прокси ссылок*\n\n"
+        "Отправляйте ссылки на подписки по одной.\n"
+        "Можно загрузить несколько ссылок — ключи из всех будут объединены.\n\n"
+        "Поддерживаются:\n"
+        "• Обычные HTTP/HTTPS ссылки на подписки\n"
+        "• Base64-закодированные ссылки\n"
+        "• Схемы приложений (happ://, incy:// и др.)\n\n"
+        "⚠️ Ключи будут *добавлены* к уже существующим в базе.\n\n"
+        "Когда закончите — нажмите *✅ Завершить загрузку*",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+    with _cache_lock:
+        proxy_url_loading[user_id] = {
+            'urls': [],
+            'message_id': msg.message_id,
+            'timestamp': int(time.time())
+        }
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_finish")
+def callback_admin_keys_proxy_finish(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    with _cache_lock:
+        if user_id not in proxy_url_loading:
+            bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
+            return
+        urls = proxy_url_loading[user_id].get('urls', [])
+        del proxy_url_loading[user_id]
+    if not urls:
+        bot.answer_callback_query(call.id, "❌ Нет добавленных ссылок")
+        return
+    bot.answer_callback_query(call.id, f"⏳ Загружаю ключи из {len(urls)} ссылок...")
+    
+    def process_proxy_urls():
+        all_keys = []
+        results = []
+        for url in urls:
+            try:
+                keys = load_keys_from_url(url)
+                results.append((url, len(keys), True))
+                all_keys.extend(keys)
+            except Exception as e:
+                results.append((url, 0, False))
+                print(f"[proxy] Ошибка загрузки {url}: {e}")
+        all_keys = _dedup(all_keys)
+        if not all_keys:
+            try:
+                bot.send_message(
+                    user_id,
+                    "❌ Не удалось извлечь ключи ни из одной ссылки.\n\n"
+                    "Проверьте доступность ссылок и формат подписки."
+                )
+            except:
+                pass
+            return
+        existing_urls = get_setting('proxy_sub_urls', '')
+        all_urls = [u for u in existing_urls.split('|||') if u] if existing_urls else []
+        all_urls.extend(urls)
+        all_urls = list(dict.fromkeys(all_urls))
+        set_setting('proxy_sub_urls', '|||'.join(all_urls))
+        if urls:
+            set_setting('proxy_sub_url', urls[-1])
+        current_keys = get_keys_from_db()
+        merged = _dedup(current_keys + all_keys)
+        save_keys_to_db(merged)
+        log_admin_action(user_id, f"Загрузил ключи из прокси", details=f"Ссылок: {len(urls)}, ключей: {len(all_keys)}")
+        proto_stats = {}
+        for k in all_keys:
+            m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
+            if m:
+                p = m.group(1).lower()
+                proto_stats[p] = proto_stats.get(p, 0) + 1
+        stats_text = '\n'.join(
+            f"  • {p}:// — {c}"
+            for p, c in sorted(proto_stats.items(), key=lambda x: -x[1])
+        )
+        results_text = ""
+        for url, count, ok in results:
+            short_url = url[:45] + "..." if len(url) > 45 else url
+            icon = "✅" if ok else "❌"
+            results_text += f"{icon} {short_url} — {count} ключей\n"
+        report = (
+            f"✅ *Загрузка из прокси завершена!*\n\n"
+            f"🔗 Обработано ссылок: {len(urls)}\n"
+            f"🔑 Новых ключей: {len(all_keys)}\n"
+            f"📦 Всего в базе: {len(merged)}\n\n"
+            f"📋 По протоколам:\n{stats_text}\n\n"
+            f"📊 Результаты по ссылкам:\n{results_text}"
+        )
+        if len(report) > 4000:
+            report = report[:3950].rstrip() + "\n…"
+        try:
+            bot.send_message(user_id, report, parse_mode="Markdown")
+        except:
+            bot.send_message(user_id, report)
+    t = threading.Thread(target=process_proxy_urls)
+    t.daemon = True
+    t.start()
+
+# ==================== ОБРАБОТЧИКИ АВТООБНОВЛЕНИЯ ====================
+
+def _show_auto_update_menu(chat_id, message_id, user_id):
+    enabled = get_setting('auto_update_enabled', 'false') == 'true'
+    interval = get_setting('auto_update_interval', '3')
+    notify = get_setting('auto_update_notify', 'true') == 'true'
+    last = int(get_setting('auto_update_last', '0'))
+    
+    proxy_urls = get_setting('proxy_sub_urls', '')
+    url_count = len([u for u in proxy_urls.split('|||') if u]) if proxy_urls else 0
+    if url_count == 0 and get_setting('proxy_sub_url', ''):
+        url_count = 1
+    
+    status = "✅ ВКЛ" if enabled else "❌ ВЫКЛ"
+    notify_status = "✅ ВКЛ" if notify else "❌ ВЫКЛ"
+    last_str = datetime.fromtimestamp(last).strftime("%d.%m в %H:%M") if last else "Никогда"
+    
+    text = (
+        f"🔄 *Автообновление ключей*\n\n"
+        f"📊 Статус: {status}\n"
+        f"⏱ Интервал: каждые {interval} ч.\n"
+        f"🔗 Прокси ссылок: {url_count}\n"
+        f"🔔 Уведомления: {notify_status}\n"
+        f"🕐 Последнее: {last_str}"
+    )
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "❌ Выключить" if enabled else "✅ Включить",
+            callback_data="admin_auto_update_toggle"
+        ),
+        types.InlineKeyboardButton(
+            f"🔔 Уведомления: {'ВЫКЛ' if notify else 'ВКЛ'}",
+            callback_data="admin_auto_update_notify"
+        ),
+        types.InlineKeyboardButton("▶️ Запустить сейчас", callback_data="admin_auto_update_now"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back")
+    )
+    
+    try:
+        bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
 
 # ==================== ПРОСМОТР ЛОГОВ АДМИНОВ ====================
 
@@ -4320,56 +6516,143 @@ def _show_admin_points_top(call):
     except:
         bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
 
-# ==================== АВТООБНОВЛЕНИЕ - ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+# ==================== ОБРАБОТЧИКИ ВСПОМОГАТЕЛЬНЫХ РЕЖИМОВ ====================
 
-def _show_auto_update_menu(chat_id, message_id, user_id):
-    enabled = get_setting('auto_update_enabled', 'false') == 'true'
-    interval = get_setting('auto_update_interval', '3')
-    notify = get_setting('auto_update_notify', 'true') == 'true'
-    last = int(get_setting('auto_update_last', '0'))
-    
-    proxy_urls = get_setting('proxy_sub_urls', '')
-    url_count = len([u for u in proxy_urls.split('|||') if u]) if proxy_urls else 0
-    if url_count == 0 and get_setting('proxy_sub_url', ''):
-        url_count = 1
-    
-    status = "✅ ВКЛ" if enabled else "❌ ВЫКЛ"
-    notify_status = "✅ ВКЛ" if notify else "❌ ВЫКЛ"
-    last_str = datetime.fromtimestamp(last).strftime("%d.%m в %H:%M") if last else "Никогда"
-    
-    text = (
-        f"🔄 *Автообновление ключей*\n\n"
-        f"📊 Статус: {status}\n"
-        f"⏱ Интервал: каждые {interval} ч.\n"
-        f"🔗 Прокси ссылок: {url_count}\n"
-        f"🔔 Уведомления: {notify_status}\n"
-        f"🕐 Последнее: {last_str}"
-    )
-    
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton(
-            "❌ Выключить" if enabled else "✅ Включить",
-            callback_data="admin_auto_update_toggle"
-        ),
-        types.InlineKeyboardButton(
-            f"🔔 Уведомления: {'ВЫКЛ' if notify else 'ВКЛ'}",
-            callback_data="admin_auto_update_notify"
-        ),
-        types.InlineKeyboardButton("▶️ Запустить сейчас", callback_data="admin_auto_update_now"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back")
-    )
-    
+def handle_autopost_load_keys(message):
+    user_id = message.from_user.id
+    with _cache_lock:
+        if user_id not in autopost_loading:
+            return
+    raw = message.text or message.caption or ''
+    keys = load_keys_from_text(raw) if raw else []
+    if not keys and message.document:
+        try:
+            file = bot.get_file(message.document.file_id)
+            data = bot.download_file(file.file_path)
+            keys = load_keys_from_text(data.decode('utf-8', errors='ignore'))
+        except:
+            pass
+    if keys:
+        with _cache_lock:
+            if user_id in autopost_loading:
+                autopost_loading[user_id]['keys'].extend(keys)
+                autopost_loading[user_id]['keys'] = _dedup(autopost_loading[user_id]['keys'])
+                autopost_loading[user_id]['timestamp'] = int(time.time())
+                total = len(autopost_loading[user_id]['keys'])
+        bot.reply_to(message, f"✅ Загружено {len(keys)}. Всего: {total}")
+    else:
+        bot.reply_to(message, "❌ Не найдено ключей")
+
+def handle_autopost_set_channel(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+    channel_id = None
+    topic_id = 0
+    if 't.me/' in text:
+        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
+        if match:
+            try:
+                chat = bot.get_chat(f"@{match.group(1)}")
+                channel_id = chat.id
+            except:
+                pass
+    if not channel_id:
+        try:
+            channel_id = int(text)
+        except:
+            pass
+    if 'thread_id=' in text:
+        match = re.search(r'thread_id=(\d+)', text)
+        if match:
+            topic_id = int(match.group(1))
+    if not channel_id:
+        bot.reply_to(message, "❌ Не удалось распознать")
+        return
+    config = get_autopost_config()
+    config['channel_id'] = channel_id
+    config['topic_id'] = topic_id
+    save_autopost_config(config)
+    with _cache_lock:
+        if user_id in search_cache:
+            del search_cache[user_id]
+    log_admin_action(user_id, f"Изменил канал автопостинга", details=f"channel_id={channel_id}, topic_id={topic_id}")
+    bot.reply_to(message, f"✅ Канал установлен: {channel_id}")
+
+def handle_autopost_set_interval(message):
+    user_id = message.from_user.id
     try:
-        bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=kb)
+        minutes = int(message.text.strip())
+        if minutes < 5 or minutes > 1440:
+            bot.reply_to(message, "❌ 5-1440 минут")
+            return
+        config = get_autopost_config()
+        config['interval'] = minutes * 60
+        save_autopost_config(config)
+        with _cache_lock:
+            if user_id in search_cache:
+                del search_cache[user_id]
+        log_admin_action(user_id, f"Изменил интервал автопостинга", details=f"{minutes} мин")
+        bot.reply_to(message, f"✅ Интервал: {minutes} мин")
     except:
-        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+        bot.reply_to(message, "❌ Введите число")
+
+def handle_add_admin_input(message):
+    user_id = message.from_user.id
+    if not has_permission(user_id, 'manage_admins'):
+        return
+    target_id = get_user_id_from_input(message.text.strip())
+    if not target_id:
+        bot.reply_to(message, "❌ Неверный ID или юзернейм.")
+        return
+    if target_id == ADMIN_ID:
+        bot.reply_to(message, "❌ Это владелец бота.")
+        return
+    if is_admin(target_id):
+        bot.reply_to(message, "❌ Пользователь уже является админом.")
+        return
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
+        user_exists = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    if not user_exists:
+        bot.reply_to(message, "❌ Пользователь не зарегистрирован в боте.")
+        return
+    with _cache_lock:
+        role = search_cache.get(user_id, {}).get('role', 'junior')
+    perms = ROLE_PRESETS[role]['permissions'].copy()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
+            (target_id, role, json.dumps(perms), user_id, int(time.time()))
+        )
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    with _cache_lock:
+        if user_id in search_cache:
+            del search_cache[user_id]
+    name = get_user_display_name_cached(target_id)
+    log_admin_action(user_id, f"Добавил админа {target_id}", target_id=target_id, details=f"Роль: {role}")
+    bot.reply_to(message, f"✅ {name} (`{target_id}`) назначен {ROLE_PRESETS[role]['name']}!")
+    try:
+        bot.send_message(target_id, f"👑 Вам назначена роль {ROLE_PRESETS[role]['name']}!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
+    except:
+        pass
 
 # ==================== ОБРАБОТЧИКИ ГРУППОВЫХ СООБЩЕНИЙ ====================
-
-_user_blocked_cache = {}
-_user_blocked_cache_lock = Lock()
-USER_BLOCKED_CACHE_TTL = 3600
 
 def is_user_blocked_bot(user_id):
     current_time = int(time.time())
@@ -4380,10 +6663,10 @@ def is_user_blocked_bot(user_id):
             return cached.get('blocked', False)
     
     try:
-        bot.send_chat_action(user_id, 'typing')
+        bot.get_chat(user_id)
         blocked = False
     except Exception as e:
-        if 'blocked' in str(e).lower() or 'deactivated' in str(e).lower():
+        if 'blocked' in str(e).lower() or 'deactivated' in str(e).lower() or 'user not found' in str(e).lower():
             blocked = True
         else:
             blocked = False
@@ -4398,7 +6681,6 @@ def is_user_blocked_bot(user_id):
 
 @bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'])
 def handle_group_message(message):
-    # Игнорируем команды — их обрабатывают отдельные хэндлеры
     if message.text and message.text.startswith('/'):
         return
     
@@ -4423,7 +6705,7 @@ def handle_group_message(message):
         points_per_msg = chat[1]
         
         cur.execute(
-            "SELECT user_id, is_blocked FROM users WHERE user_id = %s",
+            "SELECT user_id, is_blocked, points_today, points_today_date FROM users WHERE user_id = %s",
             (user_id,)
         )
         user = cur.fetchone()
@@ -4442,40 +6724,76 @@ def handle_group_message(message):
         if activity and current_time - activity[0] < 3:
             return
         
+        DAILY_POINTS_LIMIT = 100
+        points_today = user[2] or 0
+        points_today_date = user[3] or 0
+        
+        today_start = current_time - (current_time % 86400)
+        if points_today_date < today_start:
+            points_today = 0
+            points_today_date = today_start
+        
+        if points_today >= DAILY_POINTS_LIMIT:
+            cur.execute("""
+                INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
+                VALUES (%s, %s, 1, %s)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    messages_count = chat_activity.messages_count + 1,
+                    last_message = %s
+            """, (user_id, chat_id, current_time, current_time))
+            conn.commit()
+            return
+        
+        # Включаем ручное управление транзакцией
         conn.autocommit = False
         
-        cur.execute("""
-            INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
-            VALUES (%s, %s, 1, %s)
-            ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                messages_count = chat_activity.messages_count + 1,
-                last_message = %s
-        """, (user_id, chat_id, current_time, current_time))
-        
-        cur.execute(
-            "UPDATE users SET points = points + %s WHERE user_id = %s",
-            (points_per_msg, user_id)
-        )
-        
-        if message.text:
-            log_text = message.text[:500]
+        try:
             cur.execute("""
-                INSERT INTO chat_messages_log 
-                (user_id, chat_id, message_text, message_id, created_at)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (user_id, chat_id, log_text, message.message_id, current_time))
+                INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
+                VALUES (%s, %s, 1, %s)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    messages_count = chat_activity.messages_count + 1,
+                    last_message = %s
+            """, (user_id, chat_id, current_time, current_time))
             
-            cur.execute("""
-                DELETE FROM chat_messages_log 
-                WHERE chat_id = %s AND id NOT IN (
-                    SELECT id FROM chat_messages_log 
-                    WHERE chat_id = %s 
-                    ORDER BY created_at DESC 
-                    LIMIT 1000
+            points_to_add = min(points_per_msg, DAILY_POINTS_LIMIT - points_today)
+            if points_to_add > 0:
+                cur.execute(
+                    "UPDATE users SET points = points + %s, points_today = points_today + %s, points_today_date = %s WHERE user_id = %s",
+                    (points_to_add, points_to_add, today_start, user_id)
                 )
-            """, (chat_id, chat_id))
-        
-        conn.commit()
+            
+            if message.text:
+                log_text = message.text[:500]
+                cur.execute("""
+                    INSERT INTO chat_messages_log 
+                    (user_id, chat_id, message_text, message_id, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, chat_id, log_text, message.message_id, current_time))
+                
+                cur.execute("""
+                    DELETE FROM chat_messages_log 
+                    WHERE chat_id = %s AND id NOT IN (
+                        SELECT id FROM chat_messages_log 
+                        WHERE chat_id = %s 
+                        ORDER BY created_at DESC 
+                        LIMIT 1000
+                    )
+                """, (chat_id, chat_id))
+            
+            conn.commit()
+            
+        except Exception as inner_e:
+            try:
+                conn.rollback()
+            except:
+                pass
+            raise inner_e
+        finally:
+            try:
+                conn.autocommit = True
+            except:
+                pass
         
     except Exception as e:
         print(f"[group_message] Ошибка: {e}")
@@ -4497,7 +6815,49 @@ def handle_group_message(message):
                 pass
             return_db_connection(conn)
 
-# ==================== КОМАНДЫ БОНУС, ТОП, РАНГ ====================
+@bot.message_handler(content_types=['new_chat_members'])
+def handle_new_chat_members(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        return
+    
+    chat_id = message.chat.id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT welcome_text, welcome_enabled FROM chat_settings WHERE chat_id = %s",
+            (chat_id,)
+        )
+        result = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    if not result or not result[0] or not result[1]:
+        return
+    
+    welcome_text, enabled = result
+    if not enabled:
+        return
+    
+    for member in message.new_chat_members:
+        if member.is_bot:
+            continue
+        try:
+            name = member.first_name or member.username or str(member.id)
+            text = welcome_text.format(
+                name=name,
+                chat=message.chat.title or 'чат',
+                id=member.id
+            )
+            bot.send_message(chat_id, text)
+        except Exception as e:
+            print(f"[welcome] Ошибка отправки приветствия: {e}")
+
+# ==================== КОМАНДЫ ГРУППОВЫЕ ====================
 
 DAILY_BONUS_POINTS = 50
 DAILY_BONUS_COOLDOWN = 86400
@@ -4765,7 +7125,7 @@ def cmd_rank(message):
             pass
         return_db_connection(conn)
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ МОДЕРАЦИИ ====================
+# ==================== ФУНКЦИИ МОДЕРАЦИИ ====================
 
 def parse_duration(text):
     if text in ('permanent', 'навсегда', '0'):
@@ -4778,19 +7138,16 @@ def parse_duration(text):
     return value * multipliers[unit]
 
 def is_chat_admin(user_id, chat_id):
-    # Владелец бота и его админы с доступом к панели — имеют доступ везде
     if user_id == ADMIN_ID:
         return True
     if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
         return True
-    # Владелец или администратор чата в Telegram
     try:
         member = bot.get_chat_member(chat_id, user_id)
         if member.status in ['administrator', 'creator']:
             return True
     except:
         pass
-    # Назначен через /chatadmin
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -4806,15 +7163,11 @@ def is_chat_admin(user_id, chat_id):
             pass
         return_db_connection(conn)
 
-
 def is_chat_owner(user_id, chat_id):
-    # Владелец бота — владелец всего
     if user_id == ADMIN_ID:
         return True
-    # Админ бота с доступом к панели
     if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
         return True
-    # Реальный владелец чата в Telegram
     try:
         member = bot.get_chat_member(chat_id, user_id)
         return member.status == 'creator'
@@ -5276,6 +7629,22 @@ def cmd_ban(message):
         bot.reply_to(message, f"❌ Не удалось забанить: {e}")
         return
 
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_mutes (user_id, chat_id, until, reason)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET until = %s, reason = %s
+        """, (target_id, chat_id, until, f"[BAN] {reason}", until, f"[BAN] {reason}"))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
     name = get_user_display_name_cached(target_id)
     duration_text = f"на {duration_str}" if duration else "навсегда"
     bot.reply_to(message,
@@ -5302,6 +7671,18 @@ def cmd_unban(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {e}")
         return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM chat_mutes WHERE user_id = %s AND chat_id = %s AND until = 0", (target_id, chat_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
 
     name = get_user_display_name_cached(target_id)
     bot.reply_to(message, f"✅ *{name}* разбанен.", parse_mode="Markdown")
@@ -5343,7 +7724,7 @@ def cmd_modhelp(message):
     )
     bot.reply_to(message, text, parse_mode="Markdown")
 
-# ==================== НОВЫЕ КОМАНДЫ ДЛЯ ЧАТ-АДМИНОВ ====================
+# ==================== КОМАНДЫ ДЛЯ ЧАТ-АДМИНОВ ====================
 
 @bot.message_handler(commands=['chatadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
 def cmd_chatadmin(message):
@@ -5386,7 +7767,6 @@ def cmd_chatadmin(message):
     name = get_user_display_name_cached(target_id)
     bot.reply_to(message, f"✅ *{name}* назначен чат-администратором.", parse_mode="Markdown")
 
-
 @bot.message_handler(commands=['chatdeadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
 def cmd_chatdeadmin(message):
     user_id = message.from_user.id
@@ -5404,7 +7784,6 @@ def cmd_chatdeadmin(message):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Не даём снять роль 'owner'
         cur.execute(
             "SELECT role FROM chat_admins WHERE user_id = %s AND chat_id = %s",
             (target_id, chat_id)
@@ -5428,7 +7807,6 @@ def cmd_chatdeadmin(message):
 
     name = get_user_display_name_cached(target_id)
     bot.reply_to(message, f"✅ У *{name}* сняты права чат-администратора.", parse_mode="Markdown")
-
 
 @bot.message_handler(commands=['chatadmins'], func=lambda m: m.chat.type in ['group', 'supergroup'])
 def cmd_chatadmins(message):
@@ -5465,18 +7843,14 @@ def cmd_chatadmins(message):
 
 @bot.my_chat_member_handler()
 def handle_bot_added_to_chat(update):
-    """Срабатывает когда бот добавляется в чат или его статус меняется"""
     chat = update.chat
     new_status = update.new_chat_member.status
 
-    # Бот добавлен в группу
     if new_status in ('member', 'administrator') and chat.type in ('group', 'supergroup'):
         chat_id = chat.id
         _register_chat_owner(chat_id)
 
-
 def _register_chat_owner(chat_id):
-    """Находит владельца чата и регистрирует его в chat_admins"""
     try:
         admins = bot.get_chat_administrators(chat_id)
         for member in admins:
@@ -5544,1783 +7918,7 @@ def callback_edit_admin(call):
     _redraw_admin_perms(call, target_id)
     bot.answer_callback_query(call.id)
 
-# ==================== ИСТОРИЯ СООБЩЕНИЙ В КАРТОЧКЕ ПОЛЬЗОВАТЕЛЯ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('user_msg_history_'))
-def callback_user_msg_history(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    target_id = int(call.data.split('_')[3])
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT l.message_text, l.created_at, l.chat_id
-            FROM chat_messages_log l
-            WHERE l.user_id = %s
-            ORDER BY l.created_at DESC
-            LIMIT 20
-        """, (target_id,))
-        logs = cur.fetchall()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    text = f"💬 *История сообщений — {name}*\n\n"
-
-    if not logs:
-        text += "Нет сообщений в логах."
-    else:
-        prev_time = None
-        for msg_text, created_at, chat_id in logs:
-            time_str = datetime.fromtimestamp(created_at).strftime("%d.%m %H:%M:%S")
-            if prev_time:
-                delta = created_at - prev_time
-                if delta < 60:
-                    interval = f"{delta}с"
-                elif delta < 3600:
-                    interval = f"{delta // 60}м"
-                else:
-                    interval = f"{delta // 3600}ч {(delta % 3600) // 60}м"
-                text += f"⏱ +{interval}\n"
-            text += f"🕐 {time_str} | чат `{chat_id}`\n"
-            text += f"💬 {msg_text[:100]}{'...' if len(msg_text) > 100 else ''}\n\n"
-            prev_time = created_at
-
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data=f"user_{target_id}"))
-
-    if len(text) > 4000:
-        text = text[:3950] + "\n…"
-
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                              parse_mode="Markdown", reply_markup=kb)
-    except:
-        bot.send_message(call.from_user.id, text, parse_mode="Markdown", reply_markup=kb)
-    bot.answer_callback_query(call.id)
-
-# ==================== ОБРАБОТЧИК callback_user_detail (С КНОПКАМИ БАЛЛОВ) ====================
-
-def _refresh_user_card(call, target_id, admin_id):
-    """Обновляет карточку пользователя после изменения"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT subscription_end, is_blocked, points FROM users WHERE user_id = %s", (target_id,))
-            row = cur.fetchone()
-        finally:
-            try:
-                cur.close()
-            except:
-                pass
-            return_db_connection(conn)
-
-        if not row:
-            return
-
-        subscription_end, blk, pts_val = row
-        pts_val = pts_val or 0
-        current_time = int(time.time())
-        
-        if blk:
-            status = "🚫 Заблокирован"
-        elif subscription_end and subscription_end > current_time:
-            days_left = (subscription_end - current_time) // 86400
-            status = f"🟢 Активен ({days_left} дн)"
-        else:
-            status = "🔴 Неактивен"
-
-        is_admin_user = is_admin(target_id)
-        admin_text = "✅ Да" if is_admin_user else "❌ Нет"
-        name = get_user_display_name_cached(target_id)
-        rank_info = get_rank(pts_val)
-        
-        try:
-            chat = bot.get_chat(target_id)
-            username = f"@{chat.username}" if chat.username else "❌ Нет юзернейма"
-        except:
-            username = "❌ Не найден"
-
-        text = f"""👤 *{name}*
-
-🆔 ID: `{target_id}`
-👤 Юзернейм: {username}
-📊 Статус: {status}
-👑 Админ: {admin_text}
-🪙 Баллов: `{pts_val:,}` — {rank_info['name']}"""
-
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        if has_permission(admin_id, 'add_days'):
-            kb.add(types.InlineKeyboardButton("✅ Выдать подписку", callback_data=f"give_sub_{target_id}"))
-        if has_permission(admin_id, 'add_days'):
-            kb.add(types.InlineKeyboardButton("📅 +30 дн", callback_data=f"prolong_{target_id}_30"))
-        if has_permission(admin_id, 'remove_days'):
-            kb.add(types.InlineKeyboardButton("📅 -30 дн", callback_data=f"remove_days_{target_id}_30"))
-        if has_permission(admin_id, 'add_days') or has_permission(admin_id, 'remove_days'):
-            kb.add(types.InlineKeyboardButton("🗑️ Удалить подписку", callback_data=f"remove_sub_{target_id}"))
-        if has_permission(admin_id, 'block_user'):
-            if blk:
-                kb.add(types.InlineKeyboardButton("🔓 Разблокировать", callback_data=f"unblock_{target_id}"))
-            else:
-                kb.add(types.InlineKeyboardButton("🔒 Заблокировать", callback_data=f"block_{target_id}"))
-        if has_permission(admin_id, 'manage_admins'):
-            if is_admin_user and target_id != ADMIN_ID:
-                kb.add(types.InlineKeyboardButton("👑 Забрать админку", callback_data=f"remove_admin_{target_id}"))
-            elif not is_admin_user:
-                kb.add(types.InlineKeyboardButton("👑 Выдать админку", callback_data=f"grant_admin_{target_id}"))
-        
-        # --- БАЛЛЫ ---
-        if has_permission(admin_id, 'points_system'):
-            kb.row(
-                types.InlineKeyboardButton(f"🪙 +100", callback_data=f"pts_add_{target_id}_100"),
-                types.InlineKeyboardButton(f"🪙 +500", callback_data=f"pts_add_{target_id}_500"),
-                types.InlineKeyboardButton(f"🪙 +1000", callback_data=f"pts_add_{target_id}_1000"),
-            )
-            kb.row(
-                types.InlineKeyboardButton(f"➖ -100", callback_data=f"pts_sub_{target_id}_100"),
-                types.InlineKeyboardButton(f"➖ -500", callback_data=f"pts_sub_{target_id}_500"),
-                types.InlineKeyboardButton(f"🗑 Обнулить", callback_data=f"pts_zero_{target_id}"),
-            )
-            kb.add(
-                types.InlineKeyboardButton(
-                    f"✏️ Установить баллы (сейчас: {pts_val:,})",
-                    callback_data=f"pts_set_{target_id}"
-                )
-            )
-        
-        kb.add(types.InlineKeyboardButton("💬 История сообщений", callback_data=f"user_msg_history_{target_id}"))
-        kb.row(
-            types.InlineKeyboardButton("🔙 Назад к списку", callback_data="back_to_list"),
-            types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
-        )
-
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    except Exception as e:
-        print(f"[refresh_card] Ошибка обновления карточки: {e}")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('user_') and len(call.data.split('_')) == 2)
-def callback_user_detail(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "❌ Нет доступа.")
-        return
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[1])
-    if not has_permission(user_id, 'manage_users'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление пользователями.")
-        return
-    
-    _refresh_user_card(call, target_id, user_id)
-    bot.answer_callback_query(call.id)
-
-# ==================== КНОПКИ УПРАВЛЕНИЯ БАЛЛАМИ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith(('pts_add_', 'pts_sub_', 'pts_zero_', 'pts_set_', 'pts_set_confirm_')))
-def callback_points_manage(call):
-    user_id = call.from_user.id
-    if not is_admin(user_id) or not has_permission(user_id, 'points_system'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-
-    data = call.data
-
-    # Установить вручную — ждём ввода
-    if data.startswith('pts_set_') and not data.startswith('pts_set_confirm_'):
-        target_id = int(data.split('_')[2])
-        search_cache[user_id] = {
-            'action': 'set_points',
-            'target_id': target_id,
-            'timestamp': int(time.time())
-        }
-        bot.answer_callback_query(call.id)
-        bot.send_message(
-            user_id,
-            f"✏️ Введите новое количество баллов для пользователя:\n\n"
-            f"Например: `1000`\n\n"
-            f"Или /cancel для отмены.",
-            parse_mode="Markdown"
-        )
-        return
-
-    parts = data.split('_')
-
-    if data.startswith('pts_zero_'):
-        target_id = int(parts[2])
-        amount = None
-        action = 'zero'
-    elif data.startswith('pts_add_'):
-        target_id = int(parts[2])
-        amount = int(parts[3])
-        action = 'add'
-    elif data.startswith('pts_sub_'):
-        target_id = int(parts[2])
-        amount = int(parts[3])
-        action = 'sub'
-    else:
-        bot.answer_callback_query(call.id)
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
-        result = cur.fetchone()
-        if not result:
-            bot.answer_callback_query(call.id, "❌ Пользователь не найден")
-            return
-
-        old_points = result[0] or 0
-
-        if action == 'zero':
-            new_points = 0
-            detail = f"Обнулил баллы (было {old_points})"
-        elif action == 'add':
-            new_points = old_points + amount
-            detail = f"+{amount} баллов ({old_points} → {new_points})"
-        else:  # sub
-            new_points = max(0, old_points - amount)
-            detail = f"-{amount} баллов ({old_points} → {new_points})"
-
-        cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    log_admin_action(user_id, f"Изменил баллы {target_id}", target_id=target_id, details=detail)
-    bot.answer_callback_query(call.id, f"✅ {detail}")
-
-    # Уведомляем пользователя
-    try:
-        bot.send_message(
-            target_id,
-            f"🪙 Администратор изменил ваши баллы.\n\n"
-            f"📊 Было: {old_points:,}\n"
-            f"📊 Стало: {new_points:,}\n"
-            f"{get_rank(new_points)['name']}"
-        )
-    except:
-        pass
-
-    # Обновляем карточку
-    _refresh_user_card(call, target_id, user_id)
-
-# ==================== GRANT/REMOVE ADMIN С ОБНОВЛЕНИЕМ КАРТОЧКИ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('grant_admin_'))
-def callback_grant_admin(call):
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[2])
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
-        return
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Это владелец бота.")
-        return
-    if is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Пользователь уже является админом.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
-        user_exists = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    if not user_exists:
-        bot.answer_callback_query(call.id, "❌ Пользователь не зарегистрирован в боте.")
-        return
-    role = 'junior'
-    perms = ROLE_PRESETS[role]['permissions'].copy()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
-            (target_id, role, json.dumps(perms), user_id, int(time.time()))
-        )
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Назначил админом {target_id}", target_id=target_id, details=f"Роль: {role}")
-    bot.answer_callback_query(call.id, f"✅ {get_user_display_name_cached(target_id)} назначен админом!")
-    try:
-        bot.send_message(target_id, "👑 Вам назначена роль администратора!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
-    except:
-        pass
-
-    # Обновляем карточку
-    _refresh_user_card(call, target_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
-def callback_remove_admin(call):
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[2])
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
-        return
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя удалить владельца.")
-        return
-    if not is_admin(target_id):
-        bot.answer_callback_query(call.id, "❌ Пользователь не является админом.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM admins WHERE user_id = %s", (target_id,))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Удалил админа {target_id}", target_id=target_id)
-    bot.answer_callback_query(call.id, "✅ Админ удален!")
-    try:
-        bot.send_message(target_id, "❌ Ваши права администратора были отозваны.")
-    except:
-        pass
-    
-    # Обновляем карточку
-    _refresh_user_card(call, target_id, user_id)
-
-# ==================== ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ====================
-
-@bot.message_handler(func=lambda m: m.text == "👥 Рефералы")
-def referrals(message):
-    update_activity()
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-        if not cur.fetchone():
-            bot.reply_to(message, "❌ Вы не зарегистрированы. Используйте /start")
-            return
-        cur.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = %s", (user_id,))
-        total = cur.fetchone()[0]
-        today_start = int(time.time()) - 24 * 60 * 60
-        cur.execute(
-            "SELECT COUNT(*) FROM referrals WHERE referrer_id = %s AND reward_date > %s",
-            (user_id, today_start)
-        )
-        today = cur.fetchone()[0]
-        bot_username = bot.get_me().username
-        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
-        text = f"👥 *Рефералы*\n\n📊 Всего: {total}\n📅 Сегодня: {today} / 10\n\n🔗 Ссылка: `{ref_link}`\n\n📌 За каждого друга +3 дня."
-        bot.reply_to(message, text, parse_mode="Markdown")
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-@bot.message_handler(func=lambda m: m.text == "🏆 Топ рефералов")
-def top_referrals(message):
-    update_activity()
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT referrer_id, COUNT(*) FROM referrals GROUP BY referrer_id ORDER BY COUNT(*) DESC LIMIT 10")
-        rows = cur.fetchall()
-        if not rows:
-            bot.reply_to(message, "📭 Нет рефералов.")
-            return
-        text = "🏆 *Топ рефералов:*\n\n"
-        medals = ['🥇', '🥈', '🥉']
-        for i, (ref_id, count) in enumerate(rows):
-            name = get_user_display_name_cached(ref_id)
-            icon = medals[i] if i < 3 else f"{i+1}."
-            text += f"{icon} {name} — {count} реф.\n"
-        bot.reply_to(message, text, parse_mode="Markdown")
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-@bot.message_handler(func=lambda m: m.text == "ℹ️ Стаж бота")
-def bot_stats_command(message):
-    update_activity()
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    stats = get_bot_stats()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT COUNT(*) FROM users")
-        total_users = cur.fetchone()[0]
-        text = (
-            f"📊 *Статистика*\n\n"
-            f"⏳ Стаж: {stats['uptime_text']}\n"
-            f"👥 Пользователей: {total_users}\n"
-            f"📦 Ключей: {stats['current_keys']}\n"
-            f"🔑 Проверено: {stats['total_keys_checked']}\n"
-            f"🔓 Расшифровано: {stats['total_decryptions']}"
-        )
-        bot.reply_to(message, text, parse_mode="Markdown")
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-@bot.message_handler(func=lambda m: m.text == "🔓 Расшифровать подписку")
-def decrypt_subscription_start(message):
-    update_activity()
-    if message.chat.type != 'private':
-        return
-    user_id = message.from_user.id
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-    if user_id in decrypt_results:
-        del decrypt_results[user_id]
-    decrypt_results[user_id] = {'waiting': True, 'timestamp': int(time.time())}
-    bot.reply_to(
-        message,
-        "🔓 *Расшифровка VPN подписки*\n\n"
-        "Отправьте ссылку, текст или файл подписки.\n\n"
-        "Поддерживаю:\n"
-        "• URL подписки\n"
-        "• Base64 (все уровни)\n"
-        "• HTML/JSON\n"
-        "• Схемы: happ://, incy:// и др.\n"
-        "• Файлы с ключами\n\n"
-        "📄 Получите `.txt` файл со всеми ключами.\n\n"
-        "❗ Чтобы выйти из режима расшифровки - нажмите /cancel",
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(func=lambda m: m.text == "❓ Поддержка")
-def support(message):
-    bot.reply_to(message, f"💬 Поддержка: {SUPPORT}")
-
-# ==================== ОБРАБОТЧИКИ КОПИРОВАНИЯ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_link_'))
-def callback_copy_link(call):
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[2])
-
-    if user_id != target_id:
-        bot.answer_callback_query(call.id, "❌ Это не ваша ссылка.")
-        return
-
-    link = get_subscription_link(user_id)
-    if not link:
-        bot.answer_callback_query(call.id, "❌ Подписка заморожена или недоступна.")
-        return
-
-    bot.send_message(
-        user_id,
-        f"📋 *Обычная ссылка:*\n\n`{link}`\n\nНажмите на сообщение и скопируйте текст.",
-        parse_mode="Markdown"
-    )
-    bot.answer_callback_query(call.id, "✅ Ссылка отправлена!")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('copy_yandex_'))
-def callback_copy_yandex(call):
-    user_id = call.from_user.id
-    target_id = int(call.data.split('_')[2])
-
-    if user_id != target_id:
-        bot.answer_callback_query(call.id, "❌ Это не ваша ссылка.")
-        return
-
-    link = get_subscription_link(user_id)
-    if not link:
-        bot.answer_callback_query(call.id, "❌ Подписка заморожена или недоступна.")
-        return
-    
-    yandex_link = f"https://translate.yandex.ru/translate?url={link}"
-
-    bot.send_message(
-        user_id,
-        f"🔄 *Ссылка для белых списков:*\n\n`{yandex_link}`\n\nНажмите на сообщение и скопируйте текст.\n\nℹ️ Ссылка автообновляется при белых списках.",
-        parse_mode="Markdown"
-    )
-    bot.answer_callback_query(call.id, "✅ Ссылка для белых списков отправлена!")
-
-@bot.callback_query_handler(func=lambda call: call.data == "check_sub")
-def callback_check_sub(call):
-    update_activity()
-    if call.message.chat.type != 'private':
-        bot.answer_callback_query(call.id, "⚠️ Работает только в личных сообщениях.")
-        return
-    user_id = call.from_user.id
-    current_time = int(time.time())
-    if is_blocked(user_id):
-        bot.answer_callback_query(call.id, "🚫 Вы заблокированы.")
-        return
-    if is_subscribed(user_id):
-        bot.answer_callback_query(call.id, "✅ Подписка подтверждена!")
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except:
-            pass
-        if user_id in captcha_sessions and captcha_sessions[user_id].get('waiting_for_sub'):
-            session = captcha_sessions[user_id]
-            bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
-            _register_user(user_id, session.get('referrer_id'))
-            del captcha_sessions[user_id]
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "SELECT referrer_id FROM referrals WHERE referred_id = %s AND rewarded = 0",
-                (user_id,)
-            )
-            pending = cur.fetchone()
-        finally:
-            try:
-                cur.close()
-            except:
-                pass
-            return_db_connection(conn)
-        if pending:
-            referrer_id = pending[0]
-            if is_subscribed(referrer_id):
-                conn = get_db_connection()
-                cur = conn.cursor()
-                try:
-                    cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (referrer_id,))
-                    ref_result = cur.fetchone()
-                    if ref_result:
-                        new_end = ref_result[0] + 3 * 24 * 60 * 60
-                        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, referrer_id))
-                        cur.execute("UPDATE referrals SET rewarded = 1 WHERE referred_id = %s", (user_id,))
-                        conn.commit()
-                        try:
-                            bot.send_message(referrer_id, "🎉 Ваш реферал подтвердил подписку! Вам начислено +3 дня.")
-                        except:
-                            pass
-                finally:
-                    try:
-                        cur.close()
-                    except:
-                        pass
-                    return_db_connection(conn)
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-            user_exists = cur.fetchone()
-        finally:
-            try:
-                cur.close()
-            except:
-                pass
-            return_db_connection(conn)
-        if not user_exists:
-            _register_user(user_id, None)
-        else:
-            bot.send_message(user_id, "👋 Добро пожаловать!")
-            bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
-    else:
-        bot.answer_callback_query(call.id, "❌ Вы ещё не подписались на канал!")
-
-# ==================== РЕГИСТРАЦИЯ ПОЛЬЗОВАТЕЛЯ ====================
-
-def _register_user(user_id, referrer_id=None):
-    current_time = int(time.time())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        token = generate_subscription_token()
-        sub_end = current_time + 7 * 24 * 60 * 60
-        
-        cur.execute("""
-            INSERT INTO users (user_id, subscription_end, last_activity, is_blocked, token) 
-            VALUES (%s, %s, %s, 0, %s)
-            ON CONFLICT (user_id) DO NOTHING
-            RETURNING user_id
-        """, (user_id, sub_end, current_time, token))
-        result = cur.fetchone()
-        
-        if not result:
-            return
-        
-        conn.commit()
-        
-        try:
-            chat = bot.get_chat(user_id)
-            if chat.username:
-                update_user_username(user_id, chat.username)
-        except:
-            pass
-    except Exception as e:
-        print(f"[_register_user] Ошибка: {e}")
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    
-    if referrer_id:
-        success, message = process_referral(referrer_id, user_id)
-        if success:
-            try:
-                bot.send_message(referrer_id, f"🔔 Новый реферал! Пользователь {get_user_display_name_cached(user_id)} зарегистрировался по вашей ссылке.")
-            except:
-                pass
-    
-    bot.send_message(user_id, "🎉 Добро пожаловать! Вам выдана подписка на 7 дней.")
-    bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
-
-# ==================== ОБРАБОТЧИК СТАРТА ====================
-
-@bot.message_handler(commands=['start'])
-def cmd_start(message):
-    update_activity()
-    if message.chat.type != 'private':
-        bot.reply_to(message, "⚠️ Бот работает только в личных сообщениях.")
-        return
-
-    user_id = message.from_user.id
-    current_time = int(time.time())
-
-    if is_blocked(user_id):
-        bot.reply_to(message, blocked_message())
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-        existing_user = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    if existing_user:
-        if not is_subscribed(user_id):
-            bot.reply_to(message, "⚠️ Подпишитесь на канал, чтобы пользоваться ботом.", reply_markup=subscribe_button())
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT last_activity FROM users WHERE user_id = %s", (user_id,))
-            result = cur.fetchone()
-            if result:
-                last_activity = result[0] or 0
-                days_since_last = (current_time - last_activity) // (24 * 60 * 60)
-                welcome_text = "👋 С возвращением!" if days_since_last >= 3 else "👋 Добро пожаловать!"
-                cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (current_time, user_id))
-                conn.commit()
-                bot.reply_to(message, welcome_text)
-        finally:
-            try:
-                cur.close()
-            except:
-                pass
-            return_db_connection(conn)
-        bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
-        return
-
-    if user_id in captcha_sessions:
-        session = captcha_sessions[user_id]
-        if int(time.time()) - session['timestamp'] < CAPTCHA_TIMEOUT:
-            bot.reply_to(
-                message,
-                "⏳ Вы уже проходите капчу. Нажмите кнопку ниже.",
-                reply_markup=types.InlineKeyboardMarkup().add(
-                    types.InlineKeyboardButton("✅ Я НЕ РОБОТ", callback_data=f"captcha_verify_{user_id}")
-                )
-            )
-            return
-        else:
-            del captcha_sessions[user_id]
-
-    ok, msg = check_subscribe_rate()
-    if not ok:
-        bot.reply_to(message, f"⚠️ {msg}")
-        return
-
-    add_subscribe_record(user_id)
-
-    referrer_id = None
-    if message.text:
-        parts = message.text.strip().split()
-        if len(parts) > 1:
-            for part in parts:
-                if part.startswith('ref_'):
-                    try:
-                        ref = int(part[4:])
-                        if ref != user_id:
-                            referrer_id = ref
-                        break
-                    except ValueError:
-                        continue
-
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("✅ Я НЕ РОБОТ", callback_data=f"captcha_verify_{user_id}"))
-
-    msg = bot.reply_to(
-        message,
-        "🤖 *Пожалуйста, подтвердите, что вы не робот*\n\n"
-        "Нажмите кнопку ниже для проверки.\n"
-        f"⏱ У вас {CAPTCHA_TIMEOUT//60} минут.",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-
-    captcha_sessions[user_id] = {
-        'timestamp': int(time.time()),
-        'message_id': msg.message_id,
-        'referrer_id': referrer_id,
-        'waiting_for_sub': False
-    }
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('captcha_verify_'))
-def callback_captcha_verify(call):
-    user_id = int(call.data.split('_')[2])
-    if call.from_user.id != user_id:
-        bot.answer_callback_query(call.id, "❌ Это не ваша капча.")
-        return
-    if user_id not in captcha_sessions:
-        bot.answer_callback_query(call.id, "❌ Сессия истекла. Нажмите /start")
-        return
-    session = captcha_sessions[user_id]
-    current_time = int(time.time())
-    if current_time - session['timestamp'] > CAPTCHA_TIMEOUT:
-        del captcha_sessions[user_id]
-        bot.answer_callback_query(call.id, "⏰ Время вышло. Нажмите /start")
-        return
-    try:
-        bot.delete_message(call.message.chat.id, session['message_id'])
-    except:
-        pass
-    bot.answer_callback_query(call.id, "✅ Капча пройдена!")
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
-        already_registered = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    if already_registered:
-        del captcha_sessions[user_id]
-        bot.send_message(user_id, "👋 Вы уже зарегистрированы!")
-        bot.send_message(user_id, "Выберите действие:", reply_markup=main_menu())
-        return
-
-    if is_subscribed(user_id):
-        bot.send_message(user_id, "✅ Подписка подтверждена! Регистрируем вас...")
-        _register_user(user_id, session.get('referrer_id'))
-        del captcha_sessions[user_id]
-    else:
-        bot.send_message(
-            user_id,
-            "⚠️ Подпишитесь на канал, чтобы завершить регистрацию.\n\n"
-            "После подписки нажмите кнопку ниже.",
-            reply_markup=subscribe_button()
-        )
-        captcha_sessions[user_id]['waiting_for_sub'] = True
-
-# ==================== АВТОПОСТИНГ CALLBACKS ====================
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_back")
-def callback_autopost_back(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    
-    config = get_autopost_config()
-    status = "✅ ВКЛ" if config['enabled'] else "❌ ВЫКЛ"
-    text = (
-        f"📡 *АВТОПОСТИНГ*\n\n"
-        f"Статус: {status}\n"
-        f"Интервал: {config['interval'] // 60} мин\n"
-        f"Канал: {config['channel_id']}"
-    )
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="autopost_load_keys"),
-        types.InlineKeyboardButton("🚀 Начать", callback_data="autopost_start"),
-        types.InlineKeyboardButton("⚙️ Канал", callback_data="autopost_channel_settings"),
-        types.InlineKeyboardButton("⏱ Интервал", callback_data="autopost_interval_settings"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
-    )
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
-    except:
-        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_load_keys")
-def callback_autopost_load_keys(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id, "📥 Отправьте ключи")
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("✅ Завершить", callback_data="autopost_load_finish"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    msg = bot.send_message(user_id, "📥 Отправляйте ключи.\nКогда закончите - нажмите Завершить.", reply_markup=kb)
-    autopost_loading[user_id] = {'keys': [], 'message_id': msg.message_id, 'timestamp': int(time.time())}
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_load_finish")
-def callback_autopost_load_finish(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    if user_id not in autopost_loading:
-        bot.answer_callback_query(call.id, "❌ Нет загрузки")
-        return
-    keys = autopost_loading[user_id]['keys']
-    if not keys:
-        bot.answer_callback_query(call.id, "❌ Нет ключей")
-        return
-    save_keys_to_db(keys)
-    del autopost_loading[user_id]
-    bot.answer_callback_query(call.id, f"✅ Сохранено {len(keys)}")
-    callback_autopost_back(call)
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_start")
-def callback_autopost_start(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    keys = get_keys_from_db()
-    if not keys:
-        bot.answer_callback_query(call.id, "❌ Нет ключей")
-        return
-    config = get_autopost_config()
-    config['enabled'] = True
-    save_autopost_config(config)
-    bot.answer_callback_query(call.id, "🚀 Запущен!")
-    auto_post_keys_to_channel()
-    set_setting('autopost_last_post', str(int(time.time())))
-    callback_autopost_back(call)
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_channel_settings")
-def callback_autopost_channel_settings(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    config = get_autopost_config()
-    text = (
-        f"⚙️ *Канал*\n\n"
-        f"📢 Текущий: {config['channel_id']}\n"
-        f"📝 Ветка: {config['topic_id'] if config['topic_id'] else 'Нет'}"
-    )
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("📢 Сменить", callback_data="autopost_change_channel"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_change_channel")
-def callback_autopost_change_channel(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id, "🔄 Отправьте новый канал")
-    bot.send_message(user_id, "📢 Отправьте ссылку или ID канала.\nПример: `-1001234567890` или `@channel`", parse_mode="Markdown")
-    search_cache[user_id] = {'action': 'autopost_set_channel', 'timestamp': int(time.time())}
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_interval_settings")
-def callback_autopost_interval_settings(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    config = get_autopost_config()
-    text = f"⏱ *Интервал*\n\n⏱ Текущий: {config['interval'] // 60} мин"
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    kb.add(
-        types.InlineKeyboardButton("⏱ Изменить", callback_data="autopost_set_interval"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="autopost_back")
-    )
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data == "autopost_set_interval")
-def callback_autopost_set_interval(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'autopost'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id, "⏱ Введите минуты")
-    bot.send_message(user_id, "⏱ Введите интервал в минутах (5-1440):", parse_mode="Markdown")
-    search_cache[user_id] = {'action': 'autopost_set_interval', 'timestamp': int(time.time())}
-
-# ==================== УПРАВЛЕНИЕ КЛЮЧАМИ CALLBACKS ====================
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load")
-def callback_admin_keys_load(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id, "📥 Отправьте ключи")
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("✅ Завершить", callback_data="admin_keys_load_finish"),
-        types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_load_cancel")
-    )
-    msg = bot.send_message(
-        user_id,
-        "📥 *Загрузка ключей*\n\n"
-        "Отправляйте ключи по одному сообщению.\n"
-        "Поддерживаются:\n"
-        "• Текст с ключами (vless://, vmess:// и др.)\n"
-        "• .txt файл с ключами\n"
-        "• Ссылка на подписку\n\n"
-        "⚠️ *ВНИМАНИЕ:* Новая загрузка ПОЛНОСТЬЮ ЗАМЕНИТ все текущие ключи!\n\n"
-        "Когда закончите - нажмите *✅ Завершить*",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    keys_loading[user_id] = {
-        'keys': [],
-        'message_id': msg.message_id,
-        'timestamp': int(time.time())
-    }
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_finish")
-def callback_admin_keys_load_finish(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    if user_id not in keys_loading:
-        bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
-        return
-    keys = keys_loading[user_id]['keys']
-    if not keys:
-        bot.answer_callback_query(call.id, "❌ Нет загруженных ключей")
-        return
-    save_keys_to_db(keys)
-    log_admin_action(user_id, f"Загрузил {len(keys)} ключей", details=f"Ключей: {len(keys)}")
-    proto_stats = {}
-    for k in keys:
-        m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
-        if m:
-            p = m.group(1).lower()
-            proto_stats[p] = proto_stats.get(p, 0) + 1
-    stats = '\n'.join(f"  • {p}:// — {c}" for p, c in sorted(proto_stats.items(), key=lambda x: -x[1]))
-    del keys_loading[user_id]
-    bot.answer_callback_query(call.id, f"✅ Загружено {len(keys)} ключей!")
-    total_in_db = len(get_keys_from_db())
-    try:
-        bot.edit_message_text(
-            f"✅ *Ключи загружены!*\n\n"
-            f"📊 Загружено ключей: {len(keys)}\n"
-            f"📋 По протоколам:\n{stats}\n"
-            f"📦 Всего в базе: {total_in_db}",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown"
-        )
-    except:
-        bot.send_message(user_id, 
-            f"✅ *Ключи загружены!*\n\n"
-            f"📊 Загружено ключей: {len(keys)}\n"
-            f"📋 По протоколам:\n{stats}\n"
-            f"📦 Всего в базе: {total_in_db}",
-            parse_mode="Markdown"
-        )
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_cancel")
-def callback_admin_keys_load_cancel(call):
-    user_id = call.from_user.id
-    if user_id in keys_loading:
-        del keys_loading[user_id]
-    bot.answer_callback_query(call.id, "❌ Отменено")
-    try:
-        bot.delete_message(call.message.chat.id, call.message.message_id)
-    except:
-        pass
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clean_dead")
-def callback_admin_keys_clean_dead(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    keys = get_keys_from_db()
-    if not keys:
-        bot.answer_callback_query(call.id, "❌ Нет ключей для проверки")
-        return
-    bot.answer_callback_query(call.id, "⏳ Проверяю ключи...")
-    alive_keys = []
-    dead_keys = []
-    for key in keys:
-        match = re.search(r'@([\d\.]+):(\d+)', key)
-        if match:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2)
-                result = sock.connect_ex((match.group(1), int(match.group(2))))
-                sock.close()
-                if result == 0:
-                    alive_keys.append(key)
-                else:
-                    dead_keys.append(key)
-            except:
-                dead_keys.append(key)
-        else:
-            dead_keys.append(key)
-    save_keys_to_db(alive_keys)
-    log_admin_action(user_id, f"Очистил нерабочие ключи", details=f"Удалено: {len(dead_keys)}, осталось: {len(alive_keys)}")
-    text = (
-        f"🧹 *Очистка нерабочих ключей завершена!*\n\n"
-        f"✅ Оставлено живых: {len(alive_keys)}\n"
-        f"🗑️ Удалено нерабочих: {len(dead_keys)}\n"
-        f"📦 Всего в базе: {len(alive_keys)}"
-    )
-    try:
-        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-    except:
-        bot.send_message(user_id, text, parse_mode="Markdown")
-    time.sleep(2)
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clear_all")
-def callback_admin_keys_clear_all(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id)
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("✅ Да, удалить все", callback_data="admin_keys_clear_confirm"),
-        types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_back")
-    )
-    try:
-        bot.edit_message_text(
-            "⚠️ *ВНИМАНИЕ!*\n\n"
-            "Вы уверены, что хотите удалить ВСЕ ключи из базы?\n"
-            "Это действие НЕЛЬЗЯ будет отменить!",
-            call.message.chat.id,
-            call.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    except:
-        bot.send_message(user_id, "⚠️ Подтвердите удаление всех ключей.", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clear_confirm")
-def callback_admin_keys_clear_confirm(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    count = len(get_keys_from_db())
-    save_keys_to_db([])
-    set_setting('total_keys_issued', '0')
-    log_admin_action(user_id, f"Удалил все ключи", details=f"Удалено: {count} ключей")
-    bot.answer_callback_query(call.id, "🗑️ Все ключи удалены!")
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_back")
-def callback_admin_keys_back(call):
-    user_id = call.from_user.id
-    bot.answer_callback_query(call.id)
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_reset_issued")
-def callback_admin_keys_reset_issued(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    current_issued = int(get_setting('total_keys_issued', '0'))
-    if current_issued == 0:
-        bot.answer_callback_query(call.id, "❌ Выдано 0 ключей, сбрасывать нечего")
-        return
-    set_setting('total_keys_issued', '0')
-    log_admin_action(user_id, f"Сбросил счётчик выданных ключей", details=f"Было: {current_issued}")
-    bot.answer_callback_query(call.id, f"🔄 Сброшено {current_issued} выданных ключей!")
-    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_menu")
-def callback_admin_keys_proxy_menu(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id)
-    _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_reset")
-def callback_admin_keys_proxy_reset(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    set_setting('proxy_sub_url', '')
-    set_setting('proxy_sub_urls', '')
-    log_admin_action(user_id, "Сбросил прокси ссылки")
-    bot.answer_callback_query(call.id, "✅ Прокси ссылки сброшены!")
-    _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_load")
-def callback_admin_keys_proxy_load(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id)
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("✅ Завершить загрузку", callback_data="admin_keys_proxy_finish"),
-        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_keys_back")
-    )
-    msg = bot.send_message(
-        user_id,
-        "🌐 *Загрузка прокси ссылок*\n\n"
-        "Отправляйте ссылки на подписки по одной.\n"
-        "Можно загрузить несколько ссылок — ключи из всех будут объединены.\n\n"
-        "Поддерживаются:\n"
-        "• Обычные HTTP/HTTPS ссылки на подписки\n"
-        "• Base64-закодированные ссылки\n"
-        "• Схемы приложений (happ://, incy:// и др.)\n\n"
-        "⚠️ Ключи будут *добавлены* к уже существующим в базе.\n\n"
-        "Когда закончите — нажмите *✅ Завершить загрузку*",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    proxy_url_loading[user_id] = {
-        'urls': [],
-        'message_id': msg.message_id,
-        'timestamp': int(time.time())
-    }
-
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_finish")
-def callback_admin_keys_proxy_finish(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_keys'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    if user_id not in proxy_url_loading:
-        bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
-        return
-    urls = proxy_url_loading[user_id].get('urls', [])
-    if not urls:
-        bot.answer_callback_query(call.id, "❌ Нет добавленных ссылок")
-        return
-    bot.answer_callback_query(call.id, f"⏳ Загружаю ключи из {len(urls)} ссылок...")
-    proxy_url_loading.pop(user_id)
-    
-    def process_proxy_urls():
-        all_keys = []
-        results = []
-        for url in urls:
-            try:
-                keys = load_keys_from_url(url)
-                results.append((url, len(keys), True))
-                all_keys.extend(keys)
-            except Exception as e:
-                results.append((url, 0, False))
-        all_keys = _dedup(all_keys)
-        if not all_keys:
-            try:
-                bot.send_message(
-                    user_id,
-                    "❌ Не удалось извлечь ключи ни из одной ссылки.\n\n"
-                    "Проверьте доступность ссылок и формат подписки."
-                )
-            except:
-                pass
-            return
-        existing_urls = get_setting('proxy_sub_urls', '')
-        all_urls = [u for u in existing_urls.split('|||') if u] if existing_urls else []
-        all_urls.extend(urls)
-        all_urls = list(dict.fromkeys(all_urls))
-        set_setting('proxy_sub_urls', '|||'.join(all_urls))
-        if urls:
-            set_setting('proxy_sub_url', urls[-1])
-        current_keys = get_keys_from_db()
-        merged = _dedup(current_keys + all_keys)
-        save_keys_to_db(merged)
-        log_admin_action(user_id, f"Загрузил ключи из прокси", details=f"Ссылок: {len(urls)}, ключей: {len(all_keys)}")
-        proto_stats = {}
-        for k in all_keys:
-            m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
-            if m:
-                p = m.group(1).lower()
-                proto_stats[p] = proto_stats.get(p, 0) + 1
-        stats_text = '\n'.join(
-            f"  • {p}:// — {c}"
-            for p, c in sorted(proto_stats.items(), key=lambda x: -x[1])
-        )
-        results_text = ""
-        for url, count, ok in results:
-            short_url = url[:45] + "..." if len(url) > 45 else url
-            icon = "✅" if ok else "❌"
-            results_text += f"{icon} {short_url} — {count} ключей\n"
-        report = (
-            f"✅ *Загрузка из прокси завершена!*\n\n"
-            f"🔗 Обработано ссылок: {len(urls)}\n"
-            f"🔑 Новых ключей: {len(all_keys)}\n"
-            f"📦 Всего в базе: {len(merged)}\n\n"
-            f"📋 По протоколам:\n{stats_text}\n\n"
-            f"📊 Результаты по ссылкам:\n{results_text}"
-        )
-        if len(report) > 4000:
-            report = report[:3950].rstrip() + "\n…"
-        try:
-            bot.send_message(user_id, report, parse_mode="Markdown")
-        except:
-            bot.send_message(user_id, report)
-    t = threading.Thread(target=process_proxy_urls)
-    t.daemon = True
-    t.start()
-
-# ==================== УПРАВЛЕНИЕ ПОДПИСКОЙ ====================
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('give_sub_'))
-def callback_give_sub(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'add_days'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на выдачу подписки.")
-        return
-    target_id = int(call.data.split('_')[2])
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
-        result = cur.fetchone()
-        if not result:
-            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
-            return
-        current_time = int(time.time())
-        new_end = current_time + 30 * 24 * 60 * 60
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Выдал подписку {target_id}", target_id=target_id, details="30 дней")
-    bot.answer_callback_query(call.id, "✅ Выдана подписка на 30 дней!")
-    try:
-        bot.send_message(target_id, f"🎉 Администратор выдал вам подписку на 30 дней!")
-    except:
-        pass
-    
-    _refresh_user_card(call, target_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('prolong_'))
-def callback_prolong(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'add_days'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на выдачу дней.")
-        return
-    parts = call.data.split('_')
-    target_id = int(parts[1])
-    days = int(parts[2])
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
-        result = cur.fetchone()
-        if not result:
-            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
-            return
-        current_time = int(time.time())
-        current_end = result[0] if (result[0] and result[0] > current_time) else current_time
-        new_end = current_end + days * 24 * 60 * 60
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Продлил подписку {target_id}", target_id=target_id, details=f"+{days} дней")
-    bot.answer_callback_query(call.id, f"✅ Продлено на {days} дней!")
-    try:
-        bot.send_message(target_id, f"🎉 Ваша подписка продлена на {days} дней администратором!")
-    except:
-        pass
-    
-    _refresh_user_card(call, target_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_days_'))
-def callback_remove_days(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'remove_days'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на забирание дней.")
-        return
-    parts = call.data.split('_')
-    target_id = int(parts[2])
-    days = int(parts[3])
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT subscription_end FROM users WHERE user_id = %s", (target_id,))
-        result = cur.fetchone()
-        if not result:
-            bot.answer_callback_query(call.id, "❌ Пользователь не найден.")
-            return
-        current_time = int(time.time())
-        current_end = result[0] if (result[0] and result[0] > current_time) else current_time
-        new_end = current_end - days * 24 * 60 * 60
-        if new_end < current_time:
-            new_end = current_time - 1
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Забрал дни у {target_id}", target_id=target_id, details=f"-{days} дней")
-    bot.answer_callback_query(call.id, f"✅ Убавлено {days} дней!")
-    try:
-        bot.send_message(target_id, f"⚠️ Администратор забрал {days} дней подписки!")
-    except:
-        pass
-    
-    _refresh_user_card(call, target_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_sub_'))
-def callback_remove_sub(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'add_days') and not has_permission(user_id, 'remove_days'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на удаление подписки.")
-        return
-    target_id = int(call.data.split('_')[2])
-    current_time = int(time.time())
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("UPDATE users SET subscription_end = %s WHERE user_id = %s", (current_time - 1, target_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Удалил подписку у {target_id}", target_id=target_id)
-    bot.answer_callback_query(call.id, "✅ Подписка удалена!")
-    try:
-        bot.send_message(target_id, "❌ Ваша подписка была удалена администратором.")
-    except:
-        pass
-    
-    _refresh_user_card(call, target_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('block_'))
-def callback_block(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'block_user'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на блокировку.")
-        return
-    target_id = int(call.data.split('_')[1])
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя заблокировать создателя.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("UPDATE users SET is_blocked = 1 WHERE user_id = %s", (target_id,))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Заблокировал {target_id}", target_id=target_id)
-    bot.answer_callback_query(call.id, "✅ Пользователь заблокирован!")
-    try:
-        bot.send_message(target_id, f"🚫 Вы заблокированы администратором.\n\nОбратитесь в поддержку: {SUPPORT}")
-    except:
-        pass
-    
-    _refresh_user_card(call, target_id, user_id)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('unblock_'))
-def callback_unblock(call):
-    if not is_admin(call.from_user.id):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'unblock_user'):
-        bot.answer_callback_query(call.id, "⛔️ У вас нет прав на разблокировку.")
-        return
-    target_id = int(call.data.split('_')[1])
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("UPDATE users SET is_blocked = 0 WHERE user_id = %s", (target_id,))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    log_admin_action(user_id, f"Разблокировал {target_id}", target_id=target_id)
-    bot.answer_callback_query(call.id, "✅ Пользователь разблокирован!")
-    try:
-        bot.send_message(target_id, "✅ Вы разблокированы! Теперь вы можете пользоваться ботом.")
-    except:
-        pass
-    
-    _refresh_user_card(call, target_id, user_id)
-
-# ==================== РАССЫЛКА ====================
-
-@bot.callback_query_handler(func=lambda call: call.data == "announce_dm")
-def callback_announce_dm(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'announce'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id, "📝 Отправьте текст/медиа")
-    bot.send_message(user_id, "📨 *Рассылка в ЛС*\n\nОтправьте текст или медиа.", parse_mode="Markdown")
-    announce_data[user_id] = {'type': 'dm', 'waiting': True, 'timestamp': int(time.time())}
-
-@bot.callback_query_handler(func=lambda call: call.data == "announce_channels")
-def callback_announce_channels(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'announce'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT channel_id, channel_name FROM autopost_channels WHERE enabled = TRUE")
-        channels = cur.fetchall()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    if not channels:
-        bot.send_message(user_id, "❌ Нет каналов")
-        return
-    kb = types.InlineKeyboardMarkup(row_width=1)
-    for ch_id, ch_name in channels:
-        kb.add(types.InlineKeyboardButton(f"📢 {ch_name}", callback_data=f"announce_to_channel_{ch_id}"))
-    kb.add(types.InlineKeyboardButton("📢 Во все", callback_data="announce_all_channels"))
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel"))
-    bot.send_message(user_id, "📢 *Выберите канал:*", parse_mode="Markdown", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('announce_to_channel_'))
-def callback_announce_to_channel(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'announce'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    channel_id = int(call.data.split('_')[3])
-    bot.answer_callback_query(call.id, "📝 Отправьте текст/медиа")
-    bot.send_message(user_id, f"📢 *Объявление в канал*\n\nID: {channel_id}\n\nОтправьте текст или медиа.", parse_mode="Markdown")
-    announce_data[user_id] = {'type': 'channel', 'channel_id': channel_id, 'waiting': True, 'timestamp': int(time.time())}
-
-@bot.callback_query_handler(func=lambda call: call.data == "announce_all_channels")
-def callback_announce_all_channels(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'announce'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    bot.answer_callback_query(call.id, "📝 Отправьте текст/медиа")
-    bot.send_message(user_id, "📢 *Объявление во все каналы*\n\nОтправьте текст или медиа.", parse_mode="Markdown")
-    announce_data[user_id] = {'type': 'all_channels', 'waiting': True, 'timestamp': int(time.time())}
-
-# ==================== ОБРАБОТЧИКИ ДЛЯ РЕЖИМОВ ====================
-
-def handle_autopost_load_keys(message):
-    user_id = message.from_user.id
-    if user_id not in autopost_loading:
-        return
-    raw = message.text or message.caption or ''
-    keys = load_keys_from_text(raw) if raw else []
-    if not keys and message.document:
-        try:
-            file = bot.get_file(message.document.file_id)
-            data = bot.download_file(file.file_path)
-            keys = load_keys_from_text(data.decode('utf-8', errors='ignore'))
-        except:
-            pass
-    if keys:
-        autopost_loading[user_id]['keys'].extend(keys)
-        autopost_loading[user_id]['keys'] = _dedup(autopost_loading[user_id]['keys'])
-        autopost_loading[user_id]['timestamp'] = int(time.time())
-        bot.reply_to(message, f"✅ Загружено {len(keys)}. Всего: {len(autopost_loading[user_id]['keys'])}")
-    else:
-        bot.reply_to(message, "❌ Не найдено ключей")
-
-def handle_autopost_set_channel(message):
-    user_id = message.from_user.id
-    text = message.text.strip()
-    channel_id = None
-    topic_id = 0
-    if 't.me/' in text:
-        match = re.search(r't\.me/([a-zA-Z0-9_]+)', text)
-        if match:
-            try:
-                chat = bot.get_chat(f"@{match.group(1)}")
-                channel_id = chat.id
-            except:
-                pass
-    if not channel_id:
-        try:
-            channel_id = int(text)
-        except:
-            pass
-    if 'thread_id=' in text:
-        match = re.search(r'thread_id=(\d+)', text)
-        if match:
-            topic_id = int(match.group(1))
-    if not channel_id:
-        bot.reply_to(message, "❌ Не удалось распознать")
-        return
-    config = get_autopost_config()
-    config['channel_id'] = channel_id
-    config['topic_id'] = topic_id
-    save_autopost_config(config)
-    del search_cache[user_id]
-    log_admin_action(user_id, f"Изменил канал автопостинга", details=f"channel_id={channel_id}, topic_id={topic_id}")
-    bot.reply_to(message, f"✅ Канал установлен: {channel_id}")
-
-def handle_autopost_set_interval(message):
-    user_id = message.from_user.id
-    try:
-        minutes = int(message.text.strip())
-        if minutes < 5 or minutes > 1440:
-            bot.reply_to(message, "❌ 5-1440 минут")
-            return
-        config = get_autopost_config()
-        config['interval'] = minutes * 60
-        save_autopost_config(config)
-        del search_cache[user_id]
-        log_admin_action(user_id, f"Изменил интервал автопостинга", details=f"{minutes} мин")
-        bot.reply_to(message, f"✅ Интервал: {minutes} мин")
-    except:
-        bot.reply_to(message, "❌ Введите число")
-
-def handle_add_admin_input(message):
-    user_id = message.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        return
-    target_id = get_user_id_from_input(message.text.strip())
-    if not target_id:
-        bot.reply_to(message, "❌ Неверный ID или юзернейм.")
-        return
-    if target_id == ADMIN_ID:
-        bot.reply_to(message, "❌ Это владелец бота.")
-        return
-    if is_admin(target_id):
-        bot.reply_to(message, "❌ Пользователь уже является админом.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT user_id FROM users WHERE user_id = %s", (target_id,))
-        user_exists = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    if not user_exists:
-        bot.reply_to(message, "❌ Пользователь не зарегистрирован в боте.")
-        return
-    role = search_cache[user_id].get('role', 'junior')
-    perms = ROLE_PRESETS[role]['permissions'].copy()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO admins (user_id, role, permissions, added_by, added_at) VALUES (%s, %s, %s, %s, %s)",
-            (target_id, role, json.dumps(perms), user_id, int(time.time()))
-        )
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    del search_cache[user_id]
-    name = get_user_display_name_cached(target_id)
-    log_admin_action(user_id, f"Добавил админа {target_id}", target_id=target_id, details=f"Роль: {role}")
-    bot.reply_to(message, f"✅ {name} (`{target_id}`) назначен {ROLE_PRESETS[role]['name']}!")
-    try:
-        bot.send_message(target_id, f"👑 Вам назначена роль {ROLE_PRESETS[role]['name']}!\n\nТеперь вы имеете доступ к админ-панели (/admin)")
-    except:
-        pass
-
-def admin_announce_text(message):
-    user_id = message.from_user.id
-    if user_id not in announce_data:
-        return
-    data = announce_data[user_id]
-    del announce_data[user_id]
-    announce_type = data.get('type', 'dm')
-    text = message.text
-    caption = message.caption or ''
-    
-    if announce_type == 'dm':
-        if not text and not message.photo and not message.video and not message.document:
-            bot.reply_to(message, "❌ Отправьте текст или медиа.")
-            return
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT user_id FROM users")
-            users = cur.fetchall()
-        finally:
-            try:
-                cur.close()
-            except:
-                pass
-            return_db_connection(conn)
-        sent = 0
-        for (uid,) in users:
-            try:
-                if is_blocked(uid):
-                    continue
-                if message.photo:
-                    bot.send_photo(uid, message.photo[-1].file_id, caption=caption)
-                elif message.video:
-                    bot.send_video(uid, message.video.file_id, caption=caption)
-                elif message.document:
-                    bot.send_document(uid, message.document.file_id, caption=caption)
-                else:
-                    bot.send_message(uid, text)
-                sent += 1
-                time.sleep(0.05)
-            except:
-                pass
-        log_admin_action(user_id, f"Сделал рассылку в ЛС", details=f"Отправлено: {sent} пользователей")
-        bot.reply_to(message, f"✅ Отправлено {sent} пользователям")
-    elif announce_type == 'channel':
-        channel_id = data.get('channel_id')
-        try:
-            if message.photo:
-                bot.send_photo(channel_id, message.photo[-1].file_id, caption=caption)
-            elif message.video:
-                bot.send_video(channel_id, message.video.file_id, caption=caption)
-            elif message.document:
-                bot.send_document(channel_id, message.document.file_id, caption=caption)
-            else:
-                bot.send_message(channel_id, text)
-            log_admin_action(user_id, f"Отправил объявление в канал {channel_id}")
-            bot.reply_to(message, "✅ Отправлено")
-        except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка: {e}")
-    elif announce_type == 'all_channels':
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT channel_id FROM autopost_channels WHERE enabled = TRUE")
-            channels = cur.fetchall()
-        finally:
-            try:
-                cur.close()
-            except:
-                pass
-            return_db_connection(conn)
-        if not channels:
-            bot.reply_to(message, "❌ Нет активных каналов.")
-            return
-        sent = 0
-        for (ch_id,) in channels:
-            try:
-                if message.photo:
-                    bot.send_photo(ch_id, message.photo[-1].file_id, caption=caption)
-                elif message.video:
-                    bot.send_video(ch_id, message.video.file_id, caption=caption)
-                elif message.document:
-                    bot.send_document(ch_id, message.document.file_id, caption=caption)
-                else:
-                    bot.send_message(ch_id, text)
-                sent += 1
-                time.sleep(0.3)
-            except:
-                pass
-        log_admin_action(user_id, f"Сделал рассылку во все каналы", details=f"Отправлено: {sent} каналов")
-        bot.reply_to(message, f"✅ Отправлено в {sent} каналов")
-
-# ==================== ОБРАБОТЧИК ПРИВАТНЫХ СООБЩЕНИЙ ====================
+# ==================== ПРИВАТНЫЕ СООБЩЕНИЯ ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and not (m.text or '').startswith('/'))
 def handle_private_messages(message):
@@ -7333,19 +7931,26 @@ def handle_private_messages(message):
     if text in MENU_BUTTONS:
         return
 
-    if user_id in proxy_url_loading:
+    with _cache_lock:
+        in_proxy = user_id in proxy_url_loading
+        in_announce = user_id in announce_data
+        in_autopost = user_id in autopost_loading
+        decrypt_waiting = decrypt_results.get(user_id, {}).get('waiting', False)
+        in_search = user_id in search_cache
+
+    if in_proxy:
         handle_proxy_url_input(message)
         return
 
-    if user_id in announce_data:
+    if in_announce:
         admin_announce_text(message)
         return
 
-    if user_id in autopost_loading:
+    if in_autopost:
         handle_autopost_load_keys(message)
         return
 
-    if user_id in decrypt_results and decrypt_results[user_id].get('waiting'):
+    if decrypt_waiting:
         if message.document:
             try:
                 file = bot.get_file(message.document.file_id)
@@ -7358,8 +7963,9 @@ def handle_private_messages(message):
             _do_decrypt(message, user_id, text=text)
         return
 
-    if user_id in search_cache:
-        action = search_cache.get(user_id, {}).get('action', '')
+    if in_search:
+        with _cache_lock:
+            action = search_cache.get(user_id, {}).get('action', '')
         if action == 'autopost_set_channel':
             handle_autopost_set_channel(message)
             return
@@ -7394,17 +8000,20 @@ def handle_private_messages(message):
                         pass
                     return_db_connection(conn)
                 
-                del search_cache[user_id]
+                with _cache_lock:
+                    if user_id in search_cache:
+                        del search_cache[user_id]
                 log_admin_action(user_id, f"Добавил чат {new_chat_id} в систему баллов", details=f"Название: {chat_name}")
                 bot.reply_to(message, f"✅ Чат *{chat_name}* добавлен!\n\nТеперь сообщения в нём будут приносить баллы.", parse_mode="Markdown")
             except:
                 bot.reply_to(message, "❌ Неверный ID чата")
             return
         elif action == 'set_points':
-            target_id = search_cache[user_id].get('target_id')
-            if not target_id:
-                del search_cache[user_id]
-                return
+            with _cache_lock:
+                target_id = search_cache.get(user_id, {}).get('target_id')
+                if not target_id:
+                    del search_cache[user_id]
+                    return
             try:
                 new_points = int(message.text.strip())
                 if new_points < 0:
@@ -7420,7 +8029,9 @@ def handle_private_messages(message):
                 result = cur.fetchone()
                 if not result:
                     bot.reply_to(message, "❌ Пользователь не найден.")
-                    del search_cache[user_id]
+                    with _cache_lock:
+                        if user_id in search_cache:
+                            del search_cache[user_id]
                     return
                 old_points = result[0] or 0
                 cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
@@ -7432,7 +8043,9 @@ def handle_private_messages(message):
                     pass
                 return_db_connection(conn)
 
-            del search_cache[user_id]
+            with _cache_lock:
+                if user_id in search_cache:
+                    del search_cache[user_id]
             name = get_user_display_name_cached(target_id)
             rank_info = get_rank(new_points)
             log_admin_action(
@@ -7471,14 +8084,15 @@ def cmd_priority_handler(message):
     user_id = message.from_user.id
     command = message.text.split()[0].lower() if message.text else ''
     
-    if user_id in decrypt_results:
-        del decrypt_results[user_id]
-    if user_id in autopost_loading:
-        del autopost_loading[user_id]
-    if user_id in announce_data:
-        del announce_data[user_id]
-    if user_id in proxy_url_loading:
-        del proxy_url_loading[user_id]
+    with _cache_lock:
+        if user_id in decrypt_results:
+            del decrypt_results[user_id]
+        if user_id in autopost_loading:
+            del autopost_loading[user_id]
+        if user_id in announce_data:
+            del announce_data[user_id]
+        if user_id in proxy_url_loading:
+            del proxy_url_loading[user_id]
 
     if command == '/admin':
         admin_panel(message)
@@ -7770,18 +8384,19 @@ def cmd_cancel(message):
         return
     user_id = message.from_user.id
     cleared = False
-    if user_id in decrypt_results:
-        del decrypt_results[user_id]
-        cleared = True
-    if user_id in autopost_loading:
-        del autopost_loading[user_id]
-        cleared = True
-    if user_id in announce_data:
-        del announce_data[user_id]
-        cleared = True
-    if user_id in proxy_url_loading:
-        del proxy_url_loading[user_id]
-        cleared = True
+    with _cache_lock:
+        if user_id in decrypt_results:
+            del decrypt_results[user_id]
+            cleared = True
+        if user_id in autopost_loading:
+            del autopost_loading[user_id]
+            cleared = True
+        if user_id in announce_data:
+            del announce_data[user_id]
+            cleared = True
+        if user_id in proxy_url_loading:
+            del proxy_url_loading[user_id]
+            cleared = True
     if cleared:
         bot.reply_to(message, "✅ Все режимы отменены.")
     else:
@@ -7792,7 +8407,7 @@ def cmd_ref_link(message):
     if is_blocked(user_id):
         bot.reply_to(message, blocked_message())
         return
-    bot_username = bot.get_me().username
+    bot_username = get_bot_username()
     ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
     bot.reply_to(message, f"🔗 *Реферальная ссылка:*\n`{ref_link}`", parse_mode="Markdown")
 
@@ -7984,10 +8599,9 @@ def cmd_view_logs(message):
     
     bot.reply_to(message, text, parse_mode="Markdown")
 
-# ==================== НОВЫЕ КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ БАЛЛАМИ ====================
+# ==================== КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ БАЛЛАМИ ====================
 
 def cmd_points(message):
-    """/points [ID или @username] [+/-число] — добавить/убрать баллы"""
     if message.chat.type != 'private':
         return
     user_id = message.from_user.id
@@ -8036,12 +8650,10 @@ def cmd_points(message):
 
         old_points = result[0] or 0
 
-        # Если передано просто число без знака — это абсолютное значение (обнуление = 0)
         if raw.startswith('+') or raw.startswith('-'):
             new_points = max(0, old_points + amount)
             action_text = f"{'добавлено' if amount > 0 else 'убрано'} {abs(amount)}"
         else:
-            # Абсолютное значение
             new_points = max(0, amount)
             action_text = f"установлено {new_points}"
 
@@ -8073,7 +8685,6 @@ def cmd_points(message):
         parse_mode="Markdown"
     )
 
-    # Уведомляем пользователя
     try:
         if amount > 0 or (not raw.startswith('-') and new_points > old_points):
             bot.send_message(
@@ -8092,9 +8703,7 @@ def cmd_points(message):
     except:
         pass
 
-
 def cmd_set_points(message):
-    """Алиас: /set_points @user 1000 — устанавливает точное значение"""
     if message.chat.type != 'private':
         return
     user_id = message.from_user.id
@@ -8187,7 +8796,15 @@ def ping():
 
 @app.route('/health')
 def health():
-    return "OK", 200
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.close()
+        return_db_connection(conn)
+        return "OK", 200
+    except:
+        return "DB Error", 500
 
 # Rate limiting для /sub
 _rate_limit = defaultdict(list)
@@ -8201,19 +8818,19 @@ def rate_limit(limit=10, window=60):
             ip = request.remote_addr
             now = time.time()
             
-            # Чистим старые записи
-            if now - _RATE_LIMIT_LAST_CLEAN > 3600:
-                cutoff = now - 3600
-                dead = [k for k, v in _rate_limit.items() 
-                        if not any(t > cutoff for t in v)]
-                for k in dead:
-                    del _rate_limit[k]
-                _RATE_LIMIT_LAST_CLEAN = now
-            
-            _rate_limit[ip] = [t for t in _rate_limit[ip] if now - t < window]
-            if len(_rate_limit[ip]) >= limit:
-                return "Too many requests", 429
-            _rate_limit[ip].append(now)
+            with _rate_limit_lock:
+                if now - _RATE_LIMIT_LAST_CLEAN > 3600:
+                    cutoff = now - 3600
+                    dead = [k for k, v in _rate_limit.items() 
+                            if not any(t > cutoff for t in v)]
+                    for k in dead:
+                        del _rate_limit[k]
+                    _RATE_LIMIT_LAST_CLEAN = now
+                
+                _rate_limit[ip] = [t for t in _rate_limit[ip] if now - t < window]
+                if len(_rate_limit[ip]) >= limit:
+                    return "Too many requests", 429
+                _rate_limit[ip].append(now)
             return f(*args, **kwargs)
         return decorated
     return decorator
@@ -8235,9 +8852,7 @@ def subscription(token):
         if is_blocked:
             return "User blocked", 403
         
-        cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (int(time.time()), user_id))
-        conn.commit()
-        
+        # Сначала проверяем подписку, потом обновляем активность
         current_time = int(time.time())
         
         if is_frozen:
@@ -8247,8 +8862,20 @@ def subscription(token):
             )
             return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
         
-        if sub_end < current_time:
+        if not sub_end or sub_end < current_time:
             return "Subscription expired", 403
+        
+        # Обновляем активность только если подписка активна
+        try:
+            cur.execute("UPDATE users SET last_activity = %s WHERE user_id = %s", (int(time.time()), user_id))
+            conn.commit()
+        except Exception as e:
+            print(f"[sub] Ошибка обновления активности: {e}")
+            try:
+                conn.rollback()
+            except:
+                pass
+        
         keys = get_keys_from_db()
         if not keys:
             keys = DEFAULT_KEYS
@@ -8286,7 +8913,6 @@ if __name__ == "__main__":
     ensure_bot_start_time()
     print("✅ Время запуска сохранено")
     
-    # Устанавливаем команды бота
     try:
         bot.set_my_commands([
             types.BotCommand("start", "Запустить бота"),
@@ -8300,7 +8926,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[set_commands] Ошибка: {e}")
     
-    # Запускаем фоновые задачи
     Thread(target=autopost_scheduler, daemon=True).start()
     Thread(target=auto_update_keys_scheduler, daemon=True).start()
     Thread(target=cleanup_sessions_scheduler, daemon=True).start()
@@ -8310,36 +8935,45 @@ if __name__ == "__main__":
         Thread(target=keep_alive_ping, daemon=True).start()
         Thread(target=auto_restart_monitor, daemon=True).start()
     
-    print("🤖 Бот запущен и готов к работе!")
+    print("🤖 Бот готов к запуску!")
     
-    # ===== POLLING В ФОНОВОМ ПОТОКЕ =====
-    def run_polling():
-        while True:
-            try:
-                bot.delete_webhook(drop_pending_updates=True)
-                time.sleep(1)
-                bot.infinity_polling(
-                    timeout=30,
-                    long_polling_timeout=30,
-                    allowed_updates=['message', 'callback_query', 'my_chat_member']
-                )
-            except Exception as e:
-                err = str(e)
-                if '409' in err:
-                    print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
-                    time.sleep(30)
-                else:
-                    print(f"❌ Ошибка в polling: {e}")
-                    print("🔄 Переподключение через 10 секунд...")
-                    time.sleep(10)
-                    try:
-                        bot.delete_webhook(drop_pending_updates=True)
-                    except:
-                        pass
+    # ===== FLASK ЗАПУСКАЕТСЯ ПЕРВЫМ В ОТДЕЛЬНОМ ПОТОКЕ =====
+    port = int(os.getenv('PORT', 5000))
+    print(f"📡 Запускаем Flask сервер на порту {port}...")
     
-    Thread(target=run_polling, daemon=True).start()
+    flask_thread = Thread(
+        target=lambda: serve(app, host='0.0.0.0', port=port),
+        daemon=False
+    )
+    flask_thread.start()
     
-    # ===== FLASK В ГЛАВНОМ ПОТОКЕ =====
-    print("📡 Запускаем Flask сервер на порту " + str(int(os.getenv('PORT', 5000))) + "...")
-    serve(app, host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
-        
+    print("⏳ Ожидаем 3 секунды для запуска Flask...")
+    time.sleep(3)
+    print("✅ Flask сервер запущен и готов принимать запросы")
+    
+    # ===== POLLING В ГЛАВНОМ ПОТОКЕ =====
+    print("🔄 Запускаем polling...")
+    while True:
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+            time.sleep(1)
+            bot.infinity_polling(
+                timeout=30,
+                long_polling_timeout=30,
+                skip_pending=True,
+                allowed_updates=['message', 'callback_query', 'my_chat_member', 'chat_member']
+            )
+        except Exception as e:
+            err = str(e)
+            if '409' in err:
+                print(f"⚠️ Конфликт: другой экземпляр бота уже запущен. Ждём 30 сек...")
+                time.sleep(30)
+            else:
+                print(f"❌ Ошибка в polling: {e}")
+                print("🔄 Переподключение через 10 секунд...")
+                time.sleep(10)
+                try:
+                    bot.delete_webhook(drop_pending_updates=True)
+                except:
+                    pass
+```
