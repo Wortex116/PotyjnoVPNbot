@@ -29,6 +29,15 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, request
 
+# ==================== НОВЫЕ КОНСТАНТЫ ====================
+
+DAILY_BONUS_COOLDOWN = 86400
+DAILY_BONUS_POINTS = 50
+MAX_POINTS = 999999999
+RAFFLE_ACTIVE_WINDOW = 3 * 3600
+RAFFLE_COOLDOWN = 24 * 3600
+RAFFLE_SUBSCRIPTION_DAYS = 7
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 
@@ -270,10 +279,18 @@ def cleanup_sessions_scheduler():
     print("[cleanup] Запущен планировщик очистки сессий")
     last_notify = 0
     last_expired_notify = 0
+    last_temp_keys_cleanup = 0
     while True:
         try:
             cleanup_expired_sessions()
             current_time = int(time.time())
+            
+            if current_time - last_temp_keys_cleanup >= 3600:
+                deleted = cleanup_expired_temp_keys()
+                if deleted:
+                    print(f"[cleanup] Удалено временных ключей: {deleted}")
+                last_temp_keys_cleanup = current_time
+            
             if current_time - last_notify >= 3600:
                 _notify_expiring_subscriptions()
                 last_notify = current_time
@@ -760,6 +777,22 @@ def init_db():
                 consent_given_at BIGINT DEFAULT 0
             )
         """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS temp_keys (
+                id SERIAL PRIMARY KEY,
+                key TEXT UNIQUE NOT NULL,
+                created_by BIGINT,
+                created_at BIGINT,
+                expires_at BIGINT,
+                used INTEGER DEFAULT 0,
+                used_at BIGINT,
+                used_by_ip TEXT,
+                label TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_temp_keys_key ON temp_keys(key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_temp_keys_expires ON temp_keys(expires_at)")
         
         conn.commit()
     except Exception as e:
@@ -2113,6 +2146,24 @@ def is_admin(user_id):
     except:
         return False
 
+def is_chat_owner(user_id, chat_id):
+    if user_id == ADMIN_ID:
+        return True
+    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
+        return True
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return member.status == 'creator'
+    except:
+        return False
+
+def is_bot_admin_for_chat_commands(user_id):
+    if user_id == ADMIN_ID:
+        return True
+    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
+        return True
+    return False
+
 def build_user_list_keyboard(users, page, filter_type='all'):
     kb = types.InlineKeyboardMarkup(row_width=2)
     per_page = 5
@@ -2192,6 +2243,9 @@ def admin_menu():
     )
     kb.add(
         types.InlineKeyboardButton("📋 Логи админов", callback_data="admin_view_logs"),
+        types.InlineKeyboardButton("🔑 Временные ключи", callback_data="admin_temp_keys")
+    )
+    kb.add(
         types.InlineKeyboardButton("🏠 Главное меню", callback_data="admin_back")
     )
     return kb
@@ -2875,6 +2929,385 @@ def _parse_subscription_any(raw, steps=None):
         return _dedup(keys), steps
     steps.append("❌ Ключи не найдены")
     return [], steps
+
+# ==================== ВРЕМЕННЫЕ КЛЮЧИ ====================
+
+def generate_temp_key():
+    chars = string.ascii_letters + string.digits
+    return 'tk_' + ''.join(random.choices(chars, k=20))
+
+def create_temp_key(created_by, duration_minutes=60, label=None):
+    key = generate_temp_key()
+    current_time = int(time.time())
+    expires_at = current_time + duration_minutes * 60
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO temp_keys (key, created_by, created_at, expires_at, label)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING key
+        """, (key, created_by, current_time, expires_at, label))
+        conn.commit()
+        return key, expires_at
+    except Exception as e:
+        conn.rollback()
+        print(f"[temp_key] Ошибка: {e}")
+        return None, None
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def use_temp_key(key, ip=None):
+    current_time = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE temp_keys 
+            SET used = 1, used_at = %s, used_by_ip = %s
+            WHERE key = %s 
+              AND used = 0 
+              AND expires_at > %s
+            RETURNING created_by, expires_at
+        """, (current_time, ip, key, current_time))
+        result = cur.fetchone()
+        conn.commit()
+        return result
+    except Exception as e:
+        conn.rollback()
+        print(f"[use_temp_key] Ошибка: {e}")
+        return None
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def get_temp_keys_list(admin_id=None, limit=20):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        if admin_id:
+            cur.execute("""
+                SELECT key, created_by, created_at, expires_at,
+                       used, used_at, used_by_ip, label
+                FROM temp_keys
+                WHERE created_by = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (admin_id, limit))
+        else:
+            cur.execute("""
+                SELECT key, created_by, created_at, expires_at,
+                       used, used_at, used_by_ip, label
+                FROM temp_keys
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (limit,))
+        return cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def get_temp_key_detail(key):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT key, created_by, created_at, expires_at,
+                   used, used_at, used_by_ip, label
+            FROM temp_keys WHERE key = %s
+        """, (key,))
+        return cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def delete_temp_key(key):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM temp_keys WHERE key = %s", (key,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def cleanup_expired_temp_keys():
+    current_time = int(time.time())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            DELETE FROM temp_keys 
+            WHERE (used = 1 AND used_at < %s)
+               OR (expires_at < %s AND used = 0)
+        """, (current_time - 86400, current_time - 86400))
+        deleted = cur.rowcount
+        conn.commit()
+        return deleted
+    except Exception as e:
+        conn.rollback()
+        return 0
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def _show_temp_keys_menu(call):
+    user_id = call.from_user.id
+    keys = get_temp_keys_list(admin_id=user_id, limit=50)
+    current_time = int(time.time())
+    
+    active = sum(1 for k in keys if not k[4] and k[3] > current_time)
+    used = sum(1 for k in keys if k[4])
+    expired = sum(1 for k in keys if not k[4] and k[3] <= current_time)
+    
+    text = (
+        f"🔑 *Временные ключи*\n\n"
+        f"✅ Активных: `{active}`\n"
+        f"✔️ Использованных: `{used}`\n"
+        f"❌ Истёкших: `{expired}`\n\n"
+        f"Ключ даёт одноразовый доступ к подписке.\n"
+        f"Самоуничтожается после первого использования."
+    )
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton("➕ Создать ключ", callback_data="admin_temp_key_create"),
+        types.InlineKeyboardButton("📋 Список ключей", callback_data="admin_temp_keys_list"),
+        types.InlineKeyboardButton("🗑 Очистить истёкшие", callback_data="admin_temp_keys_cleanup"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
+    )
+    
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                             parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+
+def _show_temp_key_duration_picker(call):
+    user_id = call.from_user.id
+    text = "⏱ *Выберите время действия ключа:*"
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("30 минут", callback_data="admin_temp_key_gen_30"),
+        types.InlineKeyboardButton("1 час",    callback_data="admin_temp_key_gen_60"),
+        types.InlineKeyboardButton("3 часа",   callback_data="admin_temp_key_gen_180"),
+        types.InlineKeyboardButton("12 часов", callback_data="admin_temp_key_gen_720"),
+        types.InlineKeyboardButton("1 день",   callback_data="admin_temp_key_gen_1440"),
+        types.InlineKeyboardButton("7 дней",   callback_data="admin_temp_key_gen_10080"),
+        types.InlineKeyboardButton("✏️ Своё время", callback_data="admin_temp_key_custom")
+    )
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_temp_keys"))
+    
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                             parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+
+def _generate_and_show_temp_key(call, user_id, minutes, label=None):
+    key, expires_at = create_temp_key(user_id, minutes, label)
+    if not key:
+        bot.send_message(user_id, "❌ Ошибка создания ключа")
+        return
+    
+    base_url = get_bot_base_url()
+    key_url = f"{base_url}/tkey/{key}"
+    
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours and mins:
+        duration_text = f"{hours} ч. {mins} мин."
+    elif hours:
+        duration_text = f"{hours} ч."
+    else:
+        duration_text = f"{mins} мин."
+    
+    expires_str = datetime.fromtimestamp(expires_at).strftime("%d.%m.%Y в %H:%M")
+    
+    text = (
+        f"🔑 *Временный ключ создан!*\n\n"
+        f"🔗 Ссылка:\n`{key_url}`\n\n"
+        f"⏱ Действует: {duration_text}\n"
+        f"📅 До: {expires_str}\n\n"
+        f"⚠️ *Одноразовый!* Самоуничтожится после первого использования.\n\n"
+        f"📋 Ключ: `{key}`"
+    )
+    
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("➕ Ещё ключ", callback_data=f"admin_temp_key_gen_{minutes}"),
+        types.InlineKeyboardButton("🔙 В меню", callback_data="admin_temp_keys")
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            "🚫 Отозвать этот ключ", 
+            callback_data=f"admin_temp_key_revoke_{key}"
+        )
+    )
+    
+    log_admin_action(user_id, f"Создал временный ключ", details=f"Время: {duration_text}")
+    
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                             parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+
+def _show_temp_keys_list(call, user_id):
+    if user_id == ADMIN_ID:
+        keys = get_temp_keys_list(admin_id=None, limit=20)
+    else:
+        keys = get_temp_keys_list(admin_id=user_id, limit=20)
+    
+    current_time = int(time.time())
+    
+    if not keys:
+        text = "📋 *Временные ключи*\n\nНет созданных ключей."
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_temp_keys"))
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                                 parse_mode="Markdown", reply_markup=kb)
+        except:
+            bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+        return
+    
+    active = sum(1 for k in keys if not k[4] and k[3] > current_time)
+    used_count = sum(1 for k in keys if k[4])
+    expired = sum(1 for k in keys if not k[4] and k[3] <= current_time)
+    
+    text = (
+        f"📋 *Временные ключи*\n\n"
+        f"✅ Активных: `{active}`\n"
+        f"✔️ Использованных: `{used_count}`\n"
+        f"❌ Истёкших: `{expired}`\n\n"
+    )
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    
+    for row in keys:
+        key, created_by, created_at, expires_at, used, used_at, used_by_ip, label = row
+        
+        if used:
+            status_icon = "✔️"
+        elif expires_at < current_time:
+            status_icon = "❌"
+        else:
+            remaining = expires_at - current_time
+            h = remaining // 3600
+            m = (remaining % 3600) // 60
+            status_icon = "✅"
+        
+        creator_name = get_user_display_name_cached(created_by)
+        created_str = datetime.fromtimestamp(created_at).strftime("%d.%m в %H:%M")
+        
+        short_key = key[3:11]
+        
+        btn_label = f"{status_icon} {short_key}... | {creator_name} | {created_str}"
+        kb.add(types.InlineKeyboardButton(
+            btn_label,
+            callback_data=f"admin_tkey_detail_{key}"
+        ))
+    
+    kb.add(
+        types.InlineKeyboardButton("🔄 Обновить", callback_data="admin_temp_keys_list"),
+        types.InlineKeyboardButton("🗑 Удалить все истёкшие", callback_data="admin_temp_keys_del_expired")
+    )
+    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_temp_keys"))
+    
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                             parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
+
+def _show_temp_key_detail(call, user_id, key):
+    current_time = int(time.time())
+    row = get_temp_key_detail(key)
+    
+    if not row:
+        bot.answer_callback_query(call.id, "❌ Ключ не найден")
+        return
+    
+    key, created_by, created_at, expires_at, used, used_at, used_by_ip, label = row
+    
+    creator_name = get_user_display_name_cached(created_by)
+    created_str = datetime.fromtimestamp(created_at).strftime("%d.%m.%Y в %H:%M:%S")
+    expires_str = datetime.fromtimestamp(expires_at).strftime("%d.%m.%Y в %H:%M:%S")
+    
+    base_url = get_bot_base_url()
+    key_url = f"{base_url}/tkey/{key}"
+    
+    if used:
+        status = "✔️ Использован"
+        used_str = datetime.fromtimestamp(used_at).strftime("%d.%m.%Y в %H:%M:%S")
+        status_detail = f"🕐 Использован: {used_str}\n🌐 IP: `{used_by_ip or 'неизвестен'}`"
+    elif expires_at < current_time:
+        status = "❌ Истёк"
+        status_detail = f"⏰ Истёк: {expires_str}"
+    else:
+        remaining = expires_at - current_time
+        h = remaining // 3600
+        m = (remaining % 3600) // 60
+        s = remaining % 60
+        status = "✅ Активен"
+        status_detail = f"⏳ Осталось: `{h}ч {m}м {s}с`\n📅 Истекает: {expires_str}"
+    
+    text = (
+        f"🔑 *Детали ключа*\n\n"
+        f"📋 Ключ: `{key}`\n"
+        f"🔗 Ссылка:\n`{key_url}`\n\n"
+        f"📊 Статус: {status}\n"
+        f"{status_detail}\n\n"
+        f"👤 Создал: {creator_name} (`{created_by}`)\n"
+        f"🕐 Создан: {created_str}\n"
+    )
+    
+    if label:
+        text += f"📝 Метка: {label}\n"
+    
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    
+    if not used and expires_at > current_time:
+        kb.add(types.InlineKeyboardButton(
+            "🚫 Отозвать ключ",
+            callback_data=f"admin_temp_key_revoke_{key}"
+        ))
+    
+    kb.add(
+        types.InlineKeyboardButton(
+            "🗑 Удалить из базы",
+            callback_data=f"admin_tkey_delete_{key}"
+        )
+    )
+    kb.add(types.InlineKeyboardButton("🔙 Назад к списку", callback_data="admin_temp_keys_list"))
+    
+    try:
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                             parse_mode="Markdown", reply_markup=kb)
+    except:
+        bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
 
 _auto_update_event = Event()
 
@@ -6280,17 +6713,6 @@ def is_chat_admin(user_id, chat_id):
             pass
         return_db_connection(conn)
 
-def is_chat_owner(user_id, chat_id):
-    if user_id == ADMIN_ID:
-        return True
-    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
-        return True
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        return member.status == 'creator'
-    except:
-        return False
-
 def _get_user_from_message(message):
     if message.reply_to_message:
         return message.reply_to_message.from_user.id, message.reply_to_message.from_user.first_name
@@ -7350,6 +7772,66 @@ def subscription(token):
             pass
         return_db_connection(conn)
 
+@app.route('/tkey/<key>')
+def temp_key_subscription(key):
+    if not key or not key.startswith('tk_'):
+        return "Invalid key", 400
+    
+    ip = request.remote_addr
+    result = use_temp_key(key, ip=ip)
+    
+    if not result:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT used, expires_at FROM temp_keys WHERE key = %s", 
+                (key,)
+            )
+            row = cur.fetchone()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        
+        if not row:
+            return "Key not found", 404
+        used, expires_at = row
+        if used:
+            return "Key already used", 403
+        if expires_at < int(time.time()):
+            return "Key expired", 403
+        return "Invalid key", 400
+    
+    created_by, expires_at = result
+    
+    keys = get_subscription_keys_from_db()
+    if not keys:
+        keys = get_keys_from_db()
+    if not keys:
+        keys = DEFAULT_KEYS
+    
+    content = KEY_TEMPLATE.format(
+        expire=expires_at,
+        keys='\n'.join(keys)
+    )
+    
+    try:
+        bot.send_message(
+            created_by,
+            f"🔑 *Временный ключ использован!*\n\n"
+            f"🔗 Ключ: `{key}`\n"
+            f"🌐 IP: `{ip}`\n"
+            f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
+    return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
 # ==================== ADMIN CALLBACK ====================
 
 @bot.callback_query_handler(func=lambda call: (
@@ -7977,6 +8459,130 @@ def admin_callback(call):
         _show_admin_logs(call)
         return
 
+    # ===== ВРЕМЕННЫЕ КЛЮЧИ =====
+    if data == "admin_temp_keys":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_temp_keys_menu(call)
+        return
+
+    if data == "admin_temp_key_create":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_temp_key_duration_picker(call)
+        return
+
+    if data.startswith("admin_temp_key_gen_"):
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        minutes = int(data.split("_")[4])
+        bot.answer_callback_query(call.id)
+        _generate_and_show_temp_key(call, user_id, minutes)
+        return
+
+    if data == "admin_temp_key_custom":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id,
+            "⏱ Введите время в минутах (1-44640):\n\n"
+            "Примеры:\n"
+            "`60` — 1 час\n"
+            "`1440` — 1 день\n"
+            "`10080` — 1 неделя",
+            parse_mode="Markdown"
+        )
+        with _cache_lock:
+            search_cache[user_id] = {
+                'action': 'temp_key_custom_duration',
+                'timestamp': int(time.time())
+            }
+        return
+
+    if data == "admin_temp_keys_list":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_temp_keys_list(call, user_id)
+        return
+
+    if data == "admin_temp_keys_cleanup":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        deleted = cleanup_expired_temp_keys()
+        bot.answer_callback_query(call.id, f"🗑 Очищено: {deleted} ключей")
+        _show_temp_keys_menu(call)
+        return
+
+    if data.startswith("admin_temp_key_revoke_"):
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        key = data.replace("admin_temp_key_revoke_", "")
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE temp_keys SET used = 1, used_at = %s WHERE key = %s AND used = 0",
+                (int(time.time()), key)
+            )
+            conn.commit()
+            revoked = cur.rowcount > 0
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        bot.answer_callback_query(
+            call.id, 
+            "✅ Ключ отозван!" if revoked else "❌ Ключ уже использован"
+        )
+        _show_temp_keys_list(call, user_id)
+        return
+
+    if data.startswith("admin_tkey_detail_"):
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        key = data.replace("admin_tkey_detail_", "")
+        bot.answer_callback_query(call.id)
+        _show_temp_key_detail(call, user_id, key)
+        return
+
+    if data.startswith("admin_tkey_delete_"):
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        key = data.replace("admin_tkey_delete_", "")
+        deleted = delete_temp_key(key)
+        bot.answer_callback_query(
+            call.id,
+            "🗑 Удалён!" if deleted else "❌ Не найден"
+        )
+        if deleted:
+            log_admin_action(user_id, f"Удалил временный ключ", details=key)
+        _show_temp_keys_list(call, user_id)
+        return
+
+    if data == "admin_temp_keys_del_expired":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        deleted = cleanup_expired_temp_keys()
+        bot.answer_callback_query(call.id, f"🗑 Удалено: {deleted} ключей")
+        log_admin_action(user_id, "Удалил истёкшие временные ключи", details=f"Удалено: {deleted}")
+        _show_temp_keys_list(call, user_id)
+        return
+
     # ===== ОБРАБОТКА edit_admin_{id} =====
     if data.startswith("edit_admin_") and data != 'edit_admin_perms':
         if not has_permission(user_id, 'manage_admins'):
@@ -8563,6 +9169,37 @@ def handle_private_messages(message):
                 )
             except:
                 pass
+            return
+        elif action == 'temp_key_custom_duration':
+            try:
+                minutes = int(message.text.strip())
+                if minutes < 1 or minutes > 44640:
+                    bot.reply_to(message, "❌ Введите от 1 до 44640 минут")
+                    return
+                with _cache_lock:
+                    if user_id in search_cache:
+                        del search_cache[user_id]
+                key, expires_at = create_temp_key(user_id, minutes)
+                if not key:
+                    bot.reply_to(message, "❌ Ошибка создания ключа")
+                    return
+                base_url = get_bot_base_url()
+                key_url = f"{base_url}/tkey/{key}"
+                hours = minutes // 60
+                mins = minutes % 60
+                duration_text = f"{hours} ч. {mins} мин." if hours else f"{mins} мин."
+                expires_str = datetime.fromtimestamp(expires_at).strftime("%d.%m.%Y в %H:%M")
+                bot.reply_to(message,
+                    f"🔑 *Временный ключ создан!*\n\n"
+                    f"🔗 Ссылка:\n`{key_url}`\n\n"
+                    f"⏱ Действует: {duration_text}\n"
+                    f"📅 До: {expires_str}\n\n"
+                    f"⚠️ Одноразовый! Самоуничтожится после первого использования.",
+                    parse_mode="Markdown"
+                )
+                log_admin_action(user_id, "Создал временный ключ", details=f"Время: {duration_text}")
+            except ValueError:
+                bot.reply_to(message, "❌ Введите число минут")
             return
 
     if text:
@@ -9355,4 +9992,3 @@ if __name__ == "__main__":
     
     print(f"📡 Flask на порту {port}...")
     serve(app, host='0.0.0.0', port=port)
-        
