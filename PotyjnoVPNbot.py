@@ -269,6 +269,7 @@ def cleanup_expired_sessions():
 def cleanup_sessions_scheduler():
     print("[cleanup] Запущен планировщик очистки сессий")
     last_notify = 0
+    last_expired_notify = 0
     while True:
         try:
             cleanup_expired_sessions()
@@ -276,6 +277,9 @@ def cleanup_sessions_scheduler():
             if current_time - last_notify >= 3600:
                 _notify_expiring_subscriptions()
                 last_notify = current_time
+            if current_time - last_expired_notify >= 6 * 3600:
+                _notify_expired_subscriptions()
+                last_expired_notify = current_time
             time.sleep(300)
         except Exception as e:
             print(f"[cleanup] Ошибка: {e}")
@@ -315,6 +319,51 @@ def _notify_expiring_subscriptions():
                 continue
     except Exception as e:
         print(f"[notify] Ошибка: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except:
+                pass
+        return_db_connection(conn)
+
+def _notify_expired_subscriptions():
+    current_time = int(time.time())
+    conn = get_db_connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT user_id FROM users
+            WHERE is_blocked = 0
+              AND is_frozen = 0
+              AND notified_expired = 0
+              AND subscription_end > 0
+              AND subscription_end < %s
+        """, (current_time,))
+        rows = cur.fetchall()
+        for (user_id,) in rows:
+            try:
+                bot.send_message(
+                    user_id,
+                    f"❌ *Ваша подписка истекла*\n\n"
+                    f"Для продления обратитесь в поддержку: {SUPPORT}",
+                    parse_mode="Markdown"
+                )
+                cur.execute(
+                    "UPDATE users SET notified_expired = 1 WHERE user_id = %s",
+                    (user_id,)
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"[notify_expired] Ошибка отправки {user_id}: {e}")
+                continue
+    except Exception as e:
+        print(f"[notify_expired] Ошибка: {e}")
         try:
             conn.rollback()
         except:
@@ -601,6 +650,7 @@ def init_db():
             )
         """)
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS notified_expired INTEGER DEFAULT 0")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_subscription_end ON users(subscription_end)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_users_notified_3days ON users(notified_3days)")
         conn.commit()
@@ -813,14 +863,12 @@ def save_keys_to_db(keys):
         _keys_cache_time = time.time()
 
 def get_subscription_keys_from_db():
-    """Ключи для /sub эндпоинта (отдельная база)"""
     val = get_setting('subscription_keys', '')
     if not val:
         return []
     return [k for k in val.split('|||') if k]
 
 def save_subscription_keys_to_db(keys):
-    """Сохранить ключи подписки"""
     cleaned = list(dict.fromkeys(k for k in keys if k))
     set_setting('subscription_keys', '|||'.join(cleaned))
 
@@ -1585,25 +1633,36 @@ def _parse_keys_from_content(content, depth=0, visited_urls=None):
     if visited_urls is None:
         visited_urls = set()
     
+    content_stripped = content.strip()
+    try:
+        parsed = json.loads(content_stripped)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str):
+                    if '://' in item:
+                        vpn = _extract_vpn_keys(item)
+                        if vpn:
+                            all_keys.extend(vpn)
+                    elif len(item) > 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', item):
+                        decoded = _try_b64(item)
+                        if decoded:
+                            all_keys.extend(_extract_vpn_keys(decoded))
+        elif isinstance(parsed, dict):
+            if 'outbounds' in parsed:
+                all_keys.extend(_parse_singbox_json(parsed))
+            if 'proxies' in parsed or 'Proxies' in parsed:
+                all_keys.extend(_parse_clash_yaml(content_stripped))
+            all_keys.extend(_parse_json_recursive(parsed))
+        if all_keys:
+            return _dedup(all_keys)
+    except:
+        pass
+    
     direct_keys = _extract_vpn_keys(content)
     all_keys.extend(direct_keys)
     
     json_keys = _extract_keys_from_json(content)
     all_keys.extend(json_keys)
-    
-    try:
-        parsed = json.loads(content)
-        if isinstance(parsed, list):
-            for item in parsed:
-                if isinstance(item, str):
-                    if '://' in item:
-                        all_keys.extend(_extract_vpn_keys(item))
-                    elif len(item) > 30 and re.match(r'^[A-Za-z0-9+/_\-=]+$', item):
-                        decoded = _try_b64(item)
-                        if decoded:
-                            all_keys.extend(_extract_vpn_keys(decoded))
-    except:
-        pass
     
     for line in content.splitlines():
         line = line.strip()
@@ -2690,7 +2749,6 @@ def _parse_subscription_any(raw, steps=None):
         content = resp.text.strip()
         steps.append(f"✅ Загружено {len(content)} символов")
         
-        # Попытка 1: весь контент как base64
         content_no_whitespace = re.sub(r'[\s\r\n]', '', content)
         if len(content_no_whitespace) > 50 and re.match(r'^[A-Za-z0-9+/_\-=]+$', content_no_whitespace):
             steps.append(f"🔄 Пробую base64 ({len(content_no_whitespace)} символов)...")
@@ -2715,7 +2773,6 @@ def _parse_subscription_any(raw, steps=None):
                 if not re.match(r'^[A-Za-z0-9+/_\-=]+$', current):
                     break
         
-        # Попытка 2: строки по одной
         lines = [l.strip() for l in content.splitlines() if l.strip()]
         if len(lines) > 1:
             steps.append(f"🔄 Пробую построчный парсинг ({len(lines)} строк)...")
@@ -2741,7 +2798,6 @@ def _parse_subscription_any(raw, steps=None):
                 steps.append(f"✅ Найдено {len(line_keys)} ключей построчно")
                 return _dedup(line_keys), steps
         
-        # Попытка 3: JSON напрямую
         try:
             data = json.loads(content)
             json_keys = []
@@ -2763,14 +2819,12 @@ def _parse_subscription_any(raw, steps=None):
         except:
             pass
         
-        # Попытка 4: YAML
         if 'proxies:' in content.lower():
             yaml_keys = _parse_clash_yaml(content)
             if yaml_keys:
                 steps.append(f"✅ Найдено {len(yaml_keys)} ключей из YAML")
                 return _dedup(yaml_keys), steps
         
-        # Оригинальные проверки
         if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
             decoded = _try_multilevel_b64(content, max_depth=5)
             if decoded:
@@ -3139,6 +3193,8 @@ def auto_post_keys_to_channel():
     finally:
         with _autopost_lock:
             _autopost_running = False
+
+# ==================== ОСНОВНЫЕ ОБРАБОТЧИКИ МЕНЮ ====================
 
 @bot.message_handler(func=lambda m: m.text == "👤 Личный кабинет")
 def cabinet(message):
@@ -5126,7 +5182,13 @@ def callback_give_sub(call):
             return
         current_time = int(time.time())
         new_end = current_time + 30 * 24 * 60 * 60
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        cur.execute("""
+            UPDATE users SET 
+                subscription_end = %s, 
+                notified_3days = 0, 
+                notified_expired = 0 
+            WHERE user_id = %s
+        """, (new_end, target_id))
         conn.commit()
     finally:
         try:
@@ -5166,7 +5228,13 @@ def callback_prolong(call):
         current_time = int(time.time())
         current_end = result[0] if (result[0] and result[0] > current_time) else current_time
         new_end = current_end + days * 24 * 60 * 60
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        cur.execute("""
+            UPDATE users SET 
+                subscription_end = %s, 
+                notified_3days = 0, 
+                notified_expired = 0 
+            WHERE user_id = %s
+        """, (new_end, target_id))
         conn.commit()
     finally:
         try:
@@ -5909,193 +5977,7 @@ def is_user_blocked_bot(user_id):
     
     return blocked
 
-# ==================== ОБРАБОТЧИКИ ГРУППОВЫХ СООБЩЕНИЙ (В КОНЦЕ) ====================
-
-@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'])
-def handle_group_message(message):
-    if message.text:
-        text = message.text.strip()
-        if text.startswith('/'):
-            return
-        if not text:
-            return
-    elif not message.caption:
-        return
-    
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    current_time = int(time.time())
-    
-    conn = None
-    cur = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        cur.execute(
-            "SELECT enabled, points_per_message FROM points_chats WHERE chat_id = %s",
-            (chat_id,)
-        )
-        chat = cur.fetchone()
-        if not chat or not chat[0]:
-            return
-        
-        points_per_msg = chat[1]
-        
-        cur.execute(
-            "SELECT user_id, is_blocked, points_today, points_today_date FROM users WHERE user_id = %s",
-            (user_id,)
-        )
-        user = cur.fetchone()
-        if not user or user[1] == 1:
-            return
-        
-        if is_user_blocked_bot(user_id):
-            return
-        
-        cur.execute(
-            "SELECT last_message FROM chat_activity WHERE user_id = %s AND chat_id = %s",
-            (user_id, chat_id)
-        )
-        activity = cur.fetchone()
-        
-        if activity and current_time - activity[0] < 3:
-            return
-        
-        DAILY_POINTS_LIMIT = 100
-        points_today = user[2] or 0
-        points_today_date = user[3] or 0
-        
-        today_start = current_time - (current_time % 86400)
-        if points_today_date < today_start:
-            points_today = 0
-            points_today_date = today_start
-        
-        if points_today >= DAILY_POINTS_LIMIT:
-            cur.execute("""
-                INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
-                VALUES (%s, %s, 1, %s)
-                ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                    messages_count = chat_activity.messages_count + 1,
-                    last_message = %s
-            """, (user_id, chat_id, current_time, current_time))
-            conn.commit()
-            return
-        
-        conn.autocommit = False
-        
-        try:
-            cur.execute("""
-                INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
-                VALUES (%s, %s, 1, %s)
-                ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                    messages_count = chat_activity.messages_count + 1,
-                    last_message = %s
-            """, (user_id, chat_id, current_time, current_time))
-            
-            points_to_add = min(points_per_msg, DAILY_POINTS_LIMIT - points_today)
-            if points_to_add > 0:
-                cur.execute(
-                    "UPDATE users SET points = points + %s, points_today = points_today + %s, points_today_date = %s WHERE user_id = %s",
-                    (points_to_add, points_to_add, today_start, user_id)
-                )
-            
-            if message.text:
-                log_text = message.text[:500]
-                cur.execute("""
-                    INSERT INTO chat_messages_log 
-                    (user_id, chat_id, message_text, message_id, created_at)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (user_id, chat_id, log_text, message.message_id, current_time))
-                
-                cur.execute("""
-                    DELETE FROM chat_messages_log 
-                    WHERE chat_id = %s AND id NOT IN (
-                        SELECT id FROM chat_messages_log 
-                        WHERE chat_id = %s 
-                        ORDER BY created_at DESC 
-                        LIMIT 1000
-                    )
-                """, (chat_id, chat_id))
-            
-            conn.commit()
-            
-        except Exception as inner_e:
-            try:
-                conn.rollback()
-            except:
-                pass
-            raise inner_e
-        finally:
-            try:
-                conn.autocommit = True
-            except:
-                pass
-        
-    except Exception as e:
-        print(f"[group_message] Ошибка: {e}")
-        if conn:
-            try:
-                conn.rollback()
-            except:
-                pass
-    finally:
-        if cur:
-            try:
-                cur.close()
-            except:
-                pass
-        if conn:
-            try:
-                conn.autocommit = True
-            except:
-                pass
-            return_db_connection(conn)
-
-@bot.message_handler(content_types=['new_chat_members'])
-def handle_new_chat_members(message):
-    if message.chat.type not in ['group', 'supergroup']:
-        return
-    
-    chat_id = message.chat.id
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT welcome_text, welcome_enabled FROM chat_settings WHERE chat_id = %s",
-            (chat_id,)
-        )
-        result = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    
-    if not result or not result[0] or not result[1]:
-        return
-    
-    welcome_text, enabled = result
-    if not enabled:
-        return
-    
-    for member in message.new_chat_members:
-        if member.is_bot:
-            continue
-        try:
-            name = member.first_name or member.username or str(member.id)
-            text = welcome_text.format(
-                name=name,
-                chat=message.chat.title or 'чат',
-                id=member.id
-            )
-            bot.send_message(chat_id, text)
-        except Exception as e:
-            print(f"[welcome] Ошибка отправки приветствия: {e}")
-
-DAILY_BONUS_POINTS = 50
-DAILY_BONUS_COOLDOWN = 86400
+# ==================== КОМАНДЫ ЧАТОВ ====================
 
 @bot.message_handler(commands=['bonus'])
 def cmd_bonus(message):
@@ -7068,6 +6950,60 @@ def cmd_chatadmins(message):
 
     bot.reply_to(message, text, parse_mode="Markdown")
 
+@bot.message_handler(commands=['consent'])
+def cmd_consent(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.chat.type == 'private':
+        bot.reply_to(message, "❌ Эта команда доступна только в групповых чатах.")
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO user_consents (user_id, logging_consent, consent_given_at)
+            VALUES (%s, TRUE, %s)
+            ON CONFLICT (user_id) DO UPDATE SET logging_consent = TRUE, consent_given_at = %s
+        """, (user_id, int(time.time()), int(time.time())))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    bot.reply_to(message, "✅ Спасибо! Ваши сообщения будут логироваться для начисления баллов.\n\nДля отзыва согласия используйте /revoke")
+
+@bot.message_handler(commands=['revoke'])
+def cmd_revoke(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    
+    if message.chat.type == 'private':
+        bot.reply_to(message, "❌ Эта команда доступна только в групповых чатах.")
+        return
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE user_consents SET logging_consent = FALSE WHERE user_id = %s
+        """, (user_id,))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    bot.reply_to(message, "✅ Согласие отозвано. Ваши сообщения больше не будут логироваться для начисления баллов.")
+
+# ==================== ОБРАБОТЧИК ВХОДА БОТА В ЧАТ ====================
+
 @bot.my_chat_member_handler()
 def handle_bot_added_to_chat(update):
     chat = update.chat
@@ -7115,6 +7051,200 @@ def _register_chat_owner(chat_id):
                 break
     except Exception as e:
         print(f"[chat_owner] Ошибка регистрации владельца чата {chat_id}: {e}")
+
+# ==================== ОБРАБОТЧИКИ ГРУППОВЫХ СООБЩЕНИЙ (В КОНЦЕ) ====================
+
+@bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'])
+def handle_group_message(message):
+    if message.text:
+        text = message.text.strip()
+        if text.startswith('/'):
+            return
+        if not text:
+            return
+    elif not message.caption:
+        return
+    
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    current_time = int(time.time())
+    
+    conn = None
+    cur = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute(
+            "SELECT enabled, points_per_message FROM points_chats WHERE chat_id = %s",
+            (chat_id,)
+        )
+        chat = cur.fetchone()
+        if not chat or not chat[0]:
+            return
+        
+        points_per_msg = chat[1]
+        
+        # Проверяем согласие на логирование
+        cur.execute(
+            "SELECT logging_consent FROM user_consents WHERE user_id = %s",
+            (user_id,)
+        )
+        consent = cur.fetchone()
+        has_consent = consent and consent[0]
+        
+        cur.execute(
+            "SELECT user_id, is_blocked, points_today, points_today_date FROM users WHERE user_id = %s",
+            (user_id,)
+        )
+        user = cur.fetchone()
+        if not user or user[1] == 1:
+            return
+        
+        if is_user_blocked_bot(user_id):
+            return
+        
+        cur.execute(
+            "SELECT last_message FROM chat_activity WHERE user_id = %s AND chat_id = %s",
+            (user_id, chat_id)
+        )
+        activity = cur.fetchone()
+        
+        if activity and current_time - activity[0] < 3:
+            return
+        
+        DAILY_POINTS_LIMIT = 100
+        points_today = user[2] or 0
+        points_today_date = user[3] or 0
+        
+        today_start = current_time - (current_time % 86400)
+        if points_today_date < today_start:
+            points_today = 0
+            points_today_date = today_start
+        
+        if points_today >= DAILY_POINTS_LIMIT:
+            cur.execute("""
+                INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
+                VALUES (%s, %s, 1, %s)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    messages_count = chat_activity.messages_count + 1,
+                    last_message = %s
+            """, (user_id, chat_id, current_time, current_time))
+            conn.commit()
+            return
+        
+        conn.autocommit = False
+        
+        try:
+            cur.execute("""
+                INSERT INTO chat_activity (user_id, chat_id, messages_count, last_message)
+                VALUES (%s, %s, 1, %s)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    messages_count = chat_activity.messages_count + 1,
+                    last_message = %s
+            """, (user_id, chat_id, current_time, current_time))
+            
+            points_to_add = min(points_per_msg, DAILY_POINTS_LIMIT - points_today)
+            if points_to_add > 0:
+                cur.execute(
+                    "UPDATE users SET points = points + %s, points_today = points_today + %s, points_today_date = %s WHERE user_id = %s",
+                    (points_to_add, points_to_add, today_start, user_id)
+                )
+            
+            # Логируем только если есть согласие
+            if message.text and has_consent:
+                log_text = message.text[:500]
+                cur.execute("""
+                    INSERT INTO chat_messages_log 
+                    (user_id, chat_id, message_text, message_id, created_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, chat_id, log_text, message.message_id, current_time))
+                
+                cur.execute("""
+                    DELETE FROM chat_messages_log 
+                    WHERE chat_id = %s AND id NOT IN (
+                        SELECT id FROM chat_messages_log 
+                        WHERE chat_id = %s 
+                        ORDER BY created_at DESC 
+                        LIMIT 1000
+                    )
+                """, (chat_id, chat_id))
+            
+            conn.commit()
+            
+        except Exception as inner_e:
+            try:
+                conn.rollback()
+            except:
+                pass
+            raise inner_e
+        finally:
+            try:
+                conn.autocommit = True
+            except:
+                pass
+        
+    except Exception as e:
+        print(f"[group_message] Ошибка: {e}")
+        if conn:
+            try:
+                conn.rollback()
+            except:
+                pass
+    finally:
+        if cur:
+            try:
+                cur.close()
+            except:
+                pass
+        if conn:
+            try:
+                conn.autocommit = True
+            except:
+                pass
+            return_db_connection(conn)
+
+@bot.message_handler(content_types=['new_chat_members'])
+def handle_new_chat_members(message):
+    if message.chat.type not in ['group', 'supergroup']:
+        return
+    
+    chat_id = message.chat.id
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT welcome_text, welcome_enabled FROM chat_settings WHERE chat_id = %s",
+            (chat_id,)
+        )
+        result = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    if not result or not result[0] or not result[1]:
+        return
+    
+    welcome_text, enabled = result
+    if not enabled:
+        return
+    
+    for member in message.new_chat_members:
+        if member.is_bot:
+            continue
+        try:
+            name = member.first_name or member.username or str(member.id)
+            text = welcome_text.format(
+                name=name,
+                chat=message.chat.title or 'чат',
+                id=member.id
+            )
+            bot.send_message(chat_id, text)
+        except Exception as e:
+            print(f"[welcome] Ошибка отправки приветствия: {e}")
 
 # ==================== FLASK APP ====================
 
@@ -7225,6 +7355,7 @@ def subscription(token):
 @bot.callback_query_handler(func=lambda call: (
     call.data.startswith('admin_') or 
     call.data.startswith('add_admin_') or
+    call.data.startswith('edit_admin_') or
     call.data.startswith('toggle_perm_') or
     call.data.startswith('reset_perm_') or
     call.data.startswith('autopost_') or
@@ -7241,6 +7372,32 @@ def admin_callback(call):
         return
     data = call.data
 
+    # ===== ЯВНАЯ ОБРАБОТКА СИСТЕМЫ БАЛЛОВ =====
+    if data == "admin_points_chats":
+        if not has_permission(user_id, 'points_system'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_points_chats(call)
+        return
+
+    if data == "admin_points_log":
+        if not has_permission(user_id, 'points_system'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_points_log(call)
+        return
+
+    if data == "admin_points_top":
+        if not has_permission(user_id, 'points_system'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        _show_admin_points_top(call)
+        return
+
+    # ===== НАВИГАЦИЯ =====
     if data == "admin_back":
         try:
             bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -7264,6 +7421,7 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         return
 
+    # ===== УПРАВЛЕНИЕ КЛЮЧАМИ =====
     if data == "admin_keys" or data.startswith("admin_keys_"):
         if not has_permission(user_id, 'manage_keys'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -7321,6 +7479,7 @@ def admin_callback(call):
             t.start()
         return
 
+    # ===== ЗАГРУЗКА КЛЮЧЕЙ ПОДПИСКИ =====
     if data == "admin_sub_keys_load":
         if not has_permission(user_id, 'manage_keys'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -7368,6 +7527,7 @@ def admin_callback(call):
         show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
         return
 
+    # ===== РАССЫЛКА =====
     if data == "admin_announce":
         if not has_permission(user_id, 'announce'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -7459,6 +7619,7 @@ def admin_callback(call):
             search_cache[user_id] = {'action': 'add_broadcast_channel', 'timestamp': int(time.time())}
         return
 
+    # ===== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ =====
     if data == "admin_manage_users":
         if not has_permission(user_id, 'manage_users'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -7499,6 +7660,7 @@ def admin_callback(call):
             bot.send_message(user_id, f"👥 Пользователи ({len(users)}):", reply_markup=kb)
         return
 
+    # ===== АВТОПОСТИНГ =====
     if data == "admin_autopost":
         if not has_permission(user_id, 'autopost'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -7634,6 +7796,7 @@ def admin_callback(call):
             search_cache[user_id] = {'action': 'autopost_set_interval', 'timestamp': int(time.time())}
         return
 
+    # ===== УПРАВЛЕНИЕ АДМИНАМИ =====
     if data == "admin_manage_admins":
         if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление админами.")
@@ -7724,36 +7887,13 @@ def admin_callback(call):
         )
         return
 
+    # ===== СИСТЕМА БАЛЛОВ (остальные) =====
     if data == "admin_points_system":
         if not has_permission(user_id, 'points_system'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
         bot.answer_callback_query(call.id)
         _show_admin_points_system(call)
-        return
-
-    if data == "admin_points_chats":
-        if not has_permission(user_id, 'points_system'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав")
-            return
-        bot.answer_callback_query(call.id)
-        _show_admin_points_chats(call)
-        return
-
-    if data == "admin_points_log":
-        if not has_permission(user_id, 'points_system'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав")
-            return
-        bot.answer_callback_query(call.id)
-        _show_admin_points_log(call)
-        return
-
-    if data == "admin_points_top":
-        if not has_permission(user_id, 'points_system'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав")
-            return
-        bot.answer_callback_query(call.id)
-        _show_admin_points_top(call)
         return
 
     if data == "admin_points_add_chat":
@@ -7828,6 +7968,7 @@ def admin_callback(call):
         _show_admin_points_chats(call)
         return
 
+    # ===== ЛОГИ =====
     if data == "admin_view_logs":
         if not has_permission(user_id, 'view_logs'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав на просмотр логов")
@@ -7836,6 +7977,7 @@ def admin_callback(call):
         _show_admin_logs(call)
         return
 
+    # ===== ОБРАБОТКА edit_admin_{id} =====
     if data.startswith("edit_admin_") and data != 'edit_admin_perms':
         if not has_permission(user_id, 'manage_admins'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
@@ -7866,6 +8008,7 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         return
 
+    # ===== ДЕЛЕГИРОВАНИЕ ОСТАЛЬНЫХ CALLBACK =====
     if data.startswith("filter_") or data.startswith("page_") or data in ('back_to_list', 'close_manage'):
         callback_user_list_nav(call)
         return
@@ -8248,6 +8391,8 @@ def callback_admin_keys_proxy_finish(call):
     t.daemon = True
     t.start()
 
+# ==================== PRIVATE MESSAGES ====================
+
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and not (m.text or '').startswith('/'))
 def handle_private_messages(message):
     user_id = message.from_user.id
@@ -8422,6 +8567,8 @@ def handle_private_messages(message):
 
     if text:
         bot.reply_to(message, "Используйте кнопки меню или /cancel для отмены текущего режима.", reply_markup=main_menu())
+
+# ==================== PRIORITY COMMAND HANDLER ====================
 
 @bot.message_handler(commands=['admin', 'check', 'user', 'add_days', 'remove_days', 
                                 'block', 'unblock', 'cancel', 'ref', 'ref_debug', 
@@ -8604,7 +8751,13 @@ def cmd_add_days(message):
         current_time = int(time.time())
         current_end = result[0] if (result[0] and result[0] > current_time) else current_time
         new_end = current_end + days * 24 * 60 * 60
-        cur.execute("UPDATE users SET subscription_end = %s, notified_3days = 0 WHERE user_id = %s", (new_end, target_id))
+        cur.execute("""
+            UPDATE users SET 
+                subscription_end = %s, 
+                notified_3days = 0, 
+                notified_expired = 0 
+            WHERE user_id = %s
+        """, (new_end, target_id))
         conn.commit()
         log_admin_action(user_id, f"Выдал {days} дней {target_id}", target_id=target_id)
         bot.reply_to(message, f"✅ +{days} дней")
@@ -9165,6 +9318,8 @@ if __name__ == "__main__":
                 types.BotCommand("rank", "Ваш ранг"),
                 types.BotCommand("decrypt", "Расшифровать подписку"),
                 types.BotCommand("modhelp", "Помощь по модерации"),
+                types.BotCommand("consent", "Согласие на логирование"),
+                types.BotCommand("revoke", "Отозвать согласие"),
             ])
         except Exception as e:
             print(f"[set_commands] Ошибка: {e}")
