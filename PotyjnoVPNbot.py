@@ -812,6 +812,18 @@ def save_keys_to_db(keys):
         _keys_cache = cleaned.copy()
         _keys_cache_time = time.time()
 
+def get_subscription_keys_from_db():
+    """Ключи для /sub эндпоинта (отдельная база)"""
+    val = get_setting('subscription_keys', '')
+    if not val:
+        return []
+    return [k for k in val.split('|||') if k]
+
+def save_subscription_keys_to_db(keys):
+    """Сохранить ключи подписки"""
+    cleaned = list(dict.fromkeys(k for k in keys if k))
+    set_setting('subscription_keys', '|||'.join(cleaned))
+
 def add_key_to_db(key):
     with _keys_lock:
         keys = get_keys_from_db()
@@ -990,8 +1002,10 @@ def _extract_vpn_keys(text):
         cleaned.append(k)
     return cleaned
 
-def _try_b64(data, min_len=16):
+def _try_b64(data, min_len=16, max_len=200000):
     if not data:
+        return None
+    if len(data) > max_len:
         return None
     cleaned = re.sub(r'\s+', '', data.strip())
     if len(cleaned) < min_len:
@@ -1093,6 +1107,18 @@ def load_keys_from_url(raw_url):
                 session.close()
     if not content:
         return []
+    
+    content_no_whitespace = re.sub(r'[\s\r\n]', '', content.strip())
+    if len(content_no_whitespace) > 50 and re.match(r'^[A-Za-z0-9+/_\-=]+$', content_no_whitespace):
+        decoded = _try_multilevel_b64(content_no_whitespace, max_depth=5)
+        if decoded:
+            all_keys = []
+            for item in decoded:
+                all_keys.extend(_extract_vpn_keys(item))
+                all_keys.extend(_extract_keys_from_json(item))
+            if all_keys:
+                return _dedup(all_keys)
+    
     visited = {url}
     return _parse_keys_from_content(content, depth=0, visited_urls=visited)
 
@@ -1565,6 +1591,29 @@ def _parse_keys_from_content(content, depth=0, visited_urls=None):
     json_keys = _extract_keys_from_json(content)
     all_keys.extend(json_keys)
     
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str):
+                    if '://' in item:
+                        all_keys.extend(_extract_vpn_keys(item))
+                    elif len(item) > 30 and re.match(r'^[A-Za-z0-9+/_\-=]+$', item):
+                        decoded = _try_b64(item)
+                        if decoded:
+                            all_keys.extend(_extract_vpn_keys(decoded))
+    except:
+        pass
+    
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if len(line) >= 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', line):
+            decoded = _try_b64(line)
+            if decoded:
+                all_keys.extend(_extract_vpn_keys(decoded))
+    
     cleaned = re.sub(r'\s+', '', content.strip())
     if len(cleaned) >= 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', cleaned):
         decoded_items = _try_multilevel_b64(cleaned, max_depth=5)
@@ -1587,12 +1636,6 @@ def _parse_keys_from_content(content, depth=0, visited_urls=None):
         line = line.strip()
         if not line:
             continue
-        all_keys.extend(_extract_vpn_keys(line))
-        if len(line) >= 16 and re.match(r'^[A-Za-z0-9+/_\-=]+$', line):
-            decoded_line = _try_multilevel_b64(line, max_depth=4)
-            for dk in decoded_line:
-                all_keys.extend(_extract_vpn_keys(dk))
-                all_keys.extend(_extract_keys_from_json(dk))
         if url_counter < MAX_URLS_PER_PARSE:
             urls = re.findall(r'https?://[^\s<>"\']+', line)
             for url in urls:
@@ -2096,6 +2139,7 @@ def admin_menu():
 
 def show_keys_menu(user_id, chat_id, message_id):
     keys = get_keys_from_db()
+    sub_keys = get_subscription_keys_from_db()
     total_issued = int(get_setting('total_keys_issued', '0'))
     total_checked = int(get_setting('total_keys_checked', '0'))
     proxy_url = get_setting('proxy_sub_url', '')
@@ -2117,7 +2161,8 @@ def show_keys_menu(user_id, chat_id, message_id):
     
     text = (
         f"🔑 *Управление ключами*\n\n"
-        f"📦 Ключей в базе: {len(keys)}\n"
+        f"📡 *Автопостинг:* {len(keys)} ключей\n"
+        f"📋 *Подписка /sub:* {len(sub_keys)} ключей\n"
         f"🗑️ Выдано ключей: {total_issued}\n"
         f"📊 Всего проверено: {total_checked}\n"
         f"🌐 Прокси ссылка: {proxy_status}\n\n"
@@ -2129,18 +2174,21 @@ def show_keys_menu(user_id, chat_id, message_id):
     
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("📥 Загрузить ключи", callback_data="admin_keys_load"),
-        types.InlineKeyboardButton("🌐 Загрузить из прокси", callback_data="admin_keys_proxy_menu")
+        types.InlineKeyboardButton("📥 Ключи автопостинга", callback_data="admin_keys_load"),
+        types.InlineKeyboardButton("📥 Ключи подписки", callback_data="admin_sub_keys_load")
     )
     kb.add(
-        types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="admin_keys_clean_dead"),
-        types.InlineKeyboardButton("🗑️ Очистить все", callback_data="admin_keys_clear_all")
+        types.InlineKeyboardButton("🌐 Загрузить из прокси", callback_data="admin_keys_proxy_menu"),
+        types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="admin_keys_clean_dead")
     )
     kb.add(
-        types.InlineKeyboardButton("🔄 Автообновление", callback_data="admin_keys_auto_update"),
-        types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued")
+        types.InlineKeyboardButton("🗑️ Очистить все", callback_data="admin_keys_clear_all"),
+        types.InlineKeyboardButton("🔄 Автообновление", callback_data="admin_keys_auto_update")
     )
-    kb.add(types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel"))
+    kb.add(
+        types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued"),
+        types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
+    )
     
     sent = False
     if message_id:
@@ -2323,7 +2371,7 @@ _decrypt_thread_semaphore = threading.Semaphore(DECRYPT_MAX_THREADS)
 def _do_decrypt(message, user_id, text=None, file_bytes=None, file_name=None):
     with _cache_lock:
         existing = decrypt_results.get(user_id, {})
-        if existing.get('waiting', False):
+        if existing.get('task_id'):
             try:
                 bot.reply_to(message, "⏳ У вас уже выполняется расшифровка. Подождите...")
             except:
@@ -2642,6 +2690,87 @@ def _parse_subscription_any(raw, steps=None):
         content = resp.text.strip()
         steps.append(f"✅ Загружено {len(content)} символов")
         
+        # Попытка 1: весь контент как base64
+        content_no_whitespace = re.sub(r'[\s\r\n]', '', content)
+        if len(content_no_whitespace) > 50 and re.match(r'^[A-Za-z0-9+/_\-=]+$', content_no_whitespace):
+            steps.append(f"🔄 Пробую base64 ({len(content_no_whitespace)} символов)...")
+            all_decoded_keys = []
+            current = content_no_whitespace
+            for depth in range(5):
+                decoded = _try_b64(current)
+                if not decoded:
+                    break
+                steps.append(f"✅ Base64 уровень {depth+1}: {len(decoded)} символов")
+                direct = _extract_vpn_keys(decoded)
+                if direct:
+                    all_decoded_keys.extend(direct)
+                    steps.append(f"✅ Найдено {len(direct)} ключей из base64")
+                    return _dedup(all_decoded_keys), steps
+                json_keys = _extract_keys_from_json(decoded)
+                if json_keys:
+                    all_decoded_keys.extend(json_keys)
+                    steps.append(f"✅ Найдено {len(json_keys)} ключей из JSON в base64")
+                    return _dedup(all_decoded_keys), steps
+                current = re.sub(r'[\s\r\n]', '', decoded)
+                if not re.match(r'^[A-Za-z0-9+/_\-=]+$', current):
+                    break
+        
+        # Попытка 2: строки по одной
+        lines = [l.strip() for l in content.splitlines() if l.strip()]
+        if len(lines) > 1:
+            steps.append(f"🔄 Пробую построчный парсинг ({len(lines)} строк)...")
+            line_keys = []
+            for line in lines:
+                direct = _extract_vpn_keys(line)
+                if direct:
+                    line_keys.extend(direct)
+                    continue
+                if len(line) > 20 and re.match(r'^[A-Za-z0-9+/_\-=]+$', line):
+                    decoded = _try_b64(line)
+                    if decoded:
+                        line_keys.extend(_extract_vpn_keys(decoded))
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict) or isinstance(data, list):
+                        json_keys = _extract_keys_from_json(line)
+                        if json_keys:
+                            line_keys.extend(json_keys)
+                except:
+                    pass
+            if line_keys:
+                steps.append(f"✅ Найдено {len(line_keys)} ключей построчно")
+                return _dedup(line_keys), steps
+        
+        # Попытка 3: JSON напрямую
+        try:
+            data = json.loads(content)
+            json_keys = []
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, str) and '://' in item:
+                        json_keys.extend(_extract_vpn_keys(item))
+                    elif isinstance(item, dict):
+                        json_keys.extend(_parse_json_recursive(item))
+            elif isinstance(data, dict):
+                if 'outbounds' in data:
+                    json_keys.extend(_parse_singbox_json(data))
+                if 'proxies' in data or 'Proxies' in data:
+                    json_keys.extend(_parse_clash_yaml(json.dumps(data)))
+                json_keys.extend(_parse_json_recursive(data))
+            if json_keys:
+                steps.append(f"✅ Найдено {len(json_keys)} ключей из JSON")
+                return _dedup(json_keys), steps
+        except:
+            pass
+        
+        # Попытка 4: YAML
+        if 'proxies:' in content.lower():
+            yaml_keys = _parse_clash_yaml(content)
+            if yaml_keys:
+                steps.append(f"✅ Найдено {len(yaml_keys)} ключей из YAML")
+                return _dedup(yaml_keys), steps
+        
+        # Оригинальные проверки
         if re.match(r'^[A-Za-z0-9+/_\-=]+$', content) and len(content) > 50:
             decoded = _try_multilevel_b64(content, max_depth=5)
             if decoded:
@@ -3010,8 +3139,6 @@ def auto_post_keys_to_channel():
     finally:
         with _autopost_lock:
             _autopost_running = False
-
-# ОБРАБОТЧИКИ КНОПОК МЕНЮ
 
 @bot.message_handler(func=lambda m: m.text == "👤 Личный кабинет")
 def cabinet(message):
@@ -3527,10 +3654,42 @@ def cmd_decrypt(message):
             keys, steps = _parse_subscription_any(url, [])
             
             if not keys:
+                try:
+                    resp = _safe_request(url, timeout=30, headers={'User-Agent': 'v2rayNG/1.8.7'})
+                    if resp.status_code == 200:
+                        content = resp.text.strip()
+                        content_clean = re.sub(r'[\s\r\n]', '', content)
+                        if re.match(r'^[A-Za-z0-9+/_\-=]+$', content_clean):
+                            decoded = _try_b64(content_clean)
+                            if decoded:
+                                keys = _extract_vpn_keys(decoded)
+                                if not keys:
+                                    keys = _extract_keys_from_json(decoded)
+                        if not keys:
+                            try:
+                                data = json.loads(content)
+                                if isinstance(data, list):
+                                    for item in data:
+                                        if isinstance(item, str) and '://' in item:
+                                            keys.extend(_extract_vpn_keys(item))
+                                elif isinstance(data, dict):
+                                    if 'outbounds' in data:
+                                        keys.extend(_parse_singbox_json(data))
+                                    keys.extend(_parse_json_recursive(data))
+                                keys = _dedup(keys)
+                            except:
+                                pass
+                        if not keys and 'proxies:' in content.lower():
+                            keys = _parse_clash_yaml(content)
+                except Exception as e:
+                    print(f"[decrypt] Прямой парсинг: {e}")
+            
+            if not keys:
                 info = '\n'.join(steps) if steps else '—'
                 err_text = (
                     "❌ Не удалось найти VPN ключи\n\n"
-                    f"Шаги:\n{info}"
+                    f"Шаги:\n{info}\n\n"
+                    "Убедитесь что ссылка содержит ключи."
                 )
                 try:
                     bot.edit_message_text(err_text, chat_id, wait_msg.message_id)
@@ -4517,41 +4676,6 @@ def callback_reset_perm(call):
     log_admin_action(user_id, f"Сбросил права {target_id} к роли {role}", target_id=target_id)
     bot.answer_callback_query(call.id, f"✅ Права сброшены к роли {role}")
     _redraw_admin_perms(call, target_id)
-
-@bot.callback_query_handler(func=lambda call: 
-    call.data.startswith('edit_admin_') and 
-    call.data != 'edit_admin_perms' and
-    len(call.data.split('_')) == 3
-)
-def callback_edit_admin(call):
-    user_id = call.from_user.id
-    if not has_permission(user_id, 'manage_admins'):
-        bot.answer_callback_query(call.id, "⛔️ Нет прав")
-        return
-    try:
-        target_id = int(call.data.split('_')[2])
-    except (ValueError, IndexError):
-        bot.answer_callback_query(call.id, "❌ Ошибка")
-        return
-    if target_id == ADMIN_ID:
-        bot.answer_callback_query(call.id, "❌ Нельзя редактировать владельца.")
-        return
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
-        result = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    if not result:
-        bot.answer_callback_query(call.id, "❌ Админ не найден.")
-        return
-    _redraw_admin_perms(call, target_id)
-    bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('filter_') or 
                              call.data.startswith('page_') or
@@ -5785,9 +5909,17 @@ def is_user_blocked_bot(user_id):
     
     return blocked
 
+# ==================== ОБРАБОТЧИКИ ГРУППОВЫХ СООБЩЕНИЙ (В КОНЦЕ) ====================
+
 @bot.message_handler(func=lambda m: m.chat.type in ['group', 'supergroup'])
 def handle_group_message(message):
-    if message.text and message.text.startswith('/'):
+    if message.text:
+        text = message.text.strip()
+        if text.startswith('/'):
+            return
+        if not text:
+            return
+    elif not message.caption:
         return
     
     user_id = message.from_user.id
@@ -6228,6 +6360,762 @@ def cmd_rank(message):
             pass
         return_db_connection(conn)
 
+# ==================== МОДЕРАЦИЯ ====================
+
+def parse_duration(text):
+    if text in ('permanent', 'навсегда', '0'):
+        return None
+    match = re.match(r'^(\d+)(s|m|h|d)$', text.lower())
+    if not match:
+        return None
+    value, unit = int(match.group(1)), match.group(2)
+    multipliers = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
+    return value * multipliers[unit]
+
+def is_chat_admin(user_id, chat_id):
+    if user_id == ADMIN_ID:
+        return True
+    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
+        return True
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        if member.status in ['administrator', 'creator']:
+            return True
+    except:
+        pass
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id FROM chat_admins WHERE user_id = %s AND chat_id = %s",
+            (user_id, chat_id)
+        )
+        return cur.fetchone() is not None
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+def is_chat_owner(user_id, chat_id):
+    if user_id == ADMIN_ID:
+        return True
+    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
+        return True
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        return member.status == 'creator'
+    except:
+        return False
+
+def _get_user_from_message(message):
+    if message.reply_to_message:
+        return message.reply_to_message.from_user.id, message.reply_to_message.from_user.first_name
+    text = message.text or ''
+    parts = text.split(None, 2)
+    if len(parts) < 2:
+        return None, None
+    target_id = get_user_id_from_input(parts[1])
+    return target_id, str(target_id) if target_id else None
+
+WARN_LIMIT = 3
+
+@bot.message_handler(commands=['welcome'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_welcome_info(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        if member.status not in ['administrator', 'creator']:
+            bot.reply_to(message, "⛔️ Только для администраторов чата.")
+            return
+    except:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT welcome_text, welcome_enabled FROM chat_settings WHERE chat_id = %s", (chat_id,))
+        result = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    if not result or not result[0]:
+        text = (
+            "ℹ️ *Приветствие*\n\n"
+            "Сейчас используется стандартное приветствие.\n\n"
+            "Команды:\n"
+            "`/setwelcome текст` — установить своё\n"
+            "`/welcomeoff` — отключить\n"
+            "`/welcomeon` — включить\n\n"
+            "Переменные: `{name}`, `{chat}`, `{id}`"
+        )
+    else:
+        welcome_text, enabled = result
+        status = "✅ Включено" if enabled else "❌ Отключено"
+        text = (
+            f"ℹ️ *Приветствие* — {status}\n\n"
+            f"📝 Текущий текст:\n`{welcome_text}`\n\n"
+            "Команды:\n"
+            "`/setwelcome текст` — изменить\n"
+            "`/welcomeoff` — отключить\n"
+            "`/welcomeon` — включить"
+        )
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['setwelcome'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_setwelcome(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        if member.status not in ['administrator', 'creator']:
+            bot.reply_to(message, "⛔️ Только для администраторов чата.")
+            return
+    except:
+        return
+
+    text = message.text.strip()
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(message,
+            "❌ Использование: `/setwelcome текст`\n\n"
+            "Переменные:\n"
+            "`{name}` — имя пользователя\n"
+            "`{chat}` — название чата\n"
+            "`{id}` — ID пользователя\n\n"
+            "Пример: `/setwelcome Привет, {name}! Добро пожаловать в {chat}!`",
+            parse_mode="Markdown"
+        )
+        return
+
+    welcome_text = parts[1]
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_settings (chat_id, welcome_text, welcome_enabled)
+            VALUES (%s, %s, TRUE)
+            ON CONFLICT (chat_id) DO UPDATE SET welcome_text = %s, welcome_enabled = TRUE
+        """, (chat_id, welcome_text, welcome_text))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    preview = welcome_text.format(
+        name=message.from_user.first_name or "Иван",
+        chat=message.chat.title or "чат",
+        id=message.from_user.id
+    )
+    bot.reply_to(message,
+        f"✅ Приветствие сохранено!\n\n"
+        f"👁 *Превью:*\n{preview}",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['welcomeoff'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_welcomeoff(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        if member.status not in ['administrator', 'creator']:
+            bot.reply_to(message, "⛔️ Только для администраторов чата.")
+            return
+    except:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_settings (chat_id, welcome_enabled)
+            VALUES (%s, FALSE)
+            ON CONFLICT (chat_id) DO UPDATE SET welcome_enabled = FALSE
+        """, (chat_id,))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    bot.reply_to(message, "✅ Приветствие отключено.")
+
+@bot.message_handler(commands=['welcomeon'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_welcomeon(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    try:
+        member = bot.get_chat_member(chat_id, user_id)
+        if member.status not in ['administrator', 'creator']:
+            bot.reply_to(message, "⛔️ Только для администраторов чата.")
+            return
+    except:
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_settings (chat_id, welcome_enabled)
+            VALUES (%s, TRUE)
+            ON CONFLICT (chat_id) DO UPDATE SET welcome_enabled = TRUE
+        """, (chat_id,))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    bot.reply_to(message, "✅ Приветствие включено.")
+
+@bot.message_handler(commands=['warn'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_warn(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_admin(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для администраторов.")
+        return
+
+    target_id, target_name = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Укажите пользователя: `/warn @user причина` или ответьте на сообщение", parse_mode="Markdown")
+        return
+
+    if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
+        bot.reply_to(message, "⛔️ Нельзя варнить владельца.")
+        return
+
+    text = message.text or ''
+    parts = text.split(None, 2 if not message.reply_to_message else 1)
+    reason = parts[-1] if len(parts) > (1 if message.reply_to_message else 2) else "Не указана"
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO chat_warns (user_id, chat_id, reason, warned_by, warned_at) VALUES (%s, %s, %s, %s, %s)",
+            (target_id, chat_id, reason, user_id, int(time.time()))
+        )
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM chat_warns WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
+        warn_count = cur.fetchone()[0]
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+
+    if warn_count >= WARN_LIMIT:
+        try:
+            bot.ban_chat_member(chat_id, target_id)
+            bot.reply_to(message,
+                f"🚫 *{name}* получил {warn_count}/{WARN_LIMIT} варнов и *забанен*!\n"
+                f"📋 Причина последнего: {reason}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            bot.reply_to(message, f"⚠️ Варн выдан, но бан не удался: {e}")
+    else:
+        bot.reply_to(message,
+            f"⚠️ *{name}* получил варн [{warn_count}/{WARN_LIMIT}]\n"
+            f"📋 Причина: {reason}",
+            parse_mode="Markdown"
+        )
+
+@bot.message_handler(commands=['unwarn'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_unwarn(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_admin(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для администраторов.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Укажите пользователя.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            DELETE FROM chat_warns WHERE id = (
+                SELECT id FROM chat_warns
+                WHERE user_id = %s AND chat_id = %s
+                ORDER BY warned_at DESC LIMIT 1
+            )
+        """, (target_id, chat_id))
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM chat_warns WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
+        remaining = cur.fetchone()[0]
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"✅ У *{name}* снят 1 варн. Осталось: {remaining}/{WARN_LIMIT}", parse_mode="Markdown")
+
+@bot.message_handler(commands=['warns'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_warns(message):
+    chat_id = message.chat.id
+    target_id, _ = _get_user_from_message(message)
+
+    if not target_id:
+        target_id = message.from_user.id
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT reason, warned_at FROM chat_warns
+            WHERE user_id = %s AND chat_id = %s
+            ORDER BY warned_at DESC
+        """, (target_id, chat_id))
+        warns = cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    if not warns:
+        bot.reply_to(message, f"✅ У *{name}* нет варнов.", parse_mode="Markdown")
+        return
+
+    text = f"⚠️ *Варны {name}* [{len(warns)}/{WARN_LIMIT}]:\n\n"
+    for reason, warned_at in warns:
+        time_str = datetime.fromtimestamp(warned_at).strftime("%d.%m.%Y %H:%M")
+        text += f"• {time_str} — {reason}\n"
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['mute'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_mute(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_admin(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для администраторов.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Использование: `/mute @user 1h причина`\nВремя: `10m`, `1h`, `1d`, `permanent`", parse_mode="Markdown")
+        return
+
+    if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
+        bot.reply_to(message, "⛔️ Нельзя замутить владельца.")
+        return
+
+    text = message.text or ''
+    if message.reply_to_message:
+        parts = text.split(None, 2)
+        duration_str = parts[1] if len(parts) > 1 else 'permanent'
+        reason = parts[2] if len(parts) > 2 else "Не указана"
+    else:
+        parts = text.split(None, 3)
+        duration_str = parts[2] if len(parts) > 2 else 'permanent'
+        reason = parts[3] if len(parts) > 3 else "Не указана"
+
+    duration = parse_duration(duration_str)
+    until = int(time.time()) + duration if duration else 0
+
+    try:
+        until_date = until if until else None
+        bot.restrict_chat_member(
+            chat_id, target_id,
+            until_date=until_date,
+            permissions=types.ChatPermissions(
+                can_send_messages=False,
+                can_send_media_messages=False,
+                can_send_other_messages=False
+            )
+        )
+    except Exception as e:
+        bot.reply_to(message, f"❌ Не удалось замутить: {e}")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_mutes (user_id, chat_id, until, reason)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET until = %s, reason = %s
+        """, (target_id, chat_id, until, reason, until, reason))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    duration_text = f"на {duration_str}" if duration else "навсегда"
+    bot.reply_to(message,
+        f"🔇 *{name}* замучен {duration_text}\n📋 Причина: {reason}",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['unmute'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_unmute(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_admin(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для администраторов.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Укажите пользователя.")
+        return
+
+    try:
+        bot.restrict_chat_member(
+            chat_id, target_id,
+            permissions=types.ChatPermissions(
+                can_send_messages=True,
+                can_send_media_messages=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True
+            )
+        )
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM chat_mutes WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"🔊 *{name}* размучен.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['ban'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_ban(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_admin(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для администраторов.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Использование: `/ban @user 1d причина`\nВремя: `1h`, `7d`, `permanent`", parse_mode="Markdown")
+        return
+
+    if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
+        bot.reply_to(message, "⛔️ Нельзя забанить владельца.")
+        return
+
+    text = message.text or ''
+    if message.reply_to_message:
+        parts = text.split(None, 2)
+        duration_str = parts[1] if len(parts) > 1 else 'permanent'
+        reason = parts[2] if len(parts) > 2 else "Не указана"
+    else:
+        parts = text.split(None, 3)
+        duration_str = parts[2] if len(parts) > 2 else 'permanent'
+        reason = parts[3] if len(parts) > 3 else "Не указана"
+
+    duration = parse_duration(duration_str)
+    until = int(time.time()) + duration if duration else 0
+
+    try:
+        until_date = until if until else None
+        bot.ban_chat_member(chat_id, target_id, until_date=until_date)
+    except Exception as e:
+        bot.reply_to(message, f"❌ Не удалось забанить: {e}")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_mutes (user_id, chat_id, until, reason)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET until = %s, reason = %s
+        """, (target_id, chat_id, until, f"[BAN] {reason}", until, f"[BAN] {reason}"))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    duration_text = f"на {duration_str}" if duration else "навсегда"
+    bot.reply_to(message,
+        f"🚫 *{name}* забанен {duration_text}\n📋 Причина: {reason}",
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['unban'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_unban(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_admin(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для администраторов.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Укажите пользователя.")
+        return
+
+    try:
+        bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM chat_mutes WHERE user_id = %s AND chat_id = %s AND until = 0", (target_id, chat_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"✅ *{name}* разбанен.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['modhelp'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_modhelp(message):
+    text = (
+        "🛡 *Система модерации*\n\n"
+        "*Варны (лимит 3 → автобан):*\n"
+        "`/warn @user причина` — выдать варн\n"
+        "`/unwarn @user` — снять последний варн\n"
+        "`/warns @user` — посмотреть варны\n\n"
+        "*Мут:*\n"
+        "`/mute @user 10m причина` — замутить\n"
+        "`/unmute @user` — размутить\n"
+        "_Время: `10m`, `1h`, `1d`, `permanent`_\n\n"
+        "*Бан:*\n"
+        "`/ban @user 7d причина` — забанить\n"
+        "`/unban @user` — разбанить\n"
+        "_Время: `1h`, `7d`, `permanent`_\n\n"
+        "*Чат-администраторы (только владелец чата):*\n"
+        "`/chatadmin @user` — назначить чат-админа\n"
+        "`/chatdeadmin @user` — снять чат-админа\n"
+        "`/chatadmins` — список чат-админов\n\n"
+        "ℹ️ Владелец чата определяется автоматически при добавлении бота.\n"
+        "👑 Владелец и админы бота имеют доступ ко всем командам во всех чатах.\n\n"
+        "*Приветствие:*\n"
+        "`/welcome` — посмотреть текущее\n"
+        "`/setwelcome текст` — задать приветствие\n"
+        "`/welcomeoff` — отключить\n"
+        "`/welcomeon` — включить\n"
+        "_Переменные: `{name}`, `{chat}`, `{id}`_\n\n"
+        "*Топ и баллы:*\n"
+        "`/top` — топ активных участников\n"
+        "`/rank` — ваш ранг и баллы\n"
+        "`/bonus` — ежедневный бонус\n\n"
+        "⚠️ Все команды — ответом на сообщение или `@username`\n"
+        "👑 Владелец бота защищён от всех санкций"
+    )
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['chatadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_chatadmin(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_owner(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для владельца чата.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(
+            message,
+            "❌ Укажите пользователя: `/chatadmin @user` или ответьте на сообщение",
+            parse_mode="Markdown"
+        )
+        return
+
+    if target_id == user_id:
+        bot.reply_to(message, "❌ Нельзя назначить самого себя.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_admins (user_id, chat_id, role, added_by, added_at)
+            VALUES (%s, %s, 'admin', %s, %s)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET role = 'admin', added_by = %s
+        """, (target_id, chat_id, user_id, int(time.time()), user_id))
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"✅ *{name}* назначен чат-администратором.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['chatdeadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_chatdeadmin(message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if not is_chat_owner(user_id, chat_id):
+        bot.reply_to(message, "⛔️ Только для владельца чата.")
+        return
+
+    target_id, _ = _get_user_from_message(message)
+    if not target_id:
+        bot.reply_to(message, "❌ Укажите пользователя.")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT role FROM chat_admins WHERE user_id = %s AND chat_id = %s",
+            (target_id, chat_id)
+        )
+        row = cur.fetchone()
+        if row and row[0] == 'owner':
+            bot.reply_to(message, "⛔️ Нельзя снять владельца чата.")
+            return
+
+        cur.execute(
+            "DELETE FROM chat_admins WHERE user_id = %s AND chat_id = %s",
+            (target_id, chat_id)
+        )
+        conn.commit()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    name = get_user_display_name_cached(target_id)
+    bot.reply_to(message, f"✅ У *{name}* сняты права чат-администратора.", parse_mode="Markdown")
+
+@bot.message_handler(commands=['chatadmins'], func=lambda m: m.chat.type in ['group', 'supergroup'])
+def cmd_chatadmins(message):
+    chat_id = message.chat.id
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT user_id, role FROM chat_admins WHERE chat_id = %s ORDER BY role DESC",
+            (chat_id,)
+        )
+        rows = cur.fetchall()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+
+    if not rows:
+        bot.reply_to(message, "📭 Чат-администраторов нет.")
+        return
+
+    text = "👑 *Администраторы чата (в боте):*\n\n"
+    for uid, role in rows:
+        name = get_user_display_name_cached(uid)
+        icon = "👑" if role == 'owner' else "🔹"
+        text += f"{icon} {name} (`{uid}`) — {role}\n"
+
+    bot.reply_to(message, text, parse_mode="Markdown")
+
+@bot.my_chat_member_handler()
+def handle_bot_added_to_chat(update):
+    chat = update.chat
+    new_status = update.new_chat_member.status
+
+    if new_status in ('member', 'administrator') and chat.type in ('group', 'supergroup'):
+        chat_id = chat.id
+        _register_chat_owner(chat_id)
+
+def _register_chat_owner(chat_id):
+    try:
+        admins = bot.get_chat_administrators(chat_id)
+        for member in admins:
+            if member.status == 'creator':
+                owner_id = member.user.id
+                conn = get_db_connection()
+                cur = conn.cursor()
+                try:
+                    cur.execute("""
+                        INSERT INTO chat_admins (user_id, chat_id, role, added_by, added_at)
+                        VALUES (%s, %s, 'owner', %s, %s)
+                        ON CONFLICT (user_id, chat_id) DO UPDATE SET role = 'owner'
+                    """, (owner_id, chat_id, owner_id, int(time.time())))
+                    conn.commit()
+                    print(f"[chat_owner] Зарегистрирован владелец {owner_id} для чата {chat_id}")
+                    
+                    try:
+                        chat_info = bot.get_chat(chat_id)
+                        bot.send_message(
+                            owner_id,
+                            f"👋 Привет! Я добавлен в чат *{chat_info.title or 'чат'}*.\n\n"
+                            f"Ты автоматически назначен владельцем чата в боте.\n"
+                            f"Теперь ты можешь назначать чат-админов через `/chatadmin`.\n\n"
+                            f"📋 Список команд: `/modhelp`",
+                            parse_mode="Markdown"
+                        )
+                    except:
+                        pass
+                finally:
+                    try:
+                        cur.close()
+                    except:
+                        pass
+                    return_db_connection(conn)
+                break
+    except Exception as e:
+        print(f"[chat_owner] Ошибка регистрации владельца чата {chat_id}: {e}")
+
 # ==================== FLASK APP ====================
 
 @app.route('/')
@@ -6317,7 +7205,9 @@ def subscription(token):
             except:
                 pass
         
-        keys = get_keys_from_db()
+        keys = get_subscription_keys_from_db()
+        if not keys:
+            keys = get_keys_from_db()
         if not keys:
             keys = DEFAULT_KEYS
         expire_timestamp = sub_end
@@ -6330,10 +7220,11 @@ def subscription(token):
             pass
         return_db_connection(conn)
 
+# ==================== ADMIN CALLBACK ====================
+
 @bot.callback_query_handler(func=lambda call: (
     call.data.startswith('admin_') or 
     call.data.startswith('add_admin_') or
-    call.data.startswith('edit_admin_') or
     call.data.startswith('toggle_perm_') or
     call.data.startswith('reset_perm_') or
     call.data.startswith('autopost_') or
@@ -6428,6 +7319,53 @@ def admin_callback(call):
             t = threading.Thread(target=_do_auto_update_keys)
             t.daemon = True
             t.start()
+        return
+
+    if data == "admin_sub_keys_load":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("✅ Завершить", callback_data="admin_sub_keys_finish"),
+            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_back")
+        )
+        msg = bot.send_message(user_id,
+            "📥 *Загрузка ключей подписки*\n\n"
+            "Эти ключи будут выдаваться пользователям через /sub ссылку.\n"
+            "Автопостинг использует отдельную базу.\n\n"
+            "Отправляйте ключи, затем нажмите ✅ Завершить",
+            parse_mode="Markdown", reply_markup=kb)
+        with _cache_lock:
+            keys_loading[user_id] = {
+                'keys': [], 'mode': 'subscription',
+                'message_id': msg.message_id,
+                'timestamp': int(time.time())
+            }
+        return
+
+    if data == "admin_sub_keys_finish":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        with _cache_lock:
+            if user_id not in keys_loading:
+                bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
+                return
+            session = keys_loading[user_id]
+            keys = session['keys']
+            mode = session.get('mode', 'autopost')
+            del keys_loading[user_id]
+        if not keys:
+            bot.answer_callback_query(call.id, "❌ Нет ключей")
+            return
+        if mode == 'subscription':
+            save_subscription_keys_to_db(keys)
+        else:
+            save_keys_to_db(keys)
+        bot.answer_callback_query(call.id, f"✅ Загружено {len(keys)} ключей!")
+        show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
         return
 
     if data == "admin_announce":
@@ -6898,6 +7836,36 @@ def admin_callback(call):
         _show_admin_logs(call)
         return
 
+    if data.startswith("edit_admin_") and data != 'edit_admin_perms':
+        if not has_permission(user_id, 'manage_admins'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        try:
+            target_id = int(data.split('_')[2])
+        except (ValueError, IndexError):
+            bot.answer_callback_query(call.id, "❌ Ошибка")
+            return
+        if target_id == ADMIN_ID:
+            bot.answer_callback_query(call.id, "❌ Нельзя редактировать владельца.")
+            return
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT role FROM admins WHERE user_id = %s", (target_id,))
+            result = cur.fetchone()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        if not result:
+            bot.answer_callback_query(call.id, "❌ Админ не найден.")
+            return
+        _redraw_admin_perms(call, target_id)
+        bot.answer_callback_query(call.id)
+        return
+
     if data.startswith("filter_") or data.startswith("page_") or data in ('back_to_list', 'close_manage'):
         callback_user_list_nav(call)
         return
@@ -6961,20 +7929,16 @@ def callback_admin_keys_load(call):
     )
     msg = bot.send_message(
         user_id,
-        "📥 *Загрузка ключей*\n\n"
-        "Отправляйте ключи по одному сообщению.\n"
-        "Поддерживаются:\n"
-        "• Текст с ключами (vless://, vmess:// и др.)\n"
-        "• .txt файл с ключами\n"
-        "• Ссылка на подписку\n\n"
-        "⚠️ *ВНИМАНИЕ:* Новая загрузка ПОЛНОСТЬЮ ЗАМЕНИТ все текущие ключи!\n\n"
-        "Когда закончите - нажмите *✅ Завершить*",
+        "📥 *Загрузка ключей автопостинга*\n\n"
+        "Эти ключи будут использоваться для автопостинга.\n"
+        "Для подписки /sub используйте отдельную загрузку.\n\n"
+        "Отправляйте ключи, затем нажмите ✅ Завершить",
         parse_mode="Markdown",
         reply_markup=kb
     )
     with _cache_lock:
         keys_loading[user_id] = {
-            'keys': [],
+            'keys': [], 'mode': 'autopost',
             'message_id': msg.message_id,
             'timestamp': int(time.time())
         }
@@ -6989,13 +7953,20 @@ def callback_admin_keys_load_finish(call):
         if user_id not in keys_loading:
             bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
             return
-        keys = keys_loading[user_id]['keys']
+        session = keys_loading[user_id]
+        keys = session['keys']
+        mode = session.get('mode', 'autopost')
         del keys_loading[user_id]
     if not keys:
         bot.answer_callback_query(call.id, "❌ Нет загруженных ключей")
         return
-    save_keys_to_db(keys)
-    log_admin_action(user_id, f"Загрузил {len(keys)} ключей", details=f"Ключей: {len(keys)}")
+    
+    if mode == 'subscription':
+        save_subscription_keys_to_db(keys)
+    else:
+        save_keys_to_db(keys)
+    
+    log_admin_action(user_id, f"Загрузил {len(keys)} ключей ({mode})", details=f"Ключей: {len(keys)}")
     proto_stats = {}
     for k in keys:
         m = re.match(r'([a-z0-9+]+)://', k, re.IGNORECASE)
@@ -7096,7 +8067,7 @@ def callback_admin_keys_clear_all(call):
     try:
         bot.edit_message_text(
             "⚠️ *ВНИМАНИЕ!*\n\n"
-            "Вы уверены, что хотите удалить ВСЕ ключи из базы?\n"
+            "Вы уверены, что хотите удалить ВСЕ ключи автопостинга?\n"
             "Это действие НЕЛЬЗЯ будет отменить!",
             call.message.chat.id,
             call.message.message_id,
@@ -7115,7 +8086,7 @@ def callback_admin_keys_clear_confirm(call):
     count = len(get_keys_from_db())
     save_keys_to_db([])
     set_setting('total_keys_issued', '0')
-    log_admin_action(user_id, f"Удалил все ключи", details=f"Удалено: {count} ключей")
+    log_admin_action(user_id, f"Удалил все ключи автопостинга", details=f"Удалено: {count} ключей")
     bot.answer_callback_query(call.id, "🗑️ Все ключи удалены!")
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
@@ -7276,8 +8247,6 @@ def callback_admin_keys_proxy_finish(call):
     t = threading.Thread(target=process_proxy_urls)
     t.daemon = True
     t.start()
-
-# ==================== HANDLE PRIVATE MESSAGES ====================
 
 @bot.message_handler(func=lambda m: m.chat.type == 'private' and not (m.text or '').startswith('/'))
 def handle_private_messages(message):
@@ -8163,762 +9132,6 @@ def cmd_set_points(message):
     except:
         pass
 
-# ==================== МОДЕРАЦИЯ ====================
-
-def parse_duration(text):
-    if text in ('permanent', 'навсегда', '0'):
-        return None
-    match = re.match(r'^(\d+)(s|m|h|d)$', text.lower())
-    if not match:
-        return None
-    value, unit = int(match.group(1)), match.group(2)
-    multipliers = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400}
-    return value * multipliers[unit]
-
-def is_chat_admin(user_id, chat_id):
-    if user_id == ADMIN_ID:
-        return True
-    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
-        return True
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        if member.status in ['administrator', 'creator']:
-            return True
-    except:
-        pass
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT user_id FROM chat_admins WHERE user_id = %s AND chat_id = %s",
-            (user_id, chat_id)
-        )
-        return cur.fetchone() is not None
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-def is_chat_owner(user_id, chat_id):
-    if user_id == ADMIN_ID:
-        return True
-    if is_admin(user_id) and has_permission(user_id, 'admin_panel'):
-        return True
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        return member.status == 'creator'
-    except:
-        return False
-
-def _get_user_from_message(message):
-    if message.reply_to_message:
-        return message.reply_to_message.from_user.id, message.reply_to_message.from_user.first_name
-    text = message.text or ''
-    parts = text.split(None, 2)
-    if len(parts) < 2:
-        return None, None
-    target_id = get_user_id_from_input(parts[1])
-    return target_id, str(target_id) if target_id else None
-
-WARN_LIMIT = 3
-
-@bot.message_handler(commands=['welcome'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_welcome_info(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        if member.status not in ['administrator', 'creator']:
-            bot.reply_to(message, "⛔️ Только для администраторов чата.")
-            return
-    except:
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT welcome_text, welcome_enabled FROM chat_settings WHERE chat_id = %s", (chat_id,))
-        result = cur.fetchone()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    if not result or not result[0]:
-        text = (
-            "ℹ️ *Приветствие*\n\n"
-            "Сейчас используется стандартное приветствие.\n\n"
-            "Команды:\n"
-            "`/setwelcome текст` — установить своё\n"
-            "`/welcomeoff` — отключить\n"
-            "`/welcomeon` — включить\n\n"
-            "Переменные: `{name}`, `{chat}`, `{id}`"
-        )
-    else:
-        welcome_text, enabled = result
-        status = "✅ Включено" if enabled else "❌ Отключено"
-        text = (
-            f"ℹ️ *Приветствие* — {status}\n\n"
-            f"📝 Текущий текст:\n`{welcome_text}`\n\n"
-            "Команды:\n"
-            "`/setwelcome текст` — изменить\n"
-            "`/welcomeoff` — отключить\n"
-            "`/welcomeon` — включить"
-        )
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['setwelcome'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_setwelcome(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        if member.status not in ['administrator', 'creator']:
-            bot.reply_to(message, "⛔️ Только для администраторов чата.")
-            return
-    except:
-        return
-
-    text = message.text.strip()
-    parts = text.split(None, 1)
-    if len(parts) < 2:
-        bot.reply_to(message,
-            "❌ Использование: `/setwelcome текст`\n\n"
-            "Переменные:\n"
-            "`{name}` — имя пользователя\n"
-            "`{chat}` — название чата\n"
-            "`{id}` — ID пользователя\n\n"
-            "Пример: `/setwelcome Привет, {name}! Добро пожаловать в {chat}!`",
-            parse_mode="Markdown"
-        )
-        return
-
-    welcome_text = parts[1]
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO chat_settings (chat_id, welcome_text, welcome_enabled)
-            VALUES (%s, %s, TRUE)
-            ON CONFLICT (chat_id) DO UPDATE SET welcome_text = %s, welcome_enabled = TRUE
-        """, (chat_id, welcome_text, welcome_text))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    preview = welcome_text.format(
-        name=message.from_user.first_name or "Иван",
-        chat=message.chat.title or "чат",
-        id=message.from_user.id
-    )
-    bot.reply_to(message,
-        f"✅ Приветствие сохранено!\n\n"
-        f"👁 *Превью:*\n{preview}",
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(commands=['welcomeoff'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_welcomeoff(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        if member.status not in ['administrator', 'creator']:
-            bot.reply_to(message, "⛔️ Только для администраторов чата.")
-            return
-    except:
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO chat_settings (chat_id, welcome_enabled)
-            VALUES (%s, FALSE)
-            ON CONFLICT (chat_id) DO UPDATE SET welcome_enabled = FALSE
-        """, (chat_id,))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    bot.reply_to(message, "✅ Приветствие отключено.")
-
-@bot.message_handler(commands=['welcomeon'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_welcomeon(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    try:
-        member = bot.get_chat_member(chat_id, user_id)
-        if member.status not in ['administrator', 'creator']:
-            bot.reply_to(message, "⛔️ Только для администраторов чата.")
-            return
-    except:
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO chat_settings (chat_id, welcome_enabled)
-            VALUES (%s, TRUE)
-            ON CONFLICT (chat_id) DO UPDATE SET welcome_enabled = TRUE
-        """, (chat_id,))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-    bot.reply_to(message, "✅ Приветствие включено.")
-
-@bot.message_handler(commands=['warn'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_warn(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_admin(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для администраторов.")
-        return
-
-    target_id, target_name = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Укажите пользователя: `/warn @user причина` или ответьте на сообщение", parse_mode="Markdown")
-        return
-
-    if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
-        bot.reply_to(message, "⛔️ Нельзя варнить владельца.")
-        return
-
-    text = message.text or ''
-    parts = text.split(None, 2 if not message.reply_to_message else 1)
-    reason = parts[-1] if len(parts) > (1 if message.reply_to_message else 2) else "Не указана"
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "INSERT INTO chat_warns (user_id, chat_id, reason, warned_by, warned_at) VALUES (%s, %s, %s, %s, %s)",
-            (target_id, chat_id, reason, user_id, int(time.time()))
-        )
-        conn.commit()
-        cur.execute("SELECT COUNT(*) FROM chat_warns WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
-        warn_count = cur.fetchone()[0]
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-
-    if warn_count >= WARN_LIMIT:
-        try:
-            bot.ban_chat_member(chat_id, target_id)
-            bot.reply_to(message,
-                f"🚫 *{name}* получил {warn_count}/{WARN_LIMIT} варнов и *забанен*!\n"
-                f"📋 Причина последнего: {reason}",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            bot.reply_to(message, f"⚠️ Варн выдан, но бан не удался: {e}")
-    else:
-        bot.reply_to(message,
-            f"⚠️ *{name}* получил варн [{warn_count}/{WARN_LIMIT}]\n"
-            f"📋 Причина: {reason}",
-            parse_mode="Markdown"
-        )
-
-@bot.message_handler(commands=['unwarn'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_unwarn(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_admin(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для администраторов.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Укажите пользователя.")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            DELETE FROM chat_warns WHERE id = (
-                SELECT id FROM chat_warns
-                WHERE user_id = %s AND chat_id = %s
-                ORDER BY warned_at DESC LIMIT 1
-            )
-        """, (target_id, chat_id))
-        conn.commit()
-        cur.execute("SELECT COUNT(*) FROM chat_warns WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
-        remaining = cur.fetchone()[0]
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    bot.reply_to(message, f"✅ У *{name}* снят 1 варн. Осталось: {remaining}/{WARN_LIMIT}", parse_mode="Markdown")
-
-@bot.message_handler(commands=['warns'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_warns(message):
-    chat_id = message.chat.id
-    target_id, _ = _get_user_from_message(message)
-
-    if not target_id:
-        target_id = message.from_user.id
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            SELECT reason, warned_at FROM chat_warns
-            WHERE user_id = %s AND chat_id = %s
-            ORDER BY warned_at DESC
-        """, (target_id, chat_id))
-        warns = cur.fetchall()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    if not warns:
-        bot.reply_to(message, f"✅ У *{name}* нет варнов.", parse_mode="Markdown")
-        return
-
-    text = f"⚠️ *Варны {name}* [{len(warns)}/{WARN_LIMIT}]:\n\n"
-    for reason, warned_at in warns:
-        time_str = datetime.fromtimestamp(warned_at).strftime("%d.%m.%Y %H:%M")
-        text += f"• {time_str} — {reason}\n"
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['mute'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_mute(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_admin(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для администраторов.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Использование: `/mute @user 1h причина`\nВремя: `10m`, `1h`, `1d`, `permanent`", parse_mode="Markdown")
-        return
-
-    if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
-        bot.reply_to(message, "⛔️ Нельзя замутить владельца.")
-        return
-
-    text = message.text or ''
-    if message.reply_to_message:
-        parts = text.split(None, 2)
-        duration_str = parts[1] if len(parts) > 1 else 'permanent'
-        reason = parts[2] if len(parts) > 2 else "Не указана"
-    else:
-        parts = text.split(None, 3)
-        duration_str = parts[2] if len(parts) > 2 else 'permanent'
-        reason = parts[3] if len(parts) > 3 else "Не указана"
-
-    duration = parse_duration(duration_str)
-    until = int(time.time()) + duration if duration else 0
-
-    try:
-        until_date = until if until else None
-        bot.restrict_chat_member(
-            chat_id, target_id,
-            until_date=until_date,
-            permissions=types.ChatPermissions(
-                can_send_messages=False,
-                can_send_media_messages=False,
-                can_send_other_messages=False
-            )
-        )
-    except Exception as e:
-        bot.reply_to(message, f"❌ Не удалось замутить: {e}")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO chat_mutes (user_id, chat_id, until, reason)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (user_id, chat_id) DO UPDATE SET until = %s, reason = %s
-        """, (target_id, chat_id, until, reason, until, reason))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    duration_text = f"на {duration_str}" if duration else "навсегда"
-    bot.reply_to(message,
-        f"🔇 *{name}* замучен {duration_text}\n📋 Причина: {reason}",
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(commands=['unmute'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_unmute(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_admin(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для администраторов.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Укажите пользователя.")
-        return
-
-    try:
-        bot.restrict_chat_member(
-            chat_id, target_id,
-            permissions=types.ChatPermissions(
-                can_send_messages=True,
-                can_send_media_messages=True,
-                can_send_other_messages=True,
-                can_add_web_page_previews=True
-            )
-        )
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM chat_mutes WHERE user_id = %s AND chat_id = %s", (target_id, chat_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    bot.reply_to(message, f"🔊 *{name}* размучен.", parse_mode="Markdown")
-
-@bot.message_handler(commands=['ban'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_ban(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_admin(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для администраторов.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Использование: `/ban @user 1d причина`\nВремя: `1h`, `7d`, `permanent`", parse_mode="Markdown")
-        return
-
-    if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
-        bot.reply_to(message, "⛔️ Нельзя забанить владельца.")
-        return
-
-    text = message.text or ''
-    if message.reply_to_message:
-        parts = text.split(None, 2)
-        duration_str = parts[1] if len(parts) > 1 else 'permanent'
-        reason = parts[2] if len(parts) > 2 else "Не указана"
-    else:
-        parts = text.split(None, 3)
-        duration_str = parts[2] if len(parts) > 2 else 'permanent'
-        reason = parts[3] if len(parts) > 3 else "Не указана"
-
-    duration = parse_duration(duration_str)
-    until = int(time.time()) + duration if duration else 0
-
-    try:
-        until_date = until if until else None
-        bot.ban_chat_member(chat_id, target_id, until_date=until_date)
-    except Exception as e:
-        bot.reply_to(message, f"❌ Не удалось забанить: {e}")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO chat_mutes (user_id, chat_id, until, reason)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (user_id, chat_id) DO UPDATE SET until = %s, reason = %s
-        """, (target_id, chat_id, until, f"[BAN] {reason}", until, f"[BAN] {reason}"))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    duration_text = f"на {duration_str}" if duration else "навсегда"
-    bot.reply_to(message,
-        f"🚫 *{name}* забанен {duration_text}\n📋 Причина: {reason}",
-        parse_mode="Markdown"
-    )
-
-@bot.message_handler(commands=['unban'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_unban(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_admin(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для администраторов.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Укажите пользователя.")
-        return
-
-    try:
-        bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
-    except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("DELETE FROM chat_mutes WHERE user_id = %s AND chat_id = %s AND until = 0", (target_id, chat_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    bot.reply_to(message, f"✅ *{name}* разбанен.", parse_mode="Markdown")
-
-@bot.message_handler(commands=['modhelp'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_modhelp(message):
-    text = (
-        "🛡 *Система модерации*\n\n"
-        "*Варны (лимит 3 → автобан):*\n"
-        "`/warn @user причина` — выдать варн\n"
-        "`/unwarn @user` — снять последний варн\n"
-        "`/warns @user` — посмотреть варны\n\n"
-        "*Мут:*\n"
-        "`/mute @user 10m причина` — замутить\n"
-        "`/unmute @user` — размутить\n"
-        "_Время: `10m`, `1h`, `1d`, `permanent`_\n\n"
-        "*Бан:*\n"
-        "`/ban @user 7d причина` — забанить\n"
-        "`/unban @user` — разбанить\n"
-        "_Время: `1h`, `7d`, `permanent`_\n\n"
-        "*Чат-администраторы (только владелец чата):*\n"
-        "`/chatadmin @user` — назначить чат-админа\n"
-        "`/chatdeadmin @user` — снять чат-админа\n"
-        "`/chatadmins` — список чат-админов\n\n"
-        "ℹ️ Владелец чата определяется автоматически при добавлении бота.\n"
-        "👑 Владелец и админы бота имеют доступ ко всем командам во всех чатах.\n\n"
-        "*Приветствие:*\n"
-        "`/welcome` — посмотреть текущее\n"
-        "`/setwelcome текст` — задать приветствие\n"
-        "`/welcomeoff` — отключить\n"
-        "`/welcomeon` — включить\n"
-        "_Переменные: `{name}`, `{chat}`, `{id}`_\n\n"
-        "*Топ и баллы:*\n"
-        "`/top` — топ активных участников\n"
-        "`/rank` — ваш ранг и баллы\n"
-        "`/bonus` — ежедневный бонус\n\n"
-        "⚠️ Все команды — ответом на сообщение или `@username`\n"
-        "👑 Владелец бота защищён от всех санкций"
-    )
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['chatadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_chatadmin(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_owner(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для владельца чата.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(
-            message,
-            "❌ Укажите пользователя: `/chatadmin @user` или ответьте на сообщение",
-            parse_mode="Markdown"
-        )
-        return
-
-    if target_id == user_id:
-        bot.reply_to(message, "❌ Нельзя назначить самого себя.")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            INSERT INTO chat_admins (user_id, chat_id, role, added_by, added_at)
-            VALUES (%s, %s, 'admin', %s, %s)
-            ON CONFLICT (user_id, chat_id) DO UPDATE SET role = 'admin', added_by = %s
-        """, (target_id, chat_id, user_id, int(time.time()), user_id))
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    bot.reply_to(message, f"✅ *{name}* назначен чат-администратором.", parse_mode="Markdown")
-
-@bot.message_handler(commands=['chatdeadmin'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_chatdeadmin(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    if not is_chat_owner(user_id, chat_id):
-        bot.reply_to(message, "⛔️ Только для владельца чата.")
-        return
-
-    target_id, _ = _get_user_from_message(message)
-    if not target_id:
-        bot.reply_to(message, "❌ Укажите пользователя.")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT role FROM chat_admins WHERE user_id = %s AND chat_id = %s",
-            (target_id, chat_id)
-        )
-        row = cur.fetchone()
-        if row and row[0] == 'owner':
-            bot.reply_to(message, "⛔️ Нельзя снять владельца чата.")
-            return
-
-        cur.execute(
-            "DELETE FROM chat_admins WHERE user_id = %s AND chat_id = %s",
-            (target_id, chat_id)
-        )
-        conn.commit()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    name = get_user_display_name_cached(target_id)
-    bot.reply_to(message, f"✅ У *{name}* сняты права чат-администратора.", parse_mode="Markdown")
-
-@bot.message_handler(commands=['chatadmins'], func=lambda m: m.chat.type in ['group', 'supergroup'])
-def cmd_chatadmins(message):
-    chat_id = message.chat.id
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT user_id, role FROM chat_admins WHERE chat_id = %s ORDER BY role DESC",
-            (chat_id,)
-        )
-        rows = cur.fetchall()
-    finally:
-        try:
-            cur.close()
-        except:
-            pass
-        return_db_connection(conn)
-
-    if not rows:
-        bot.reply_to(message, "📭 Чат-администраторов нет.")
-        return
-
-    text = "👑 *Администраторы чата (в боте):*\n\n"
-    for uid, role in rows:
-        name = get_user_display_name_cached(uid)
-        icon = "👑" if role == 'owner' else "🔹"
-        text += f"{icon} {name} (`{uid}`) — {role}\n"
-
-    bot.reply_to(message, text, parse_mode="Markdown")
-
-@bot.my_chat_member_handler()
-def handle_bot_added_to_chat(update):
-    chat = update.chat
-    new_status = update.new_chat_member.status
-
-    if new_status in ('member', 'administrator') and chat.type in ('group', 'supergroup'):
-        chat_id = chat.id
-        _register_chat_owner(chat_id)
-
-def _register_chat_owner(chat_id):
-    try:
-        admins = bot.get_chat_administrators(chat_id)
-        for member in admins:
-            if member.status == 'creator':
-                owner_id = member.user.id
-                conn = get_db_connection()
-                cur = conn.cursor()
-                try:
-                    cur.execute("""
-                        INSERT INTO chat_admins (user_id, chat_id, role, added_by, added_at)
-                        VALUES (%s, %s, 'owner', %s, %s)
-                        ON CONFLICT (user_id, chat_id) DO UPDATE SET role = 'owner'
-                    """, (owner_id, chat_id, owner_id, int(time.time())))
-                    conn.commit()
-                    print(f"[chat_owner] Зарегистрирован владелец {owner_id} для чата {chat_id}")
-                    
-                    try:
-                        chat_info = bot.get_chat(chat_id)
-                        bot.send_message(
-                            owner_id,
-                            f"👋 Привет! Я добавлен в чат *{chat_info.title or 'чат'}*.\n\n"
-                            f"Ты автоматически назначен владельцем чата в боте.\n"
-                            f"Теперь ты можешь назначать чат-админов через `/chatadmin`.\n\n"
-                            f"📋 Список команд: `/modhelp`",
-                            parse_mode="Markdown"
-                        )
-                    except:
-                        pass
-                finally:
-                    try:
-                        cur.close()
-                    except:
-                        pass
-                    return_db_connection(conn)
-                break
-    except Exception as e:
-        print(f"[chat_owner] Ошибка регистрации владельца чата {chat_id}: {e}")
-
 # ==================== ЗАПУСК ====================
 
 if __name__ == "__main__":
@@ -8987,4 +9200,4 @@ if __name__ == "__main__":
     
     print(f"📡 Flask на порту {port}...")
     serve(app, host='0.0.0.0', port=port)
-    
+        
