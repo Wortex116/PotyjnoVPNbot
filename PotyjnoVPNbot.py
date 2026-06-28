@@ -793,6 +793,7 @@ def init_db():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_temp_keys_key ON temp_keys(key)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_temp_keys_expires ON temp_keys(expires_at)")
+        cur.execute("ALTER TABLE temp_keys ALTER COLUMN used SET DEFAULT 0")
         
         conn.commit()
     except Exception as e:
@@ -2967,14 +2968,18 @@ def use_temp_key(key, ip=None):
     cur = conn.cursor()
     try:
         cur.execute("""
-            UPDATE temp_keys 
-            SET used = 1, used_at = %s, used_by_ip = %s
-            WHERE key = %s 
-              AND used = 0 
-              AND expires_at > %s
-            RETURNING created_by, expires_at
-        """, (current_time, ip, key, current_time))
+            SELECT created_by, expires_at FROM temp_keys
+            WHERE key = %s AND expires_at > %s
+        """, (key, current_time))
         result = cur.fetchone()
+        if not result:
+            return None
+        
+        cur.execute("""
+            UPDATE temp_keys 
+            SET used = used + 1, used_at = %s, used_by_ip = %s
+            WHERE key = %s
+        """, (current_time, ip, key))
         conn.commit()
         return result
     except Exception as e:
@@ -3055,9 +3060,8 @@ def cleanup_expired_temp_keys():
     try:
         cur.execute("""
             DELETE FROM temp_keys 
-            WHERE (used = 1 AND used_at < %s)
-               OR (expires_at < %s AND used = 0)
-        """, (current_time - 86400, current_time - 86400))
+            WHERE expires_at < %s
+        """, (current_time - 86400,))
         deleted = cur.rowcount
         conn.commit()
         return deleted
@@ -3260,9 +3264,9 @@ def _show_temp_key_detail(call, user_id, key):
     key_url = f"{base_url}/tkey/{key}"
     
     if used:
-        status = "✔️ Использован"
-        used_str = datetime.fromtimestamp(used_at).strftime("%d.%m.%Y в %H:%M:%S")
-        status_detail = f"🕐 Использован: {used_str}\n🌐 IP: `{used_by_ip or 'неизвестен'}`"
+        status = f"✔️ Использован {used} раз"
+        used_str = datetime.fromtimestamp(used_at).strftime("%d.%m.%Y в %H:%M:%S") if used_at else "—"
+        status_detail = f"🕐 Последнее: {used_str}\n🌐 IP: `{used_by_ip or 'неизвестен'}`"
     elif expires_at < current_time:
         status = "❌ Истёк"
         status_detail = f"⏰ Истёк: {expires_str}"
@@ -3270,9 +3274,8 @@ def _show_temp_key_detail(call, user_id, key):
         remaining = expires_at - current_time
         h = remaining // 3600
         m = (remaining % 3600) // 60
-        s = remaining % 60
         status = "✅ Активен"
-        status_detail = f"⏳ Осталось: `{h}ч {m}м {s}с`\n📅 Истекает: {expires_str}"
+        status_detail = f"⏳ Осталось: `{h}ч {m}м`\n📅 Истекает: {expires_str}"
     
     text = (
         f"🔑 *Детали ключа*\n\n"
@@ -5955,6 +5958,12 @@ def admin_announce_text(message):
                 bot.send_message(channel_id, text)
             log_admin_action(user_id, f"Отправил объявление в канал {channel_id}")
             bot.reply_to(message, "✅ Отправлено")
+            try:
+                chat_info = bot.get_chat(channel_id)
+                ch_name = chat_info.title or str(channel_id)
+                add_broadcast_channel(channel_id, ch_name, user_id)
+            except:
+                pass
         except Exception as e:
             bot.reply_to(message, f"❌ Ошибка: {e}")
             
@@ -7032,6 +7041,14 @@ def cmd_mute(message):
         bot.reply_to(message, "⛔️ Нельзя замутить владельца.")
         return
 
+    try:
+        member = bot.get_chat_member(chat_id, target_id)
+        if member.status in ['administrator', 'creator']:
+            bot.reply_to(message, "⛔️ Нельзя замутить администратора чата.")
+            return
+    except:
+        pass
+
     text = message.text or ''
     if message.reply_to_message:
         parts = text.split(None, 2)
@@ -7143,6 +7160,14 @@ def cmd_ban(message):
     if target_id == ADMIN_ID or is_chat_owner(target_id, chat_id):
         bot.reply_to(message, "⛔️ Нельзя забанить владельца.")
         return
+
+    try:
+        member = bot.get_chat_member(chat_id, target_id)
+        if member.status in ['administrator', 'creator']:
+            bot.reply_to(message, "⛔️ Нельзя забанить администратора чата.")
+            return
+    except:
+        pass
 
     text = message.text or ''
     if message.reply_to_message:
@@ -7507,7 +7532,6 @@ def handle_group_message(message):
         
         points_per_msg = chat[1]
         
-        # Проверяем согласие на логирование
         cur.execute(
             "SELECT logging_consent FROM user_consents WHERE user_id = %s",
             (user_id,)
@@ -7573,7 +7597,6 @@ def handle_group_message(message):
                     (points_to_add, points_to_add, today_start, user_id)
                 )
             
-            # Логируем только если есть согласие
             if message.text and has_consent:
                 log_text = message.text[:500]
                 cur.execute("""
@@ -7785,7 +7808,7 @@ def temp_key_subscription(key):
         cur = conn.cursor()
         try:
             cur.execute(
-                "SELECT used, expires_at FROM temp_keys WHERE key = %s", 
+                "SELECT expires_at FROM temp_keys WHERE key = %s", 
                 (key,)
             )
             row = cur.fetchone()
@@ -7798,10 +7821,7 @@ def temp_key_subscription(key):
         
         if not row:
             return "Key not found", 404
-        used, expires_at = row
-        if used:
-            return "Key already used", 403
-        if expires_at < int(time.time()):
+        if row[0] < int(time.time()):
             return "Key expired", 403
         return "Invalid key", 400
     
@@ -7818,17 +7838,30 @@ def temp_key_subscription(key):
         keys='\n'.join(keys)
     )
     
+    conn = get_db_connection()
+    cur = conn.cursor()
     try:
-        bot.send_message(
-            created_by,
-            f"🔑 *Временный ключ использован!*\n\n"
-            f"🔗 Ключ: `{key}`\n"
-            f"🌐 IP: `{ip}`\n"
-            f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
-            parse_mode="Markdown"
-        )
-    except:
-        pass
+        cur.execute("SELECT used FROM temp_keys WHERE key = %s", (key,))
+        use_count = cur.fetchone()[0]
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    if use_count == 1:
+        try:
+            bot.send_message(
+                created_by,
+                f"🔑 *Временный ключ активирован!*\n\n"
+                f"🔗 Ключ: `{key}`\n"
+                f"🌐 IP: `{ip}`\n"
+                f"🕐 Время: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
     
     return content, 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
@@ -7904,7 +7937,7 @@ def admin_callback(call):
         return
 
     # ===== УПРАВЛЕНИЕ КЛЮЧАМИ =====
-    if data == "admin_keys" or data.startswith("admin_keys_"):
+    if data in ("admin_keys", "admin_sub_keys_load", "admin_sub_keys_finish") or data.startswith("admin_keys_") or data.startswith("admin_auto_update_"):
         if not has_permission(user_id, 'manage_keys'):
             bot.answer_callback_query(call.id, "⛔️ Нет прав")
             return
@@ -8531,7 +8564,7 @@ def admin_callback(call):
         cur = conn.cursor()
         try:
             cur.execute(
-                "UPDATE temp_keys SET used = 1, used_at = %s WHERE key = %s AND used = 0",
+                "UPDATE temp_keys SET used = used + 1, used_at = %s WHERE key = %s AND used = 0",
                 (int(time.time()), key)
             )
             conn.commit()
@@ -8664,7 +8697,6 @@ def admin_callback(call):
 
 # ==================== CALLBACKS ДЛЯ КЛЮЧЕЙ ====================
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load")
 def callback_admin_keys_load(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8692,7 +8724,6 @@ def callback_admin_keys_load(call):
             'timestamp': int(time.time())
         }
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_finish")
 def callback_admin_keys_load_finish(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8744,7 +8775,6 @@ def callback_admin_keys_load_finish(call):
             parse_mode="Markdown"
         )
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_load_cancel")
 def callback_admin_keys_load_cancel(call):
     user_id = call.from_user.id
     with _cache_lock:
@@ -8757,7 +8787,6 @@ def callback_admin_keys_load_cancel(call):
         pass
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clean_dead")
 def callback_admin_keys_clean_dead(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8801,7 +8830,6 @@ def callback_admin_keys_clean_dead(call):
     time.sleep(2)
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clear_all")
 def callback_admin_keys_clear_all(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8826,7 +8854,6 @@ def callback_admin_keys_clear_all(call):
     except:
         bot.send_message(user_id, "⚠️ Подтвердите удаление всех ключей.", reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_clear_confirm")
 def callback_admin_keys_clear_confirm(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8839,13 +8866,11 @@ def callback_admin_keys_clear_confirm(call):
     bot.answer_callback_query(call.id, "🗑️ Все ключи удалены!")
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_back")
 def callback_admin_keys_back(call):
     user_id = call.from_user.id
     bot.answer_callback_query(call.id)
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_reset_issued")
 def callback_admin_keys_reset_issued(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8860,7 +8885,6 @@ def callback_admin_keys_reset_issued(call):
     bot.answer_callback_query(call.id, f"🔄 Сброшено {current_issued} выданных ключей!")
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_menu")
 def callback_admin_keys_proxy_menu(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8869,7 +8893,6 @@ def callback_admin_keys_proxy_menu(call):
     bot.answer_callback_query(call.id)
     _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_reset")
 def callback_admin_keys_proxy_reset(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8881,7 +8904,6 @@ def callback_admin_keys_proxy_reset(call):
     bot.answer_callback_query(call.id, "✅ Прокси ссылки сброшены!")
     _show_proxy_menu(call.message.chat.id, call.message.message_id, user_id)
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_load")
 def callback_admin_keys_proxy_load(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -8914,7 +8936,6 @@ def callback_admin_keys_proxy_load(call):
             'timestamp': int(time.time())
         }
 
-@bot.callback_query_handler(func=lambda call: call.data == "admin_keys_proxy_finish")
 def callback_admin_keys_proxy_finish(call):
     user_id = call.from_user.id
     if not has_permission(user_id, 'manage_keys'):
@@ -9068,7 +9089,7 @@ def handle_private_messages(message):
                         if user_id in search_cache:
                             del search_cache[user_id]
                     log_admin_action(user_id, f"Добавил канал рассылки {new_ch_id}", details=ch_name)
-                    bot.reply_to(message, f"✅ Канал *{ch_name}* добавлен для рассылки!", parse_mode="Markdown")
+                    bot.reply_to(message, f"✅ Канал *{ch_name}* добавлен для рассылки!\n\nТеперь он будет доступен в меню рассылки.", parse_mode="Markdown")
                 else:
                     bot.reply_to(message, "❌ Ошибка добавления канала.")
             except ValueError:
