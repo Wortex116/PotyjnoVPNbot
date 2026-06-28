@@ -7936,6 +7936,54 @@ def admin_callback(call):
         bot.answer_callback_query(call.id)
         return
 
+    # ===== ЗАГРУЗКА КЛЮЧЕЙ ПОДПИСКИ =====
+    if data == "admin_sub_keys_load":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id)
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("✅ Завершить", callback_data="admin_sub_keys_finish"),
+            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_back")
+        )
+        msg = bot.send_message(user_id,
+            "📥 *Загрузка ключей подписки*\n\n"
+            "Эти ключи будут выдаваться пользователям через /sub ссылку.\n"
+            "Автопостинг использует отдельную базу.\n\n"
+            "Отправляйте ключи, затем нажмите ✅ Завершить",
+            parse_mode="Markdown", reply_markup=kb)
+        with _cache_lock:
+            keys_loading[user_id] = {
+                'keys': [], 'mode': 'subscription',
+                'message_id': msg.message_id,
+                'timestamp': int(time.time())
+            }
+        return
+
+    if data == "admin_sub_keys_finish":
+        if not has_permission(user_id, 'manage_keys'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        with _cache_lock:
+            if user_id not in keys_loading:
+                bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
+                return
+            session = keys_loading[user_id]
+            keys = session['keys']
+            mode = session.get('mode', 'autopost')
+            del keys_loading[user_id]
+        if not keys:
+            bot.answer_callback_query(call.id, "❌ Нет ключей")
+            return
+        if mode == 'subscription':
+            save_subscription_keys_to_db(keys)
+        else:
+            save_keys_to_db(keys)
+        bot.answer_callback_query(call.id, f"✅ Загружено {len(keys)} ключей!")
+        show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+        return
+
     # ===== УПРАВЛЕНИЕ КЛЮЧАМИ =====
     if data in ("admin_keys", "admin_sub_keys_load", "admin_sub_keys_finish") or data.startswith("admin_keys_") or data.startswith("admin_auto_update_"):
         if not has_permission(user_id, 'manage_keys'):
@@ -7992,54 +8040,6 @@ def admin_callback(call):
             t = threading.Thread(target=_do_auto_update_keys)
             t.daemon = True
             t.start()
-        return
-
-    # ===== ЗАГРУЗКА КЛЮЧЕЙ ПОДПИСКИ =====
-    if data == "admin_sub_keys_load":
-        if not has_permission(user_id, 'manage_keys'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав")
-            return
-        bot.answer_callback_query(call.id)
-        kb = types.InlineKeyboardMarkup(row_width=2)
-        kb.add(
-            types.InlineKeyboardButton("✅ Завершить", callback_data="admin_sub_keys_finish"),
-            types.InlineKeyboardButton("❌ Отмена", callback_data="admin_keys_back")
-        )
-        msg = bot.send_message(user_id,
-            "📥 *Загрузка ключей подписки*\n\n"
-            "Эти ключи будут выдаваться пользователям через /sub ссылку.\n"
-            "Автопостинг использует отдельную базу.\n\n"
-            "Отправляйте ключи, затем нажмите ✅ Завершить",
-            parse_mode="Markdown", reply_markup=kb)
-        with _cache_lock:
-            keys_loading[user_id] = {
-                'keys': [], 'mode': 'subscription',
-                'message_id': msg.message_id,
-                'timestamp': int(time.time())
-            }
-        return
-
-    if data == "admin_sub_keys_finish":
-        if not has_permission(user_id, 'manage_keys'):
-            bot.answer_callback_query(call.id, "⛔️ Нет прав")
-            return
-        with _cache_lock:
-            if user_id not in keys_loading:
-                bot.answer_callback_query(call.id, "❌ Нет активной загрузки")
-                return
-            session = keys_loading[user_id]
-            keys = session['keys']
-            mode = session.get('mode', 'autopost')
-            del keys_loading[user_id]
-        if not keys:
-            bot.answer_callback_query(call.id, "❌ Нет ключей")
-            return
-        if mode == 'subscription':
-            save_subscription_keys_to_db(keys)
-        else:
-            save_keys_to_db(keys)
-        bot.answer_callback_query(call.id, f"✅ Загружено {len(keys)} ключей!")
-        show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
         return
 
     # ===== РАССЫЛКА =====
@@ -9035,6 +9035,7 @@ def handle_private_messages(message):
         in_proxy = user_id in proxy_url_loading
         in_announce = user_id in announce_data
         in_autopost = user_id in autopost_loading
+        in_keys_loading = user_id in keys_loading
         decrypt_waiting = decrypt_results.get(user_id, {}).get('waiting', False)
         in_search = user_id in search_cache
 
@@ -9048,6 +9049,28 @@ def handle_private_messages(message):
 
     if in_autopost:
         handle_autopost_load_keys(message)
+        return
+
+    if in_keys_loading:
+        raw = text or message.caption or ''
+        found_keys = load_keys_from_text(raw) if raw else []
+        if not found_keys and message.document:
+            try:
+                file = bot.get_file(message.document.file_id)
+                data_bytes = bot.download_file(file.file_path)
+                found_keys = load_keys_from_text(data_bytes.decode('utf-8', errors='ignore'))
+            except:
+                pass
+        if found_keys:
+            with _cache_lock:
+                if user_id in keys_loading:
+                    keys_loading[user_id]['keys'].extend(found_keys)
+                    keys_loading[user_id]['keys'] = _dedup(keys_loading[user_id]['keys'])
+                    keys_loading[user_id]['timestamp'] = int(time.time())
+                    total = len(keys_loading[user_id]['keys'])
+            bot.reply_to(message, f"✅ Загружено {len(found_keys)}. Всего: {total}")
+        else:
+            bot.reply_to(message, "❌ Ключи не найдены")
         return
 
     if decrypt_waiting:
