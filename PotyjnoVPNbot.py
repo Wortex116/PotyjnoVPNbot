@@ -2296,11 +2296,15 @@ def show_keys_menu(user_id, chat_id, message_id):
         types.InlineKeyboardButton("🧹 Очистить нерабочие", callback_data="admin_keys_clean_dead")
     )
     kb.add(
-        types.InlineKeyboardButton("🗑️ Очистить все", callback_data="admin_keys_clear_all"),
-        types.InlineKeyboardButton("🔄 Автообновление", callback_data="admin_keys_auto_update")
+        types.InlineKeyboardButton("🗑️ Очистить ВСЕ", callback_data="admin_keys_clear_all"),
+        types.InlineKeyboardButton("🗑️ Очистить автопостинг", callback_data="admin_keys_clear_autopost"),
+        types.InlineKeyboardButton("🗑️ Очистить подписку", callback_data="admin_keys_clear_subscription")
     )
     kb.add(
-        types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued"),
+        types.InlineKeyboardButton("🔄 Автообновление", callback_data="admin_keys_auto_update"),
+        types.InlineKeyboardButton("🔄 Сбросить выдачу", callback_data="admin_keys_reset_issued")
+    )
+    kb.add(
         types.InlineKeyboardButton("🔙 Назад", callback_data="admin_back_panel")
     )
     
@@ -5419,8 +5423,12 @@ def callback_user_detail(call):
         bot.answer_callback_query(call.id, "⛔️ У вас нет прав на управление пользователями.")
         return
     
-    _refresh_user_card(call, target_id, user_id)
-    bot.answer_callback_query(call.id)
+    try:
+        _refresh_user_card(call, target_id, user_id)
+        bot.answer_callback_query(call.id)
+    except Exception as e:
+        print(f"[callback_user_detail] Ошибка: {e}")
+        bot.answer_callback_query(call.id, "❌ Ошибка открытия карточки")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith(('pts_add_', 'pts_sub_', 'pts_zero_', 'pts_set_', 'pts_set_confirm_')))
 def callback_points_manage(call):
@@ -7878,7 +7886,10 @@ def temp_key_subscription(key):
     call.data.startswith('broadcast_') or
     call.data == 'edit_admin_perms' or
     call.data == 'admin_back_panel' or
-    call.data == 'admin_back'
+    call.data == 'admin_back' or
+    call.data == 'admin_points_chats' or
+    call.data == 'admin_points_log' or
+    call.data == 'admin_points_top'
 ))
 def admin_callback(call):
     user_id = call.from_user.id
@@ -8005,6 +8016,10 @@ def admin_callback(call):
             callback_admin_keys_clear_all(call)
         elif data == "admin_keys_clear_confirm":
             callback_admin_keys_clear_confirm(call)
+        elif data == "admin_keys_clear_autopost":
+            callback_admin_keys_clear_autopost(call)
+        elif data == "admin_keys_clear_subscription":
+            callback_admin_keys_clear_subscription(call)
         elif data == "admin_keys_back":
             callback_admin_keys_back(call)
         elif data == "admin_keys_reset_issued":
@@ -8844,7 +8859,8 @@ def callback_admin_keys_clear_all(call):
     try:
         bot.edit_message_text(
             "⚠️ *ВНИМАНИЕ!*\n\n"
-            "Вы уверены, что хотите удалить ВСЕ ключи автопостинга?\n"
+            "Вы уверены, что хотите удалить ВСЕ ключи?\n"
+            "Будут удалены И ключи автопостинга, И ключи подписки!\n"
             "Это действие НЕЛЬЗЯ будет отменить!",
             call.message.chat.id,
             call.message.message_id,
@@ -8859,11 +8875,41 @@ def callback_admin_keys_clear_confirm(call):
     if not has_permission(user_id, 'manage_keys'):
         bot.answer_callback_query(call.id, "⛔️ Нет прав")
         return
-    count = len(get_keys_from_db())
+    autopost_count = len(get_keys_from_db())
+    sub_count = len(get_subscription_keys_from_db())
     save_keys_to_db([])
+    save_subscription_keys_to_db([])
     set_setting('total_keys_issued', '0')
-    log_admin_action(user_id, f"Удалил все ключи автопостинга", details=f"Удалено: {count} ключей")
-    bot.answer_callback_query(call.id, "🗑️ Все ключи удалены!")
+    log_admin_action(user_id, f"Удалил все ключи", details=f"Автопостинг: {autopost_count}, Подписка: {sub_count}")
+    bot.answer_callback_query(call.id, f"🗑️ Удалено {autopost_count + sub_count} ключей!")
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+def callback_admin_keys_clear_autopost(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    count = len(get_keys_from_db())
+    if count == 0:
+        bot.answer_callback_query(call.id, "❌ Нет ключей автопостинга для удаления")
+        return
+    save_keys_to_db([])
+    log_admin_action(user_id, f"Очистил ключи автопостинга", details=f"Удалено: {count}")
+    bot.answer_callback_query(call.id, f"🗑️ Удалено {count} ключей автопостинга!")
+    show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
+
+def callback_admin_keys_clear_subscription(call):
+    user_id = call.from_user.id
+    if not has_permission(user_id, 'manage_keys'):
+        bot.answer_callback_query(call.id, "⛔️ Нет прав")
+        return
+    count = len(get_subscription_keys_from_db())
+    if count == 0:
+        bot.answer_callback_query(call.id, "❌ Нет ключей подписки для удаления")
+        return
+    save_subscription_keys_to_db([])
+    log_admin_action(user_id, f"Очистил ключи подписки", details=f"Удалено: {count}")
+    bot.answer_callback_query(call.id, f"🗑️ Удалено {count} ключей подписки!")
     show_keys_menu(user_id, call.message.chat.id, call.message.message_id)
 
 def callback_admin_keys_back(call):
