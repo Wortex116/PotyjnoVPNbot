@@ -1935,8 +1935,7 @@ def blocked_message():
 
 def _format_duration(seconds):
     seconds = max(0, int(seconds))
-    days = seconds // 86400
-    hours = (seconds % 86400) // 3600
+    days = seconds // 86400    hours = (seconds % 86400) // 3600
     minutes = (seconds % 3600) // 60
     parts = []
     if days:
@@ -2223,7 +2222,10 @@ def build_user_list_keyboard(users, page, filter_type='all'):
         types.InlineKeyboardButton("📋 Все", callback_data="filter_all")
     )
     kb.row(
-        types.InlineKeyboardButton("🔙 Назад в админ-панель", callback_data="admin_back_panel"),
+        types.InlineKeyboardButton("🔍 Поиск", callback_data="search_user_start"),
+        types.InlineKeyboardButton("🔙 Назад в админ-панель", callback_data="admin_back_panel")
+    )
+    kb.row(
         types.InlineKeyboardButton("❌ Закрыть", callback_data="close_manage")
     )
     return kb
@@ -3084,9 +3086,18 @@ def _show_temp_keys_menu(call):
     keys = get_temp_keys_list(admin_id=user_id, limit=50)
     current_time = int(time.time())
     
-    active = sum(1 for k in keys if not k[4] and k[3] > current_time)
-    used = sum(1 for k in keys if k[4])
-    expired = sum(1 for k in keys if not k[4] and k[3] <= current_time)
+    # Пересчитываем статусы прямо сейчас
+    active = 0
+    used = 0
+    expired = 0
+    
+    for k in keys:
+        if k[4] > 0:  # used
+            used += 1
+        elif k[3] <= current_time:  # expires_at <= current_time
+            expired += 1
+        else:
+            active += 1
     
     text = (
         f"🔑 *Временные ключи*\n\n"
@@ -3201,9 +3212,17 @@ def _show_temp_keys_list(call, user_id):
             bot.send_message(user_id, text, parse_mode="Markdown", reply_markup=kb)
         return
     
-    active = sum(1 for k in keys if not k[4] and k[3] > current_time)
-    used_count = sum(1 for k in keys if k[4])
-    expired = sum(1 for k in keys if not k[4] and k[3] <= current_time)
+    active = 0
+    used_count = 0
+    expired = 0
+    
+    for k in keys:
+        if k[4] > 0:
+            used_count += 1
+        elif k[3] <= current_time:
+            expired += 1
+        else:
+            active += 1
     
     text = (
         f"📋 *Временные ключи*\n\n"
@@ -3217,7 +3236,7 @@ def _show_temp_keys_list(call, user_id):
     for row in keys:
         key, created_by, created_at, expires_at, used, used_at, used_by_ip, label = row
         
-        if used:
+        if used > 0:
             status_icon = "✔️"
         elif expires_at < current_time:
             status_icon = "❌"
@@ -3225,7 +3244,7 @@ def _show_temp_keys_list(call, user_id):
             remaining = expires_at - current_time
             h = remaining // 3600
             m = (remaining % 3600) // 60
-            status_icon = "✅"
+            status_icon = f"⏳{h}h{m}m"
         
         creator_name = get_user_display_name_cached(created_by)
         created_str = datetime.fromtimestamp(created_at).strftime("%d.%m в %H:%M")
@@ -3267,7 +3286,7 @@ def _show_temp_key_detail(call, user_id, key):
     base_url = get_bot_base_url()
     key_url = f"{base_url}/tkey/{key}"
     
-    if used:
+    if used > 0:
         status = f"✔️ Использован {used} раз"
         used_str = datetime.fromtimestamp(used_at).strftime("%d.%m.%Y в %H:%M:%S") if used_at else "—"
         status_detail = f"🕐 Последнее: {used_str}\n🌐 IP: `{used_by_ip or 'неизвестен'}`"
@@ -3296,7 +3315,7 @@ def _show_temp_key_detail(call, user_id, key):
     
     kb = types.InlineKeyboardMarkup(row_width=1)
     
-    if not used and expires_at > current_time:
+    if used == 0 and expires_at > current_time:
         kb.add(types.InlineKeyboardButton(
             "🚫 Отозвать ключ",
             callback_data=f"admin_temp_key_revoke_{key}"
@@ -3587,7 +3606,7 @@ def auto_post_keys_to_channel():
         ip_match = re.search(r'@([^:]+):(\d+)', key)
         ip = ip_match.group(1) if ip_match else "Unknown"
         
-        protocol_match = re.match(r'([a-z0-9+]+)://', key, re.IGNORECASE)
+        protocol_match = re.match(r'([a-z0-9]+)://', key, re.IGNORECASE)
         protocol = protocol_match.group(1).upper() if protocol_match else "VLESS"
         
         protocol_icons = {
@@ -4640,18 +4659,32 @@ def top_referrals(message):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        cur.execute("SELECT referrer_id, COUNT(*) FROM referrals GROUP BY referrer_id ORDER BY COUNT(*) DESC LIMIT 10")
+        # Ограничиваем выборку 50 пользователями для производительности
+        cur.execute("""
+            SELECT referrer_id, COUNT(*) as cnt 
+            FROM referrals 
+            GROUP BY referrer_id 
+            ORDER BY cnt DESC 
+            LIMIT 50
+        """)
         rows = cur.fetchall()
         if not rows:
             bot.reply_to(message, "📭 Нет рефералов.")
             return
+        
+        # Берем только топ-10 для отображения
+        top_rows = rows[:10]
         text = "🏆 *Топ рефералов:*\n\n"
         medals = ['🥇', '🥈', '🥉']
-        for i, (ref_id, count) in enumerate(rows):
+        
+        for i, (ref_id, count) in enumerate(top_rows):
             name = get_user_display_name_cached(ref_id)
             icon = medals[i] if i < 3 else f"{i+1}."
             text += f"{icon} {name} — {count} реф.\n"
         bot.reply_to(message, text, parse_mode="Markdown")
+    except Exception as e:
+        print(f"[top_referrals] Ошибка: {e}")
+        bot.reply_to(message, "❌ Произошла ошибка при загрузке топа. Попробуйте позже.")
     finally:
         try:
             cur.close()
@@ -5175,7 +5208,8 @@ def callback_reset_perm(call):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('filter_') or 
                              call.data.startswith('page_') or
-                             call.data in ('back_to_list', 'close_manage'))
+                             call.data in ('back_to_list', 'close_manage') or
+                             call.data == 'search_user_start')
 def callback_user_list_nav(call):
     user_id = call.from_user.id
     if not is_admin(user_id) or not has_permission(user_id, 'manage_users'):
@@ -5190,6 +5224,25 @@ def callback_user_list_nav(call):
             bot.delete_message(call.message.chat.id, call.message.message_id)
         except:
             pass
+        return
+    
+    if data == 'search_user_start':
+        bot.answer_callback_query(call.id, "🔍 Введите ID или @username")
+        with _cache_lock:
+            search_cache[user_id] = {
+                'action': 'search_user',
+                'timestamp': int(time.time())
+            }
+        bot.send_message(
+            user_id,
+            "🔍 Введите ID пользователя или @username для поиска.\n\n"
+            "Примеры:\n"
+            "`123456789`\n"
+            "`@mel1ste`\n"
+            "`tg://user?id=123456789`\n\n"
+            "Или /cancel для отмены.",
+            parse_mode="Markdown"
+        )
         return
     
     if data == 'back_to_list':
@@ -5455,6 +5508,52 @@ def callback_points_manage(call):
             f"Или /cancel для отмены.",
             parse_mode="Markdown"
         )
+        return
+
+    # Обработка подтверждения установки баллов
+    if data.startswith('pts_set_confirm_'):
+        target_id = int(data.split('_')[3])
+        new_points = int(data.split('_')[4])
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT points FROM users WHERE user_id = %s", (target_id,))
+            result = cur.fetchone()
+            if not result:
+                bot.answer_callback_query(call.id, "❌ Пользователь не найден")
+                return
+            old_points = result[0] or 0
+            
+            cur.execute("UPDATE users SET points = %s WHERE user_id = %s", (new_points, target_id))
+            conn.commit()
+        finally:
+            try:
+                cur.close()
+            except:
+                pass
+            return_db_connection(conn)
+        
+        name = get_user_display_name_cached(target_id)
+        rank_info = get_rank(new_points)
+        log_admin_action(
+            user_id, f"Установил баллы {target_id}",
+            target_id=target_id,
+            details=f"{old_points} → {new_points}"
+        )
+        bot.answer_callback_query(call.id, f"✅ Установлено {new_points} баллов!")
+        
+        try:
+            bot.send_message(
+                target_id,
+                f"🪙 Администратор установил ваши баллы.\n\n"
+                f"💰 Новый баланс: {new_points:,}\n"
+                f"{rank_info['name']}"
+            )
+        except:
+            pass
+        
+        _refresh_user_card(call, target_id, user_id)
         return
 
     parts = data.split('_')
@@ -6426,6 +6525,53 @@ def is_user_blocked_bot(user_id):
         }
     
     return blocked
+
+def handle_private_search_user(message):
+    user_id = message.from_user.id
+    target_input = message.text.strip()
+    
+    target_id = get_user_id_from_input(target_input)
+    if not target_id:
+        bot.reply_to(message, f"❌ Не удалось найти пользователя: `{target_input}`\n\nПопробуйте ввести ID или @username.", parse_mode="Markdown")
+        with _cache_lock:
+            if user_id in search_cache:
+                del search_cache[user_id]
+        return
+    
+    with _cache_lock:
+        if user_id in search_cache:
+            del search_cache[user_id]
+    
+    # Показываем карточку пользователя
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT subscription_end, is_blocked, points FROM users WHERE user_id = %s", (target_id,))
+        row = cur.fetchone()
+    finally:
+        try:
+            cur.close()
+        except:
+            pass
+        return_db_connection(conn)
+    
+    if not row:
+        bot.reply_to(message, f"❌ Пользователь с ID `{target_id}` не зарегистрирован в боте.", parse_mode="Markdown")
+        return
+    
+    # Используем существующую функцию для отображения карточки
+    # Создаем временный call объект
+    class DummyCall:
+        def __init__(self, chat_id, message_id, from_user_id):
+            self.message = type('obj', (object,), {
+                'chat': type('obj', (object,), {'id': chat_id}),
+                'message_id': message_id
+            })()
+            self.from_user = type('obj', (object,), {'id': from_user_id})
+            self.id = None
+    
+    dummy_call = DummyCall(message.chat.id, message.message_id, user_id)
+    _refresh_user_card(dummy_call, target_id, user_id)
 
 # ==================== КОМАНДЫ ЧАТОВ ====================
 
@@ -7889,7 +8035,8 @@ def temp_key_subscription(key):
     call.data == 'admin_back' or
     call.data == 'admin_points_chats' or
     call.data == 'admin_points_log' or
-    call.data == 'admin_points_top'
+    call.data == 'admin_points_top' or
+    call.data == 'search_user_start'
 ))
 def admin_callback(call):
     user_id = call.from_user.id
@@ -7945,6 +8092,29 @@ def admin_callback(call):
             reply_markup=admin_menu()
         )
         bot.answer_callback_query(call.id)
+        return
+
+    # ===== ПОИСК ПОЛЬЗОВАТЕЛЯ =====
+    if data == "search_user_start":
+        if not has_permission(user_id, 'manage_users'):
+            bot.answer_callback_query(call.id, "⛔️ Нет прав")
+            return
+        bot.answer_callback_query(call.id, "🔍 Введите ID или @username")
+        with _cache_lock:
+            search_cache[user_id] = {
+                'action': 'search_user',
+                'timestamp': int(time.time())
+            }
+        bot.send_message(
+            user_id,
+            "🔍 Введите ID пользователя или @username для поиска.\n\n"
+            "Примеры:\n"
+            "`123456789`\n"
+            "`@mel1ste`\n"
+            "`tg://user?id=123456789`\n\n"
+            "Или /cancel для отмены.",
+            parse_mode="Markdown"
+        )
         return
 
     # ===== ЗАГРУЗКА КЛЮЧЕЙ ПОДПИСКИ =====
@@ -9085,6 +9255,14 @@ def handle_private_messages(message):
         decrypt_waiting = decrypt_results.get(user_id, {}).get('waiting', False)
         in_search = user_id in search_cache
 
+    # ===== ПОИСК ПОЛЬЗОВАТЕЛЯ =====
+    if in_search:
+        with _cache_lock:
+            action = search_cache.get(user_id, {}).get('action', '')
+        if action == 'search_user':
+            handle_private_search_user(message)
+            return
+
     if in_proxy:
         handle_proxy_url_input(message)
         return
@@ -9313,6 +9491,10 @@ def cmd_priority_handler(message):
             del announce_data[user_id]
         if user_id in proxy_url_loading:
             del proxy_url_loading[user_id]
+        if user_id in search_cache:
+            action = search_cache.get(user_id, {}).get('action', '')
+            if action == 'search_user':
+                del search_cache[user_id]
 
     if command == '/admin':
         admin_panel(message)
@@ -9626,6 +9808,9 @@ def cmd_cancel(message):
             cleared = True
         if user_id in proxy_url_loading:
             del proxy_url_loading[user_id]
+            cleared = True
+        if user_id in search_cache:
+            del search_cache[user_id]
             cleared = True
     if cleared:
         bot.reply_to(message, "✅ Все режимы отменены.")
