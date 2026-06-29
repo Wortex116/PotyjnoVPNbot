@@ -1935,7 +1935,8 @@ def blocked_message():
 
 def _format_duration(seconds):
     seconds = max(0, int(seconds))
-    days = seconds // 86400    hours = (seconds % 86400) // 3600
+    days = seconds // 86400   
+    hours = (seconds % 86400) // 3600
     minutes = (seconds % 3600) // 60
     parts = []
     if days:
